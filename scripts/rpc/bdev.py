@@ -77,6 +77,12 @@ def construct_passthru_bdev(client, args):
     }
     return client.call('construct_passthru_bdev', params)
 
+def construct_raid_bdev(client, args):
+    params = {
+        'base_bdev_name': args.base_bdev_name,
+        'raid_bdev_name': args.raid_bdev_name,
+    }
+    return client.call('construct_raid_bdev', params)
 
 def construct_split_vbdev(client, args):
     params = {

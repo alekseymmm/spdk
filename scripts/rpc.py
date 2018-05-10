@@ -118,7 +118,7 @@ if __name__ == "__main__":
     p.add_argument(
         'total_size', help='Size of null bdev in MB (int > 0)', type=int)
     p.add_argument('block_size', help='Block size for this bdev', type=int)
-    p.set_defaults(func=construct_null_bdev)
+    p.set_defaults(func=construct_null_bdev) 
 
     @call_cmd
     def construct_aio_bdev(args):
@@ -188,6 +188,19 @@ if __name__ == "__main__":
     p.add_argument('-b', '--base-bdev-name', help="Name of the existing bdev", required=True)
     p.add_argument('-p', '--passthru-bdev-name', help="Name of the passthru bdev", required=True)
     p.set_defaults(func=construct_passthru_bdev)
+    
+    @call_cmd
+    def construct_raid_bdev(args):
+        print_array(rpc.bdev.construct_raid_bdev(args.client, args))
+        
+    p = subparsers.add_parser('construct_raid_bdev',
+                              help='Add a raid with ? backend')
+    p.add_argument('name', help='Block device name')
+    p.add_argument('-u', '--uuid', help='UUID of the bdev')
+    p.add_argument(
+        'total_size', help='Size of null bdev in MB (int > 0)', type=int)
+    p.add_argument('block_size', help='Block size for this bdev', type=int)
+    p.set_defaults(func=construct_raid_bdev)  
 
     @call_cmd
     def get_bdevs(args):
