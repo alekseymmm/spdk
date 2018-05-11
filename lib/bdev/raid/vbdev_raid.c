@@ -68,6 +68,48 @@ SPDK_BDEV_MODULE_REGISTER(&raid_if)
 
 static int vbdev_raid_init(void)
 {
+	struct spdk_conf_section *sp = NULL;
+	char *conf_bdev_name = NULL;
+	char *conf_vbdev_name = NULL;
+	int i, rc;
+	int drives_num, stripe_size_kb;
+
+	sp = spdk_conf_find_section(NULL, "RAID");
+	if (sp == NULL) {
+		return 0;
+	}
+
+	if (sp != NULL){
+		conf_vbdev_name = spdk_conf_section_get_val(sp, "RAIDName");
+		if (!conf_vbdev_name) {
+			SPDK_ERRLOG("RAID configuration missing raid_bdev name\n");
+			break;
+		}
+		drives_num = spdk_conf_section_get_intval(sp, "NumberOfDrives");
+		stripe_size_kb = spdk_conf_section_get_intval(sp, "StripeSizeKB");
+
+		for (i = 0 ; i < drives_num; i++) {
+			conf_bdev_name = spdk_conf_section_get_nmval(sp,
+					"Drive", i, 0);
+		}
+	}
+
+
+	for (i = 0; ; i++) {
+		conf_bdev_name = spdk_conf_section_get_nmval(sp, "rdx", i, 1);
+		if (!conf_bdev_name) {
+			SPDK_ERRLOG("RAID configuration missing bdev0 name\n");
+			break;
+		}
+
+//		rc = vbdev_passthru_insert_name(conf_bdev_name, conf_vbdev_name);
+//		if (rc != 0) {
+//			return rc;
+//		}
+	}
+//	TAILQ_FOREACH(name, &g_bdev_names, link) {
+//		SPDK_NOTICELOG("conf parse matched: %s\n", name->bdev_name);
+//	}
 	return 0;
 }
 
