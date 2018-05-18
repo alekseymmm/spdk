@@ -12,6 +12,8 @@
 
 #include "spdk/bdev.h"
 
+int spdk_raid_create(char *name, int level, int stripe_size_kb, u64 raid_size);
+
 int create_raid_disk(const char *bdev_name, const char *vbdev_name);
 
 #endif /* LIB_BDEV_RAID_VBDEV_RAID_H_ */

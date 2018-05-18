@@ -26,6 +26,8 @@ static int vbdev_raid_get_ctx_size(void);
 static void vbdev_raid_examine(struct spdk_bdev *bdev);
 static void vbdev_raid_finish(void);
 
+#define MAX_DEV_NAME_LEN 32
+
 /* Called when SPDK wants to output the bdev specific methods. */
 static void
 vbdev_raid_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
@@ -66,13 +68,18 @@ static struct spdk_bdev_module raid_if = {
 
 SPDK_BDEV_MODULE_REGISTER(&raid_if)
 
+struct spdk_bdev *create_raid_disk(const char *name, int level, char **bdev_names) {
+
+}
+
 static int vbdev_raid_init(void)
 {
 	struct spdk_conf_section *sp = NULL;
 	char *conf_bdev_name = NULL;
 	char *conf_vbdev_name = NULL;
+	struct rdx_devices devices;
 	int i, rc;
-	int drives_num, stripe_size_kb;
+	int drives_num, stripe_size_kb, level;
 
 	sp = spdk_conf_find_section(NULL, "RAID");
 	if (sp == NULL) {
@@ -83,15 +90,22 @@ static int vbdev_raid_init(void)
 		conf_vbdev_name = spdk_conf_section_get_val(sp, "RAIDName");
 		if (!conf_vbdev_name) {
 			SPDK_ERRLOG("RAID configuration missing raid_bdev name\n");
-			break;
 		}
 		drives_num = spdk_conf_section_get_intval(sp, "NumberOfDrives");
 		stripe_size_kb = spdk_conf_section_get_intval(sp, "StripeSizeKB");
+		level = spdk_conf_section_get_intval(sp, "Level");
 
+		devices->names = malloc(sizeof(char *) * drives_num);
 		for (i = 0 ; i < drives_num; i++) {
 			conf_bdev_name = spdk_conf_section_get_nmval(sp,
 					"Drive", i, 0);
+			devices->names[i] = strdup(conf_bdev_name);
 		}
+
+		spdk_raid_create(conf_vbdev_name, level, stripe_size_kb,
+				0);
+
+		free(devices->names);
 	}
 
 

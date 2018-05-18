@@ -10,6 +10,7 @@
   
 [RAID]
   RAIDName dimec
+  Level 0
   NumberOfDrives  2
   StripeSizeKB 64
   Drive AIO_0
