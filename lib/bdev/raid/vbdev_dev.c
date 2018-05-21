@@ -27,8 +27,7 @@ vbdev_raid_examine_hotremove_cb(void *ctx)
 //	}
 }
 
-int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
-		int dev_num)
+int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev, int dev_num)
 {
 	struct rdx_dev *dev;
 	uint64_t strips_in_dev;
@@ -45,6 +44,7 @@ int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 	dev->num = dev_num;
 	dev->raid = raid;
 	raid->devices[dev_num] = dev;
+	dev->bdev = bdev;
 
 //	dev->md = (struct rdx_md *)get_zeroed_page(GFP_KERNEL);
 //	if (!dev->md) {

@@ -47,7 +47,7 @@ error:
 	return -ENOMEM;
 }
 
-static int rdx_raid_create_devices(struct rdx_raid *raid,
+static int rdx_raid_allocate_devices(struct rdx_raid *raid,
 				struct rdx_devices *devices)
 {
 	int i;

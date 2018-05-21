@@ -129,7 +129,7 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 }
 
 static void vbdev_raid_examine(struct spdk_bdev *bdev) {
-
+	return;
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)

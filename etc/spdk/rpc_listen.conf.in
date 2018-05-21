@@ -6,6 +6,15 @@
 
 [AIO]
   AIO /dev/nullb0 AIO_0
-  AIO /dev/nullb1 AIO_1
+  #AIO /dev/nullb1 AIO_1
+  
 [Split]
   Split AIO_0 2
+  
+[RAID]
+  RAIDName dimec
+  Level 0
+  NumberOfDrives  2
+  StripeSizeKB 64
+  Drive AIO_0
+  Drive AIO_1
