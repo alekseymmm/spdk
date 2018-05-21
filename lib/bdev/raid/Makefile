@@ -35,10 +35,13 @@ SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/bdev/
-CFLAGS += -I/lib/modules/4.9.0-4-amd64/source/arch/x86/include/
-CFLAGS += -I/lib/modules/4.9.0-4-amd64/source/include
 
-C_SRCS = vbdev_raid.c vbdev_raid_rpc.c#vbdev_passthru.c vbdev_passthru_rpc.c
+C_SRCS = vbdev_raid.c 		\
+	 vbdev_dev.c		\
+	 vbdev_raid_rpc.c 	\
+	 vbdev_main.c 		\
+	 vbdev_bitops.c 
+	 
 LIBNAME = vbdev_raid
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

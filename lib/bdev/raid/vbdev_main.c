@@ -20,13 +20,14 @@
 #include "spdk_internal/bdev.h"
 #include "spdk_internal/log.h"
 
-static int vbdev_raid_init(void);
-static void vbdev_raid_get_spdk_running_config(FILE *fp);
-static int vbdev_raid_get_ctx_size(void);
-static void vbdev_raid_examine(struct spdk_bdev *bdev);
-static void vbdev_raid_finish(void);
+#include "vbdev_common.h"
+#include "vbdev_raid.h"
 
-#define MAX_DEV_NAME_LEN 32
+static int vbdev_raid_init(void);
+//static void vbdev_raid_get_spdk_running_config(FILE *fp);
+//static int vbdev_raid_get_ctx_size(void);
+//static void vbdev_raid_examine(struct spdk_bdev *bdev);
+//static void vbdev_raid_finish(void);
 
 /* Called when SPDK wants to output the bdev specific methods. */
 static void
@@ -68,17 +69,13 @@ static struct spdk_bdev_module raid_if = {
 
 SPDK_BDEV_MODULE_REGISTER(&raid_if)
 
-struct spdk_bdev *create_raid_disk(const char *name, int level, char **bdev_names) {
-
-}
-
 static int vbdev_raid_init(void)
 {
 	struct spdk_conf_section *sp = NULL;
 	char *conf_bdev_name = NULL;
 	char *conf_vbdev_name = NULL;
 	struct rdx_devices devices;
-	int i, rc;
+	int i, ret = 0;
 	int drives_num, stripe_size_kb, level;
 
 	sp = spdk_conf_find_section(NULL, "RAID");
@@ -95,32 +92,29 @@ static int vbdev_raid_init(void)
 		stripe_size_kb = spdk_conf_section_get_intval(sp, "StripeSizeKB");
 		level = spdk_conf_section_get_intval(sp, "Level");
 
-		devices->names = malloc(sizeof(char *) * drives_num);
+		devices.names = malloc(sizeof(char *) * drives_num);
 		for (i = 0 ; i < drives_num; i++) {
 			conf_bdev_name = spdk_conf_section_get_nmval(sp,
 					"Drive", i, 0);
-			devices->names[i] = strdup(conf_bdev_name);
+			devices.names[i] = strdup(conf_bdev_name);
 		}
 
-		spdk_raid_create(conf_vbdev_name, level, stripe_size_kb,
-				0);
+		ret = spdk_raid_create(conf_vbdev_name, level, stripe_size_kb,
+				&devices, 0);
+		if (!ret) {
 
-		free(devices->names);
+		}
+		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_RAID, "RAID %s created.\n",
+				conf_vbdev_name);
+
+		free(devices.names);
 	}
 
-
-	for (i = 0; ; i++) {
-		conf_bdev_name = spdk_conf_section_get_nmval(sp, "rdx", i, 1);
-		if (!conf_bdev_name) {
-			SPDK_ERRLOG("RAID configuration missing bdev0 name\n");
-			break;
-		}
 
 //		rc = vbdev_passthru_insert_name(conf_bdev_name, conf_vbdev_name);
 //		if (rc != 0) {
 //			return rc;
 //		}
-	}
 //	TAILQ_FOREACH(name, &g_bdev_names, link) {
 //		SPDK_NOTICELOG("conf parse matched: %s\n", name->bdev_name);
 //	}
@@ -131,3 +125,5 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 {
 	return 0;
 }
+
+SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)

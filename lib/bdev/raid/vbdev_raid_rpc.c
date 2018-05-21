@@ -54,10 +54,10 @@ static void spdk_rpc_construct_raid_bdev(
 		goto invalid;
 	}
 
-	rc = create_raid_disk(req.base_bdev_name, req.raid_bdev_name);
-	if (rc != 0) {
-		goto invalid;
-	}
+//	rc = create_raid_disk(req.base_bdev_name, req.raid_bdev_name);
+//	if (rc != 0) {
+//		goto invalid;
+//	}
 
 	w = spdk_jsonrpc_begin_result(request);
 	if (w == NULL) {
