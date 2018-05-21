@@ -13,8 +13,10 @@
 
 #include "vbdev_common.h"
 #include "vbdev_dev.h"
+#include "vbdev_raid.h"
 
-static int rdx_raid_create_devices(struct rdx_raid *raid);
+static int rdx_raid_create_devices(struct rdx_raid *raid,
+				struct rdx_devices *devices);
 
 int spdk_raid_create(char *name, int level, int stripe_size_kb,
 		struct rdx_devices *devices, uint64_t raid_size)
@@ -36,7 +38,7 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 //	if (!raid_size)
 //		set_bit(RDX_RAID_STATE_CREATE, &raid->state);
 
-	if (rdx_raid_create_devices(raid)) {
+	if (rdx_raid_create_devices(raid, devices)) {
 		SPDK_ERRLOG("Cannot allocate devices\n");
 		goto error;
 	}
@@ -45,7 +47,8 @@ error:
 	return -ENOMEM;
 }
 
-static int rdx_raid_create_devices(struct rdx_raid *raid)
+static int rdx_raid_create_devices(struct rdx_raid *raid,
+				struct rdx_devices *devices)
 {
 	int i;
 
@@ -57,7 +60,7 @@ static int rdx_raid_create_devices(struct rdx_raid *raid)
 
 	/* Open drives */
 	for (i = 0; i < raid->dev_cnt; i++) {
-		if (rdx_dev_create(raid, i)) {
+		if (rdx_dev_create(raid, devices, i)) {
 			SPDK_ERRLOG("Cannot allocate memory\n");
 			return -1;
 		}

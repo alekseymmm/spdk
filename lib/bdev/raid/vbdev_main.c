@@ -92,11 +92,13 @@ static int vbdev_raid_init(void)
 		stripe_size_kb = spdk_conf_section_get_intval(sp, "StripeSizeKB");
 		level = spdk_conf_section_get_intval(sp, "Level");
 
-		devices.names = malloc(sizeof(char *) * drives_num);
+		devices.names = calloc(1, sizeof(char *) * drives_num);
+		devices.cnt = 0;
 		for (i = 0 ; i < drives_num; i++) {
 			conf_bdev_name = spdk_conf_section_get_nmval(sp,
 					"Drive", i, 0);
 			devices.names[i] = strdup(conf_bdev_name);
+			devices.cnt++;
 		}
 
 		ret = spdk_raid_create(conf_vbdev_name, level, stripe_size_kb,

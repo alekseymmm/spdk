@@ -9,7 +9,16 @@
 #define LIB_BDEV_RAID_VBDEV_COMMON_H_
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 
+#include "spdk/bdev.h"
+#include "spdk/log.h"
+
+#include "spdk_internal/bdev.h"
+#include "stddef.h"
+
+#define RDX_MD_OFFSET 0
 
 #define KERNEL_SECTOR_SIZE_SHIFT (9)
 #define KERNEL_SECTOR_SIZE (1 << KERNEL_SECTOR_SIZE_SHIFT)
@@ -46,6 +55,9 @@ struct rdx_dev {
 	uint64_t size;
 	int num;
 	struct spdk_bdev *bdev;
+	struct rdx_raid *raid;
+	char *bdev_name;
+	struct spdk_bdev_desc *base_desc;
 };
 
 struct rdx_stripe_dsc {
@@ -67,5 +79,11 @@ struct rdx_raid {
 	struct rdx_stripe_dsc stripe_dsc;
 };
 
+static inline bool rdx_dev_is_null(char *name)
+{
+	if (!strncmp(name, "null", RDX_MAX_PATH_LEN))
+		return true;
+	return false;
+}
 
 #endif /* LIB_BDEV_RAID_VBDEV_COMMON_H_ */

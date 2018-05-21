@@ -7,7 +7,138 @@
 #include "vbdev_common.h"
 #include "vbdev_dev.h"
 
-int rdx_dev_create(struct rdx_raid *raid, int dev_num)
+void rdx_dev_close(struct rdx_dev *dev);
+void rdx_dev_destroy(struct rdx_dev *dev);
+
+/* Called when the underlying base bdev goes away. */
+static void
+vbdev_raid_examine_hotremove_cb(void *ctx)
 {
+	//struct rdx_dev *dev = ctx;
+	//struct rdx_raid *raid = dev->raid;
+	/*
+	 *unregister dev in raid and do  spdk_bdev_unregister
+	 */
+
+//	TAILQ_FOREACH_SAFE(pt_node, &g_pt_nodes, link, tmp) {
+//		if (bdev_find == pt_node->base_bdev) {
+//			spdk_bdev_unregister(&pt_node->pt_bdev, NULL, NULL);
+//		}
+//	}
+}
+
+int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
+		int dev_num)
+{
+	struct rdx_dev *dev;
+	uint64_t strips_in_dev;
+	int rc = 0;
+
+	dev = calloc(1, sizeof(struct rdx_dev));
+	if (!dev) {
+		SPDK_ERRLOG("Cannot allocate memory for dev\n");
+		return -ENOMEM;
+	}
+
+//	INIT_HLIST_NODE(&dev->hlist);
+//	init_waitqueue_head(&dev->wait);
+	dev->num = dev_num;
+	dev->raid = raid;
+	raid->devices[dev_num] = dev;
+
+//	dev->md = (struct rdx_md *)get_zeroed_page(GFP_KERNEL);
+//	if (!dev->md) {
+//		SPDK_ERRLOG("Cannot allocate page for metadata\n");
+//		goto error;
+//	}
+
+//	dev->recon_md = (struct rdx_recon_md *)get_zeroed_page(GFP_KERNEL);
+//	if (!dev->recon_md) {
+//		SPDK_ERRLOG("Cannot allocate page for reconstruction metadata\n");
+//		goto error;
+//	}
+
+	if (rdx_dev_is_null(devices->names[dev_num])) {
+		SPDK_NOTICELOG("Device null number %d added to raid %s\n",
+			 dev->num, raid->name);
+		//rdx_dev_clear_state(dev, RDX_DEV_STATE_ONLINE);
+		return 0;
+	}
+
+	/* Start opening device */
+	//atomic_set(&dev->ref_cnt, 1);
+
+	dev->bdev_name = strdup(devices->names[dev_num]);
+	if (!dev->bdev_name) {
+		SPDK_ERRLOG("Cannot allocate memory for bdev_name\n");
+		goto error;
+	}
+
+	dev->bdev = spdk_bdev_get_by_name(dev->bdev_name);
+	if(!dev->bdev) {
+		SPDK_ERRLOG("Cannot get bdev=%s by name\n", dev->bdev_name);
+		dev->bdev = NULL;
+		//rdx_dev_clear_state(dev, RDX_DEV_STATE_ONLINE);
+		return 0;
+	}
+
+	rc = spdk_bdev_open(dev->bdev, true, vbdev_raid_examine_hotremove_cb,
+			dev, &dev->base_desc);
+	if (rc) {
+		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);
+		goto error;
+	}
+
+
+	strips_in_dev = (spdk_bdev_get_num_blocks(dev->bdev) - RDX_MD_OFFSET) /
+			raid->stripe_size;
+	dev->size = strips_in_dev * raid->stripe_size;
+
+	SPDK_NOTICELOG("Device %s number %d of size %lu sectors added to raid %s\n",
+		 dev->bdev_name, dev->num, dev->size, raid->name);
+
+	//rdx_dev_update(dev);
+
 	return 0;
+
+error:
+	rdx_dev_destroy(dev);
+	return -ENOMEM;
+}
+
+void rdx_dev_close(struct rdx_dev *dev)
+{
+//	rdx_dev_clear_state(dev, RDX_DEV_STATE_ONLINE);
+//
+//	/* Dev is closed */
+//	if (!atomic_read(&dev->ref_cnt))
+		return;
+
+	SPDK_NOTICELOG("Closing dev %s number %d\n", dev->bdev_name, dev->num);
+
+//	rdx_dev_put_ref(dev);
+//	wait_event(dev->wait, !atomic_read(&dev->ref_cnt));
+
+	/* Remove bdev from device. Do not delete the rdx_dev structure */
+	if (dev->bdev){
+		spdk_bdev_close(dev->base_desc);
+	}
+	if (dev->bdev_name)
+		free(dev->bdev_name);
+	dev->bdev = NULL;
+	dev->bdev_name = NULL;
+
+	SPDK_NOTICELOG("Closed dev number %d\n", dev->num);
+}
+
+void rdx_dev_destroy(struct rdx_dev *dev)
+{
+	struct rdx_raid *raid = dev->raid;
+	raid->devices[dev->num] = NULL;
+	rdx_dev_close(dev);
+//	if (dev->recon_md)
+//		free_page((unsigned long)dev->recon_md);
+//	if (dev->md)
+//		free_page((unsigned long)dev->md);
+	free(dev);
 }
