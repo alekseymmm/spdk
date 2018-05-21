@@ -4,3 +4,8 @@
   Enable Yes
   Listen 127.0.0.1
 
+[AIO]
+  AIO /dev/nullb0 AIO_0
+  AIO /dev/nullb1 AIO_1
+[Split]
+  Split AIO_0 2

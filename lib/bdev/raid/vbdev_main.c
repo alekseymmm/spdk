@@ -26,7 +26,7 @@
 static int vbdev_raid_init(void);
 //static void vbdev_raid_get_spdk_running_config(FILE *fp);
 //static int vbdev_raid_get_ctx_size(void);
-//static void vbdev_raid_examine(struct spdk_bdev *bdev);
+static void vbdev_raid_examine(struct spdk_bdev *bdev);
 //static void vbdev_raid_finish(void);
 
 /* Called when SPDK wants to output the bdev specific methods. */
@@ -63,7 +63,7 @@ static struct spdk_bdev_module raid_if = {
 	.module_init = vbdev_raid_init,
 	.config_text = NULL,//vbdev_raid_get_spdk_running_config,
 	.get_ctx_size = NULL,//vbdev_raid_get_ctx_size,
-	.examine = NULL,//vbdev_raid_examine,
+	.examine = vbdev_raid_examine,
 	.module_fini = NULL,//vbdev_raid_finish
 };
 
@@ -126,6 +126,10 @@ static int vbdev_raid_init(void)
 int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 {
 	return 0;
+}
+
+static void vbdev_raid_examine(struct spdk_bdev *bdev) {
+
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)

@@ -4,9 +4,7 @@
   Enable Yes
   Listen 127.0.0.1
 
-[AIO]
-  AIO /dev/nullb0 AIO_0
-  AIO /dev/nullb1 AIO_1
+
   
 [RAID]
   RAIDName dimec
@@ -16,3 +14,6 @@
   Drive AIO_0
   Drive AIO_1
   
+[AIO]
+  AIO /dev/nullb0 AIO_0
+  AIO /dev/nullb1 AIO_1
