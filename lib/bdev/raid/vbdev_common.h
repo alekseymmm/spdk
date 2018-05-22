@@ -18,6 +18,8 @@
 #include "spdk_internal/bdev.h"
 #include "stddef.h"
 
+extern struct rdx_raid *g_raid;
+
 #define RDX_MD_OFFSET 0
 
 #define KERNEL_SECTOR_SIZE_SHIFT (9)

@@ -23,10 +23,13 @@
 #include "vbdev_common.h"
 #include "vbdev_raid.h"
 
+struct rdx_raid *g_raid;
+
 static int vbdev_raid_init(void);
 //static void vbdev_raid_get_spdk_running_config(FILE *fp);
 //static int vbdev_raid_get_ctx_size(void);
 static void vbdev_raid_examine(struct spdk_bdev *bdev);
+static void vbdev_raid_init_complete(void);
 //static void vbdev_raid_finish(void);
 
 /* Called when SPDK wants to output the bdev specific methods. */
@@ -61,6 +64,7 @@ static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
 static struct spdk_bdev_module raid_if = {
 	.name = "raid",
 	.module_init = vbdev_raid_init,
+	.init_complete = vbdev_raid_init_complete,
 	.config_text = NULL,//vbdev_raid_get_spdk_running_config,
 	.get_ctx_size = NULL,//vbdev_raid_get_ctx_size,
 	.examine = vbdev_raid_examine,
@@ -106,7 +110,7 @@ static int vbdev_raid_init(void)
 		if (!ret) {
 
 		}
-		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_RAID, "RAID %s created.\n",
+		SPDK_NOTICELOG("RAID %s created.\n",
 				conf_vbdev_name);
 
 		free(devices.names);
@@ -129,7 +133,28 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 }
 
 static void vbdev_raid_examine(struct spdk_bdev *bdev) {
+	int i, ret;
 
+	for (i = 0; i < g_raid->dev_cnt; i++) {
+		if (strcmp(g_raid->devices[i]->bdev_name, bdev->name) != 0) {
+			continue;
+		}
+
+		ret = rdx_raid_replace(g_raid, i, bdev);
+		if (ret) {
+			SPDK_ERRLOG("Failed to replace device %s on position %d\n",
+					bdev->name, i);
+		}
+		break;
+	}
+	spdk_bdev_module_examine_done(&raid_if);
+}
+
+static void vbdev_raid_init_complete(void)
+{
+	SPDK_NOTICELOG("init complete called for raid module\n");
+
+	return;
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)

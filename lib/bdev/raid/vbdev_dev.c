@@ -9,6 +9,7 @@
 
 void rdx_dev_close(struct rdx_dev *dev);
 void rdx_dev_destroy(struct rdx_dev *dev);
+int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev);
 
 /* Called when the underlying base bdev goes away. */
 static void
@@ -27,10 +28,32 @@ vbdev_raid_examine_hotremove_cb(void *ctx)
 //	}
 }
 
+int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
+{
+	int rc;
+	uint64_t strips_in_dev;
+	struct rdx_raid *raid = dev->raid;
+
+	rc = spdk_bdev_open(bdev, true, vbdev_raid_examine_hotremove_cb,
+			dev, &dev->base_desc);
+	if (rc) {
+		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);
+		return -1;;
+	}
+
+	dev->bdev = bdev;
+	strips_in_dev = (spdk_bdev_get_num_blocks(dev->bdev) - RDX_MD_OFFSET) /
+			raid->stripe_size;
+	dev->size = strips_in_dev * raid->stripe_size;
+
+	return 0;
+}
+
 int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 		int dev_num)
 {
 	struct rdx_dev *dev;
+	struct spdk_bdev *bdev;
 	uint64_t strips_in_dev;
 	int rc = 0;
 
@@ -74,25 +97,18 @@ int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 		goto error;
 	}
 
-	dev->bdev = spdk_bdev_get_by_name(dev->bdev_name);
-	if(!dev->bdev) {
-		SPDK_ERRLOG("Cannot get bdev=%s by name\n", dev->bdev_name);
+	bdev = spdk_bdev_get_by_name(dev->bdev_name);
+	if(!bdev) {
+		SPDK_NOTICELOG("Cannot get bdev=%s by name\n", dev->bdev_name);
 		dev->bdev = NULL;
 		//rdx_dev_clear_state(dev, RDX_DEV_STATE_ONLINE);
 		return 0;
 	}
 
-	rc = spdk_bdev_open(dev->bdev, true, vbdev_raid_examine_hotremove_cb,
-			dev, &dev->base_desc);
-	if (rc) {
-		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);
+	rc = rdx_dev_register(dev, bdev);
+	if (!rc) {
 		goto error;
 	}
-
-
-	strips_in_dev = (spdk_bdev_get_num_blocks(dev->bdev) - RDX_MD_OFFSET) /
-			raid->stripe_size;
-	dev->size = strips_in_dev * raid->stripe_size;
 
 	SPDK_NOTICELOG("Device %s number %d of size %lu sectors added to raid %s\n",
 		 dev->bdev_name, dev->num, dev->size, raid->name);
@@ -142,3 +158,4 @@ void rdx_dev_destroy(struct rdx_dev *dev)
 //		free_page((unsigned long)dev->md);
 	free(dev);
 }
+

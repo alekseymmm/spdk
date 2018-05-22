@@ -10,5 +10,6 @@
 
 int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 		int dev_num);
+int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev);
 
 #endif /* LIB_BDEV_RAID_VBDEV_DEV_H_ */

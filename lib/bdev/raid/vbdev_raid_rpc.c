@@ -44,7 +44,7 @@ static void spdk_rpc_construct_raid_bdev(
 {
 	struct rpc_construct_raid req = {NULL};
 	struct spdk_json_write_ctx *w;
-	int rc;
+	//int rc;
 
 	if (spdk_json_decode_object(params, rpc_construct_raid_decoders,
 				    SPDK_COUNTOF(rpc_construct_raid_decoders),
