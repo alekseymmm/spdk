@@ -132,7 +132,8 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 	return 0;
 }
 
-static void vbdev_raid_examine(struct spdk_bdev *bdev) {
+static void vbdev_raid_examine(struct spdk_bdev *bdev)
+{
 	int i, ret;
 
 	for (i = 0; i < g_raid->dev_cnt; i++) {
@@ -153,7 +154,6 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev) {
 static void vbdev_raid_init_complete(void)
 {
 	SPDK_NOTICELOG("init complete called for raid module\n");
-
 	return;
 }
 

@@ -28,6 +28,7 @@ vbdev_raid_examine_hotremove_cb(void *ctx)
 //	}
 }
 
+
 int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 {
 	int rc;
@@ -54,7 +55,7 @@ int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 {
 	struct rdx_dev *dev;
 	struct spdk_bdev *bdev;
-	uint64_t strips_in_dev;
+//	uint64_t strips_in_dev;
 	int rc = 0;
 
 	dev = calloc(1, sizeof(struct rdx_dev));
