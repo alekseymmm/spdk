@@ -92,6 +92,11 @@
  */
 #define NVME_QUIRK_READ_ZERO_AFTER_DEALLOCATE 0x20
 
+/*
+ * The controller doesn't handle Identify value others than 0 or 1 correctly.
+ */
+#define NVME_QUIRK_IDENTIFY_CNS 0x40
+
 #define NVME_MAX_ASYNC_EVENTS	(8)
 
 #define NVME_MIN_TIMEOUT_PERIOD		(5)
@@ -370,6 +375,9 @@ struct spdk_nvme_ctrlr_process {
 	/** Allocated IO qpairs */
 	TAILQ_HEAD(, spdk_nvme_qpair)			allocated_io_qpairs;
 
+	spdk_nvme_aer_cb				aer_cb_fn;
+	void						*aer_cb_arg;
+
 	/**
 	 * A function pointer to timeout callback function
 	 */
@@ -432,8 +440,6 @@ struct spdk_nvme_ctrlr {
 
 	uint32_t			num_aers;
 	struct nvme_async_event_request	aer[NVME_MAX_ASYNC_EVENTS];
-	spdk_nvme_aer_cb		aer_cb_fn;
-	void				*aer_cb_arg;
 
 	/** guards access to the controller itself, including admin queues */
 	pthread_mutex_t			ctrlr_lock;
@@ -571,6 +577,9 @@ int	nvme_ctrlr_cmd_fw_image_download(struct spdk_nvme_ctrlr *ctrlr,
 		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 void	nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl);
 
+struct spdk_nvme_ctrlr_process *spdk_nvme_ctrlr_get_process(struct spdk_nvme_ctrlr *ctrlr,
+		pid_t pid);
+struct spdk_nvme_ctrlr_process *spdk_nvme_ctrlr_get_current_process(struct spdk_nvme_ctrlr *ctrlr);
 int	nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle);
 void	nvme_ctrlr_free_processes(struct spdk_nvme_ctrlr *ctrlr);
 struct spdk_pci_device *nvme_ctrlr_proc_get_devhandle(struct spdk_nvme_ctrlr *ctrlr);

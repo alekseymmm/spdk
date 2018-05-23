@@ -468,6 +468,19 @@ void spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Allocate all unallocated clusters in this blob and copy data from backing blob.
+ * This call removes dependency on backing blob.
+ *
+ * \param bs blobstore.
+ * \param channel IO channel used to inflate blob.
+ * \param blobid The id of the blob to inflate.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			  spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Open a blob from the given blobstore.
  *
  * \param bs blobstore.
@@ -626,29 +639,6 @@ void spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
  */
 void spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			       uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg);
-
-/*
- * The following spdk_bs_io prefixed functions are deprecated in favor of their corresponding spdk_blob_io
- * function above.
- */
-void spdk_bs_io_write_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			   void *payload, uint64_t offset, uint64_t length,
-			   spdk_blob_op_complete cb_fn, void *cb_arg) __attribute__((deprecated));
-void spdk_bs_io_read_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			  void *payload, uint64_t offset, uint64_t length,
-			  spdk_blob_op_complete cb_fn, void *cb_arg) __attribute__((deprecated));
-void spdk_bs_io_writev_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			    struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
-			    spdk_blob_op_complete cb_fn, void *cb_arg) __attribute__((deprecated));
-void spdk_bs_io_readv_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
-			   spdk_blob_op_complete cb_fn, void *cb_arg) __attribute__((deprecated));
-void spdk_bs_io_unmap_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			   uint64_t offset, uint64_t length,
-			   spdk_blob_op_complete cb_fn, void *cb_arg)  __attribute__((deprecated));
-void spdk_bs_io_write_zeroes_blob(struct spdk_blob *blob, struct spdk_io_channel *channel,
-				  uint64_t offset, uint64_t length,
-				  spdk_blob_op_complete cb_fn, void *cb_arg)  __attribute__((deprecated));
 
 /**
  * Get the first blob of the blobstore. The obtained blob will be passed to

@@ -73,7 +73,7 @@ struct bdev_iscsi_lun {
 	struct spdk_bdev		bdev;
 	struct iscsi_context		*context;
 	char				*initiator_iqn;
-	struct iscsi_url		*url;
+	char				*url;
 	pthread_mutex_t			mutex;
 	uint32_t			ch_count;
 	struct bdev_iscsi_io_channel	*master_ch;
@@ -87,8 +87,9 @@ struct bdev_iscsi_io_channel {
 };
 
 struct bdev_iscsi_conn_req {
-	struct iscsi_url			*url;
+	char					*url;
 	char					*bdev_name;
+	char					*initiator_iqn;
 	struct iscsi_context			*context;
 	TAILQ_ENTRY(bdev_iscsi_conn_req)	link;
 };
@@ -125,6 +126,8 @@ static void iscsi_free_lun(struct bdev_iscsi_lun *lun)
 {
 	assert(lun != NULL);
 	free(lun->bdev.name);
+	free(lun->url);
+	free(lun->initiator_iqn);
 	free(lun);
 }
 
@@ -133,7 +136,6 @@ bdev_iscsi_lun_cleanup(struct bdev_iscsi_lun *lun)
 {
 	TAILQ_REMOVE(&g_iscsi_lun_head, lun, link);
 	iscsi_destroy_context(lun->context);
-	iscsi_destroy_url(lun->url);
 	iscsi_free_lun(lun);
 	if (TAILQ_EMPTY(&g_iscsi_lun_head)) {
 		bdev_iscsi_finish_done();
@@ -214,7 +216,7 @@ bdev_iscsi_rw_cb(struct iscsi_context *context, int status, void *_task, void *_
 	struct bdev_iscsi_io *iscsi_io = _iscsi_io;
 
 	iscsi_io->scsi_status = task->status;
-	iscsi_io->sk = task->sense.key;
+	iscsi_io->sk = (uint8_t)task->sense.key;
 	iscsi_io->asc = (task->sense.ascq >> 8) & 0xFF;
 	iscsi_io->ascq = task->sense.ascq & 0xFF;
 
@@ -429,8 +431,8 @@ bdev_iscsi_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_object_begin(w);
 	spdk_json_write_name(w, "initiator_name");
 	spdk_json_write_string(w, lun->initiator_iqn);
-	spdk_json_write_name(w, "target");
-	spdk_json_write_string(w, lun->url->target);
+	spdk_json_write_name(w, "url");
+	spdk_json_write_string(w, lun->url);
 	spdk_json_write_object_end(w);
 
 	return 0;
@@ -445,7 +447,7 @@ static const struct spdk_bdev_fn_table iscsi_fn_table = {
 };
 
 static struct spdk_bdev *
-create_iscsi_lun(struct iscsi_context *context, struct iscsi_url *url,
+create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn,
 		 const char *name, uint64_t num_blocks, uint32_t block_size)
 {
 	struct bdev_iscsi_lun *lun;
@@ -459,6 +461,7 @@ create_iscsi_lun(struct iscsi_context *context, struct iscsi_url *url,
 
 	lun->context = context;
 	lun->url = url;
+	lun->initiator_iqn = initiator_iqn;
 
 	pthread_mutex_init(&lun->mutex, NULL);
 
@@ -490,24 +493,6 @@ error_return:
 	return NULL;
 }
 
-static struct bdev_iscsi_conn_req *
-bdev_iscsi_allocate_conn_req(struct iscsi_context *context, char *bdev_name, struct iscsi_url *url)
-{
-	struct bdev_iscsi_conn_req *req;
-
-	req = calloc(1, sizeof(struct bdev_iscsi_conn_req));
-	if (!req) {
-		SPDK_ERRLOG("Cannot allocate pointer of struct bdev_iscsi_conn_req\n");
-		return NULL;
-	}
-
-	req->bdev_name = bdev_name;
-	req->url = url;
-	req->context = context;
-
-	return req;
-}
-
 static void
 _bdev_iscsi_set_module_init(void)
 {
@@ -537,7 +522,7 @@ iscsi_readcapacity16_cb(struct iscsi_context *iscsi, int status,
 	}
 
 	readcap16 = scsi_datain_unmarshall(task);
-	bdev = create_iscsi_lun(req->context, req->url, req->bdev_name,
+	bdev = create_iscsi_lun(req->context, req->url, req->initiator_iqn, req->bdev_name,
 				readcap16->returned_lba + 1, readcap16->block_length);
 	if (!bdev) {
 		SPDK_ERRLOG("Unable to create iscsi bdev\n");
@@ -565,6 +550,7 @@ iscsi_connect_cb(struct iscsi_context *iscsi, int status,
 		return;
 	}
 ret:
+	SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(req->context));
 	bdev_iscsi_remove_conn_req(req);
 	bdev_iscsi_set_module_init();
 }
@@ -595,13 +581,76 @@ iscsi_bdev_conn_poll(void *arg)
 }
 
 static int
+create_iscsi_disk(const char *bdev_name, const char *url, const char *initiator_iqn)
+{
+	struct bdev_iscsi_conn_req *req;
+	struct iscsi_url *iscsi_url = NULL;
+	int rc;
+
+	if (!bdev_name || !url || !initiator_iqn || strlen(initiator_iqn) == 0) {
+		return -EINVAL;
+	}
+
+	req = calloc(1, sizeof(struct bdev_iscsi_conn_req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot allocate pointer of struct bdev_iscsi_conn_req\n");
+		return -ENOMEM;
+	}
+
+	req->bdev_name = strdup(bdev_name);
+	req->url = strdup(url);
+	req->initiator_iqn = strdup(initiator_iqn);
+	req->context = iscsi_create_context(initiator_iqn);
+	if (!req->bdev_name || !req->url || !req->initiator_iqn || !req->context) {
+		SPDK_ERRLOG("Out of memory\n");
+		rc = -ENOMEM;
+		goto err;
+	}
+
+	iscsi_url = iscsi_parse_full_url(req->context, url);
+	if (iscsi_url == NULL) {
+		SPDK_ERRLOG("could not parse URL: %s\n", iscsi_get_error(req->context));
+		rc = -EINVAL;
+		goto err;
+	}
+
+	rc = iscsi_set_session_type(req->context, ISCSI_SESSION_NORMAL);
+	rc = rc ? rc : iscsi_set_header_digest(req->context, ISCSI_HEADER_DIGEST_NONE);
+	rc = rc ? rc : iscsi_set_targetname(req->context, iscsi_url->target);
+	rc = rc ? rc : iscsi_full_connect_async(req->context, iscsi_url->portal, iscsi_url->lun,
+						iscsi_connect_cb, req);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to connect provided URL=%s: %s\n", url, iscsi_get_error(req->context));
+		goto err;
+	}
+
+	iscsi_destroy_url(iscsi_url);
+	TAILQ_INSERT_TAIL(&g_iscsi_conn_req, req, link);
+	return 0;
+
+err:
+	/* iscsi_destroy_url() is not NULL-proof */
+	if (iscsi_url) {
+		iscsi_destroy_url(iscsi_url);
+	}
+
+	if (req->context) {
+		iscsi_destroy_context(req->context);
+	}
+
+	free(req->initiator_iqn);
+	free(req->bdev_name);
+	free(req->url);
+	free(req);
+	return rc;
+}
+
+static int
 bdev_iscsi_initialize(void)
 {
 	struct spdk_conf_section *sp;
-	struct iscsi_context *context;
-	struct iscsi_url *url;
-	char *val, *bdev_name, *initiator_iqn;
-	struct bdev_iscsi_conn_req *req;
+
+	const char *url, *bdev_name, *initiator_iqn;
 	int i, rc;
 
 	sp = spdk_conf_find_section(NULL, "iSCSI_Initiator");
@@ -615,54 +664,30 @@ bdev_iscsi_initialize(void)
 		initiator_iqn = DEFAULT_INITIATOR_NAME;
 	}
 
-	i = 0;
-	while (true) {
-		val = spdk_conf_section_get_nmval(sp, "URL", i, 0);
-		if (val == NULL) {
-			break;
-		}
-
+	rc = 0;
+	for (i = 0; (url = spdk_conf_section_get_nmval(sp, "URL", i, 0)) != NULL; i++) {
 		bdev_name = spdk_conf_section_get_nmval(sp, "URL", i, 1);
 		if (bdev_name == NULL) {
-			SPDK_ERRLOG("no bdev name specified for URL %s\n", val);
+			SPDK_ERRLOG("no bdev name specified for URL %s\n", url);
+			rc = -EINVAL;
 			break;
 		}
 
-		context = iscsi_create_context(initiator_iqn);
-		if (context == NULL) {
-			SPDK_ERRLOG("could not create iscsi context\n");
+		rc = create_iscsi_disk(bdev_name, url, initiator_iqn);
+		if (rc) {
 			break;
 		}
-
-		url = iscsi_parse_full_url(context, val);
-		if (url == NULL) {
-			SPDK_ERRLOG("could not parse URL\n");
-			break;
-		}
-
-		req = bdev_iscsi_allocate_conn_req(context, bdev_name, url);
-		if (!req) {
-			_bdev_iscsi_set_module_init();
-			return -1;
-		}
-
-		iscsi_set_session_type(context, ISCSI_SESSION_NORMAL);
-		iscsi_set_header_digest(context, ISCSI_HEADER_DIGEST_NONE);
-		rc = iscsi_full_connect_async(context, url->portal, url->lun, iscsi_connect_cb, req);
-		if (rc < 0) {
-			free(req);
-			SPDK_ERRLOG("Failed to connect provided URL=%s, will ignore it\n", val);
-			continue;
-		}
-
-		TAILQ_INSERT_TAIL(&g_iscsi_conn_req, req, link);
-		i++;
 	}
 
 	if (!TAILQ_EMPTY(&g_iscsi_conn_req)) {
 		g_conn_poller = spdk_poller_register(iscsi_bdev_conn_poll, NULL, 0);
 	}
-	return 0;
+
+	if (rc) {
+		bdev_iscsi_set_module_init();
+	}
+
+	return rc;
 }
 
 SPDK_LOG_REGISTER_COMPONENT("iscsi_init", SPDK_LOG_ISCSI_INIT)

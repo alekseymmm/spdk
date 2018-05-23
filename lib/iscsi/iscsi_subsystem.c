@@ -84,7 +84,7 @@ static void *g_fini_cb_arg;
 "\n"
 
 static void
-spdk_iscsi_config_dump_section(FILE *fp)
+spdk_iscsi_globals_config_text(FILE *fp)
 {
 	const char *authmethod = "None";
 	char authgroup[32] = "None";
@@ -114,104 +114,6 @@ spdk_iscsi_config_dump_section(FILE *fp)
 		g_spdk_iscsi.DefaultTime2Wait, g_spdk_iscsi.DefaultTime2Retain,
 		(g_spdk_iscsi.ImmediateData) ? "Yes" : "No",
 		g_spdk_iscsi.ErrorRecoveryLevel);
-}
-
-
-/* Portal groups */
-static const char *portal_group_section = \
-		"\n"
-		"# Users must change the PortalGroup section(s) to match the IP addresses\n"
-		"#  for their environment.\n"
-		"# PortalGroup sections define which network portals the iSCSI target\n"
-		"# will use to listen for incoming connections.  These are also used to\n"
-		"#  determine which targets are accessible over each portal group.\n"
-		"# Up to 1024 Portal directives are allowed.  These define the network\n"
-		"#  portals of the portal group. The user must specify a IP address\n"
-		"#  for each network portal, and may optionally specify a port and\n"
-		"#  a cpumask. If the port is omitted, 3260 will be used. Cpumask will\n"
-		"#  be used to set the processor affinity of the iSCSI connection\n"
-		"#  through the portal.  If the cpumask is omitted, cpumask will be\n"
-		"#  set to all available processors.\n"
-		"#  Syntax:\n"
-		"#    Portal <Name> <IP address>[:<port>[@<cpumask>]]\n";
-
-#define PORTAL_GROUP_TMPL \
-"[PortalGroup%d]\n" \
-"  Comment \"Portal%d\"\n"
-
-#define PORTAL_TMPL \
-"  Portal DA1 %s:%s@0x%s\n"
-
-static void
-spdk_iscsi_config_dump_portal_groups(FILE *fp)
-{
-	struct spdk_iscsi_portal *p = NULL;
-	struct spdk_iscsi_portal_grp *pg = NULL;
-
-	/* Create portal group section */
-	fprintf(fp, "%s", portal_group_section);
-
-	/* Dump portal groups */
-	TAILQ_FOREACH(pg, &g_spdk_iscsi.pg_head, tailq) {
-		if (NULL == pg) { continue; }
-		fprintf(fp, PORTAL_GROUP_TMPL, pg->tag, pg->tag);
-		/* Dump portals */
-		TAILQ_FOREACH(p, &pg->head, per_pg_tailq) {
-			if (NULL == p) { continue; }
-			fprintf(fp, PORTAL_TMPL, p->host, p->port,
-				spdk_cpuset_fmt(p->cpumask));
-		}
-	}
-}
-
-/* Initiator Groups */
-static const char *initiator_group_section = \
-		"\n"
-		"# Users must change the InitiatorGroup section(s) to match the IP\n"
-		"#  addresses and initiator configuration in their environment.\n"
-		"# Netmask can be used to specify a single IP address or a range of IP addresses\n"
-		"#  Netmask 192.168.1.20   <== single IP address\n"
-		"#  Netmask 192.168.1.0/24 <== IP range 192.168.1.*\n";
-
-#define INITIATOR_GROUP_TMPL \
-"[InitiatorGroup%d]\n" \
-"  Comment \"Initiator Group%d\"\n"
-
-#define INITIATOR_TMPL \
-"  InitiatorName "
-
-#define NETMASK_TMPL \
-"  Netmask "
-
-static void
-spdk_iscsi_config_dump_initiator_groups(FILE *fp)
-{
-	struct spdk_iscsi_init_grp *ig;
-	struct spdk_iscsi_initiator_name *iname;
-	struct spdk_iscsi_initiator_netmask *imask;
-
-	/* Create initiator group section */
-	fprintf(fp, "%s", initiator_group_section);
-
-	/* Dump initiator groups */
-	TAILQ_FOREACH(ig, &g_spdk_iscsi.ig_head, tailq) {
-		if (NULL == ig) { continue; }
-		fprintf(fp, INITIATOR_GROUP_TMPL, ig->tag, ig->tag);
-
-		/* Dump initiators */
-		fprintf(fp, INITIATOR_TMPL);
-		TAILQ_FOREACH(iname, &ig->initiator_head, tailq) {
-			fprintf(fp, "%s ", iname->name);
-		}
-		fprintf(fp, "\n");
-
-		/* Dump netmasks */
-		fprintf(fp, NETMASK_TMPL);
-		TAILQ_FOREACH(imask, &ig->netmask_head, tailq) {
-			fprintf(fp, "%s ", imask->mask);
-		}
-		fprintf(fp, "\n");
-	}
 }
 
 static void
@@ -1011,10 +913,20 @@ spdk_shutdown_iscsi_conns_done(void)
 void
 spdk_iscsi_config_text(FILE *fp)
 {
-	spdk_iscsi_config_dump_section(fp);
-	spdk_iscsi_config_dump_portal_groups(fp);
-	spdk_iscsi_config_dump_initiator_groups(fp);
+	spdk_iscsi_globals_config_text(fp);
+	spdk_iscsi_portal_grps_config_text(fp);
+	spdk_iscsi_init_grps_config_text(fp);
 	spdk_iscsi_tgt_nodes_config_text(fp);
+}
+
+void
+spdk_iscsi_config_json(struct spdk_json_write_ctx *w)
+{
+	spdk_json_write_array_begin(w);
+	spdk_iscsi_portal_grps_config_json(w);
+	spdk_iscsi_init_grps_config_json(w);
+	spdk_iscsi_tgt_nodes_config_json(w);
+	spdk_json_write_array_end(w);
 }
 
 SPDK_LOG_REGISTER_COMPONENT("iscsi", SPDK_LOG_ISCSI)

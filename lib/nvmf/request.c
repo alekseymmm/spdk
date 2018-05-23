@@ -59,6 +59,7 @@ spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 		      rsp->cid, rsp->cdw0, rsp->rsvd1,
 		      *(uint16_t *)&rsp->status);
 
+	TAILQ_REMOVE(&req->qpair->outstanding, req, link);
 	if (spdk_nvmf_transport_req_complete(req)) {
 		SPDK_ERRLOG("Transport request completion error!\n");
 	}
@@ -126,7 +127,11 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 			TAILQ_INSERT_TAIL(&sgroup->queued, req, link);
 			return;
 		}
+
 	}
+
+	/* Place the request on the outstanding list so we can keep track of it */
+	TAILQ_INSERT_TAIL(&qpair->outstanding, req, link);
 
 	if (spdk_unlikely(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC)) {
 		status = spdk_nvmf_ctrlr_process_fabrics_cmd(req);

@@ -94,6 +94,7 @@ struct spdk_env_opts {
  * \param socket_id Socket ID to allocate memory on, or SPDK_ENV_SOCKET_ID_ANY
  * for any socket.
  * \param flags Combination of SPDK_MALLOC flags (\ref SPDK_MALLOC_DMA, \ref SPDK_MALLOC_SHARE).
+ * At least one flag must be specified.
  *
  * \return a pointer to the allocated memory buffer.
  */
@@ -599,17 +600,6 @@ int spdk_pci_ioat_enumerate(spdk_pci_enum_cb enum_cb, void *enum_ctx);
  * \return 0 on success, -1 on failure.
  */
 int spdk_pci_virtio_enumerate(spdk_pci_enum_cb enum_cb, void *enum_ctx);
-
-/**
- * Get PCI device from the given address.
- *
- * \param pci_addr A pointer to the PCI address struct.
- *
- * \return a pointer to the PCI device or NULL if no devide is found at the given
- * address.
- */
-struct spdk_pci_device *spdk_pci_get_device(struct spdk_pci_addr *pci_addr)
-__attribute__((deprecated));
 
 /**
  * Get a mapping of the virtual address to the BAR of the PCI device.

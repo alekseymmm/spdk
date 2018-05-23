@@ -60,9 +60,8 @@ struct spdk_nvmf_tgt {
 
 	uint64_t				discovery_genctr;
 
-	/* Array of subsystem pointers of size max_sid indexed by sid */
+	/* Array of subsystem pointers of size max_subsystems indexed by sid */
 	struct spdk_nvmf_subsystem		**subsystems;
-	uint32_t				max_sid;
 
 	struct spdk_nvmf_discovery_log_page	*discovery_log_page;
 	size_t					discovery_log_page_size;
@@ -154,6 +153,7 @@ struct spdk_nvmf_qpair {
 	uint16_t				sq_head;
 	uint16_t				sq_head_max;
 
+	TAILQ_HEAD(, spdk_nvmf_request)		outstanding;
 	TAILQ_ENTRY(spdk_nvmf_qpair)		link;
 };
 
