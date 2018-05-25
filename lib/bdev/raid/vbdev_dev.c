@@ -28,26 +28,40 @@ vbdev_raid_examine_hotremove_cb(void *ctx)
 //	}
 }
 
-
 int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 {
 	int rc;
 	uint64_t strips_in_dev;
+	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
 
 	rc = spdk_bdev_open(bdev, true, vbdev_raid_examine_hotremove_cb,
 			dev, &dev->base_desc);
 	if (rc) {
 		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);
-		return -1;;
+		return -1;
 	}
+	SPDK_NOTICELOG("bdev %s opened in raid module\n", bdev->name);
 
 	dev->bdev = bdev;
-	strips_in_dev = (spdk_bdev_get_num_blocks(dev->bdev) - RDX_MD_OFFSET) /
+
+	rc = spdk_bdev_module_claim_bdev(bdev, dev->base_desc, dev->raid->module);
+
+	if (rc) {
+		SPDK_ERRLOG("could not open bdev %s\n", spdk_bdev_get_name(bdev));
+		spdk_bdev_close(dev->base_desc);
+		goto error;
+	}
+
+	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
+	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
+			block_size_sectors;
+	strips_in_dev = (dev->size - RDX_MD_OFFSET) /
 			raid->stripe_size;
-	dev->size = strips_in_dev * raid->stripe_size;
 
 	return 0;
+error:
+	return -1;
 }
 
 int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
@@ -138,6 +152,7 @@ void rdx_dev_close(struct rdx_dev *dev)
 
 	/* Remove bdev from device. Do not delete the rdx_dev structure */
 	if (dev->bdev){
+		spdk_bdev_module_release_bdev(dev->bdev);
 		spdk_bdev_close(dev->base_desc);
 	}
 	if (dev->bdev_name)

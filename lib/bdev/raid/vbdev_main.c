@@ -61,7 +61,7 @@ static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
 	.write_config_json	= vbdev_raid_write_json_config,//
 };
 
-static struct spdk_bdev_module raid_if = {
+struct spdk_bdev_module raid_if = {
 	.name = "raid",
 	.module_init = vbdev_raid_init,
 	.init_complete = vbdev_raid_init_complete,
@@ -71,7 +71,7 @@ static struct spdk_bdev_module raid_if = {
 	.module_fini = NULL,//vbdev_raid_finish
 };
 
-SPDK_BDEV_MODULE_REGISTER(&raid_if)
+SPDK_BDEV_MODULE_REGISTER(&raid_if);
 
 static int vbdev_raid_init(void)
 {
@@ -153,8 +153,7 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev)
 
 static void vbdev_raid_init_complete(void)
 {
-	SPDK_NOTICELOG("init complete called for raid module\n");
-	return;
+
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)

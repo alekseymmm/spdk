@@ -19,6 +19,7 @@
 #include "stddef.h"
 
 extern struct rdx_raid *g_raid;
+extern struct spdk_bdev_module raid_if;
 
 #define RDX_MD_OFFSET 0
 
@@ -79,6 +80,10 @@ struct rdx_raid {
 	int stripe_size;
 	int dev_cnt;
 	struct rdx_stripe_dsc stripe_dsc;
+	struct spdk_bdev_module *module;
+	struct spdk_bdev raid_bdev;
+
+	TAILQ_ENTRY(vbdev_passthru)	link;
 };
 
 static inline bool rdx_dev_is_null(char *name)
