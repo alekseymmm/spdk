@@ -15,8 +15,24 @@
 #include "vbdev_dev.h"
 #include "vbdev_raid.h"
 
+
+
 static int rdx_raid_create_devices(struct rdx_raid *raid,
 				struct rdx_devices *devices);
+
+static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx);
+static void vbdev_raid_write_json_config(struct spdk_bdev *bdev,
+					 struct spdk_json_write_ctx *w);
+
+/* When we regsiter our bdev this is how we specify our entry points. */
+static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
+	.destruct		= NULL,//vbdev_passthru_destruct,
+	.submit_request		= NULL,//vbdev_passthru_submit_request,
+	.io_type_supported	= NULL,//vbdev_passthru_io_type_supported,
+	.get_io_channel		= vbdev_raid_get_io_channel,
+	.dump_info_json		= NULL,//vbdev_passthru_info_config_json,
+	.write_config_json	= vbdev_raid_write_json_config,//
+};
 
 int spdk_raid_create(char *name, int level, int stripe_size_kb,
 		struct rdx_devices *devices, uint64_t raid_size)
@@ -43,6 +59,9 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 	g_raid->raid_bdev.optimal_io_boundary = 1; // test 0
 	g_raid->raid_bdev.blocklen = 4096;
 	g_raid->raid_bdev.blockcnt = 0; // will be increased later
+	g_raid->raid_bdev.ctxt = g_raid; // not so sure about this
+	g_raid->raid_bdev.fn_table = &vbdev_raid_fn_table;
+	g_raid->raid_bdev.module = &raid_if;
 //	if (!raid_size)
 //		set_bit(RDX_RAID_STATE_CREATE, &raid->state);
 
@@ -137,21 +156,59 @@ int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
 static int
 raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 {
-	struct pt_io_channel *pt_ch = ctx_buf;
-	struct vbdev_passthru *pt_node = io_device;
-
-	pt_ch->base_ch = spdk_bdev_get_io_channel(pt_node->base_desc);
+	/*
+	 * we probably have to create our own poller here
+	 */
+//	struct pt_io_channel *pt_ch = ctx_buf;
+//	struct vbdev_passthru *pt_node = io_device;
+//
+//	pt_ch->base_ch = spdk_bdev_get_io_channel(pt_node->base_desc);
 
 	return 0;
+}
+
+/* We provide this callback for the SPDK channel code to destroy a channel
+ * created with our create callback. We just need to undo anything we did
+ * when we created. If this bdev used its own poller, we'd unregsiter it here.
+ */
+static void
+raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
+{
+	//struct pt_io_channel *pt_ch = ctx_buf;
+
+	//pdk_put_io_channel(pt_ch->base_ch);
+}
+
+
+static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx)
+{
+	struct rdx_raid *raid = ctx;
+
+	return spdk_get_io_channel(raid);
 }
 
 int rdx_raid_register(struct rdx_raid *raid)
 {
 	struct spdk_bdev **base_bdevs;
 	int rc = 0;
+	int i;
 
 	SPDK_NOTICELOG("init complete called for raid module\n");
-	base_bdevs = calloc(g_raid->dev_cnt, sizeof(struct spdk_bdev *));
+	base_bdevs = calloc(raid->dev_cnt, sizeof(struct spdk_bdev *));
+	if (!base_bdevs) {
+		SPDK_ERRLOG("Cannot allcoate memory for bdevs list\n");
+		return -1;
+	}
+
+	spdk_io_device_register(raid, raid_bdev_ch_create_cb,
+				raid_bdev_ch_destroy_cb,
+				sizeof(struct rdx_raid_io_channel));
+
+	SPDK_NOTICELOG("io_device  for raid registered \n");
+
+	for (i = 0; i < raid->dev_cnt; i++) {
+		base_bdevs[i] = raid->devices[i]->bdev;
+	}
 
 	rc = spdk_vbdev_register(&g_raid->raid_bdev, base_bdevs, g_raid->dev_cnt);
 	if (rc) {
@@ -161,13 +218,29 @@ int rdx_raid_register(struct rdx_raid *raid)
 	SPDK_NOTICELOG("vbdev raid registered with name: %s\n",
 			raid->raid_bdev.name);
 
-	spdk_io_device_register(raid, pt_bdev_ch_create_cb, pt_bdev_ch_destroy_cb,
-				sizeof(struct pt_io_channel));
 
 error:
 	free(base_bdevs);
 
 	return rc;
+}
 
+
+/* Called when SPDK wants to output the bdev specific methods. */
+static void
+vbdev_raid_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	//struct vbdev_passthru *pt_node = SPDK_CONTAINEROF(bdev, struct vbdev_passthru, pt_bdev);
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_passthru_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	//spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(pt_node->base_bdev));
+	//spdk_json_write_named_string(w, "raid_bdev_name", spdk_bdev_get_name(bdev));
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
 }
 

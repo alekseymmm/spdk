@@ -52,6 +52,15 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 		spdk_bdev_close(dev->base_desc);
 		goto error;
 	}
+	SPDK_NOTICELOG("bdev %s claimed by raid module\n", bdev->name);
+
+	dev->io_channel = spdk_bdev_get_io_channel(dev->base_desc);
+	if (!dev->io_channel){
+		SPDK_ERRLOG("could not open bdev %s\n", spdk_bdev_get_name(bdev));
+		spdk_bdev_close(dev->base_desc);
+		spdk_bdev_module_release_bdev(dev->base_desc);
+		goto error;
+	}
 
 	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
 	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
@@ -150,8 +159,13 @@ void rdx_dev_close(struct rdx_dev *dev)
 //	rdx_dev_put_ref(dev);
 //	wait_event(dev->wait, !atomic_read(&dev->ref_cnt));
 
+	if (!dev->io_channel) {
+		spdk_put_io_channel(dev->io_channel);
+	}
+
 	/* Remove bdev from device. Do not delete the rdx_dev structure */
 	if (dev->bdev){
+
 		spdk_bdev_module_release_bdev(dev->bdev);
 		spdk_bdev_close(dev->base_desc);
 	}

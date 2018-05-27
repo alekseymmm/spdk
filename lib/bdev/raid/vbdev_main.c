@@ -32,35 +32,6 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev);
 static void vbdev_raid_init_complete(void);
 //static void vbdev_raid_finish(void);
 
-/* Called when SPDK wants to output the bdev specific methods. */
-static void
-vbdev_raid_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
-{
-	//struct vbdev_passthru *pt_node = SPDK_CONTAINEROF(bdev, struct vbdev_passthru, pt_bdev);
-
-	spdk_json_write_object_begin(w);
-
-	spdk_json_write_named_string(w, "method", "construct_passthru_bdev");
-
-	spdk_json_write_named_object_begin(w, "params");
-	//spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(pt_node->base_bdev));
-	//spdk_json_write_named_string(w, "raid_bdev_name", spdk_bdev_get_name(bdev));
-	spdk_json_write_object_end(w);
-
-	spdk_json_write_object_end(w);
-}
-
-
-/* When we regsiter our bdev this is how we specify our entry points. */
-static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
-	.destruct		= NULL,//vbdev_passthru_destruct,
-	.submit_request		= NULL,//vbdev_passthru_submit_request,
-	.io_type_supported	= NULL,//vbdev_passthru_io_type_supported,
-	.get_io_channel		= NULL,//vbdev_passthru_get_io_channel,
-	.dump_info_json		= NULL,//vbdev_passthru_info_config_json,
-	.write_config_json	= vbdev_raid_write_json_config,//
-};
-
 struct spdk_bdev_module raid_if = {
 	.name = "raid",
 	.module_init = vbdev_raid_init,
@@ -136,24 +107,29 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev)
 {
 	int i, ret;
 
-	for (i = 0; i < g_raid->dev_cnt; i++) {
-		if (strcmp(g_raid->devices[i]->bdev_name, bdev->name) != 0) {
-			continue;
-		}
+	if (g_raid)
+	{
+		for (i = 0; i < g_raid->dev_cnt; i++) {
+			if (strcmp(g_raid->devices[i]->bdev_name, bdev->name) != 0) {
+				continue;
+			}
 
-		ret = rdx_raid_replace(g_raid, i, bdev);
-		if (ret) {
-			SPDK_ERRLOG("Failed to replace device %s on position %d\n",
-					bdev->name, i);
+			ret = rdx_raid_replace(g_raid, i, bdev);
+			if (ret) {
+				SPDK_ERRLOG("Failed to replace device %s on"
+					    " position %d\n", bdev->name, i);
+			}
+			break;
 		}
-		break;
 	}
 	spdk_bdev_module_examine_done(&raid_if);
 }
 
 static void vbdev_raid_init_complete(void)
 {
-
+	if (g_raid) {
+		rdx_raid_register(g_raid);
+	}
 }
 
-SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID)
+SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID);

@@ -49,6 +49,11 @@ enum rdx_raid_state_shift {
 #define RDX_RAID_STATE_DEGRADED (1 << RDX_RAID_STATE_DEGRADED_SHIFT)
 #define RDX_RAID_STATE_CREATE (1 << RDX_RAID_STATE_CREATE_SHIFT)
 
+struct rdx_raid_io_channel {
+	struct spdk_poller *poller;
+	//something else
+};
+
 struct rdx_devices {
 	char **names;
 	int cnt;
@@ -61,6 +66,7 @@ struct rdx_dev {
 	struct rdx_raid *raid;
 	char *bdev_name;
 	struct spdk_bdev_desc *base_desc;
+	struct spdk_io_channel *io_channel;
 };
 
 struct rdx_stripe_dsc {
