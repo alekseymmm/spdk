@@ -30,6 +30,10 @@ extern struct spdk_bdev_module raid_if;
 #define RDX_MAX_PATH_LEN 256
 #define RDX_MAX_NAME_LEN 32
 
+#define RDX_SECTOR_SIZE 512
+#define RDX_BLOCK_SIZE 4096
+#define RDX_BLOCK_SIZE_SECTORS (RDX_BLOCK_SIZE / KERNEL_SECTOR_SIZE)
+
 enum rdx_raid_state_shift {
 	RDX_RAID_STATE_ONLINE_SHIFT = 0,
 	RDX_RAID_STATE_DEGRADED_SHIFT,
@@ -51,6 +55,7 @@ enum rdx_raid_state_shift {
 
 struct rdx_raid_io_channel {
 	struct spdk_poller *poller;
+	struct rdx_raid *raid;
 	//something else
 };
 

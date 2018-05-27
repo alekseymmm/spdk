@@ -31,7 +31,6 @@ vbdev_raid_examine_hotremove_cb(void *ctx)
 int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 {
 	int rc;
-	uint64_t strips_in_dev;
 	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
 
@@ -58,15 +57,20 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	if (!dev->io_channel){
 		SPDK_ERRLOG("could not open bdev %s\n", spdk_bdev_get_name(bdev));
 		spdk_bdev_close(dev->base_desc);
-		spdk_bdev_module_release_bdev(dev->base_desc);
+		spdk_bdev_module_release_bdev(dev->bdev);
 		goto error;
 	}
 
 	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
 	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
-			block_size_sectors;
-	strips_in_dev = (dev->size - RDX_MD_OFFSET) /
-			raid->stripe_size;
+			block_size_sectors - RDX_MD_OFFSET;
+	if (raid->size) { //create raid
+		if (dev->size < raid->dev_size) {
+			raid->dev_size = dev->size;
+		}
+	} else { // restore raid
+		//to be done
+	}
 
 	return 0;
 error:

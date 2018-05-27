@@ -57,8 +57,8 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 	g_raid->raid_bdev.write_cache = 0;
 	g_raid->raid_bdev.need_aligned_buffer = 1; // test 0
 	g_raid->raid_bdev.optimal_io_boundary = 1; // test 0
-	g_raid->raid_bdev.blocklen = 4096;
-	g_raid->raid_bdev.blockcnt = 0; // will be increased later
+	g_raid->raid_bdev.blocklen = RDX_BLOCK_SIZE;
+	g_raid->raid_bdev.blockcnt = raid_size / RDX_BLOCK_SIZE_SECTORS;
 	g_raid->raid_bdev.ctxt = g_raid; // not so sure about this
 	g_raid->raid_bdev.fn_table = &vbdev_raid_fn_table;
 	g_raid->raid_bdev.module = &raid_if;
@@ -147,6 +147,11 @@ int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
 			raid->name, bdev->name, dev_num);
 	return 0;
 }
+
+static int vbdev_raid_poll(void *arg)
+{
+	return 0;
+}
 /* We provide this callback for the SPDK channel code to create a channel using
  * the channel struct we provided in our module get_io_channel() entry point. Here
  * we get and save off an underlying base channel of the device below us so that
@@ -156,13 +161,12 @@ int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
 static int
 raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 {
-	/*
-	 * we probably have to create our own poller here
-	 */
-//	struct pt_io_channel *pt_ch = ctx_buf;
-//	struct vbdev_passthru *pt_node = io_device;
-//
-//	pt_ch->base_ch = spdk_bdev_get_io_channel(pt_node->base_desc);
+
+	struct rdx_raid_io_channel *raid_ch = ctx_buf;
+	struct rdx_raid *raid = io_device;
+
+	raid_ch->raid = raid;
+	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
 
 	return 0;
 }
@@ -174,9 +178,9 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 static void
 raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 {
-	//struct pt_io_channel *pt_ch = ctx_buf;
+	struct rdx_raid_io_channel *raid_ch = ctx_buf;
 
-	//pdk_put_io_channel(pt_ch->base_ch);
+	spdk_poller_unregister(&raid_ch->poller);
 }
 
 
@@ -200,6 +204,10 @@ int rdx_raid_register(struct rdx_raid *raid)
 		return -1;
 	}
 
+	if (raid->size == 0) {
+		raid->size = raid->dev_size * raid->dev_cnt;
+		raid->raid_bdev.blockcnt = raid->size / RDX_BLOCK_SIZE_SECTORS;
+	}
 	spdk_io_device_register(raid, raid_bdev_ch_create_cb,
 				raid_bdev_ch_destroy_cb,
 				sizeof(struct rdx_raid_io_channel));
