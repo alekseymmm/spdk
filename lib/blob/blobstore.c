@@ -234,7 +234,7 @@ _spdk_blob_mark_clean(struct spdk_blob *blob)
 		assert(blob->active.clusters);
 		clusters = calloc(blob->active.num_clusters, sizeof(*blob->active.clusters));
 		if (!clusters) {
-			return -1;
+			return -ENOMEM;
 		}
 		memcpy(clusters, blob->active.clusters, blob->active.num_clusters * sizeof(*clusters));
 	}
@@ -244,7 +244,7 @@ _spdk_blob_mark_clean(struct spdk_blob *blob)
 		pages = calloc(blob->active.num_pages, sizeof(*blob->active.pages));
 		if (!pages) {
 			free(clusters);
-			return -1;
+			return -ENOMEM;
 		}
 		memcpy(pages, blob->active.pages, blob->active.num_pages * sizeof(*pages));
 	}
@@ -678,7 +678,7 @@ _spdk_blob_serialize_xattrs(const struct spdk_blob *blob,
 				spdk_dma_free(*pages);
 				*pages = NULL;
 				*page_count = 0;
-				return -1;
+				return rc;
 			}
 		}
 
@@ -952,6 +952,8 @@ _spdk_blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 struct spdk_blob_persist_ctx {
 	struct spdk_blob		*blob;
+
+	struct spdk_bs_super_block	*super;
 
 	struct spdk_blob_md_page	*pages;
 
@@ -1277,6 +1279,7 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 	struct spdk_blob_store *bs = blob->bs;
 	uint64_t i;
 	uint32_t page_num;
+	void *tmp;
 	int rc;
 
 	if (blob->active.num_pages == 0) {
@@ -1300,12 +1303,12 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 	assert(blob->active.num_pages >= 1);
 
 	/* Resize the cache of page indices */
-	blob->active.pages = realloc(blob->active.pages,
-				     blob->active.num_pages * sizeof(*blob->active.pages));
-	if (!blob->active.pages) {
+	tmp = realloc(blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
+	if (!tmp) {
 		_spdk_blob_persist_complete(seq, ctx, -ENOMEM);
 		return;
 	}
+	blob->active.pages = tmp;
 
 	/* Assign this metadata to pages. This requires two passes -
 	 * one to verify that there are enough pages and a second
@@ -1340,6 +1343,34 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 	_spdk_blob_persist_write_page_chain(seq, ctx, 0);
 }
 
+static void
+_spdk_blob_persist_dirty_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+
+	ctx->blob->bs->clean = 0;
+
+	spdk_dma_free(ctx->super);
+
+	_spdk_blob_persist_start(ctx);
+}
+
+static void
+_spdk_bs_write_super(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
+		     struct spdk_bs_super_block *super, spdk_bs_sequence_cpl cb_fn, void *cb_arg);
+
+
+static void
+_spdk_blob_persist_dirty(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+
+	ctx->super->clean = 0;
+
+	_spdk_bs_write_super(seq, ctx->blob->bs, ctx->super, _spdk_blob_persist_dirty_cpl, ctx);
+}
+
+
 /* Write a blob to disk */
 static void
 _spdk_blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
@@ -1364,7 +1395,20 @@ _spdk_blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 
-	_spdk_blob_persist_start(ctx);
+	if (blob->bs->clean) {
+		ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+		if (!ctx->super) {
+			cb_fn(seq, cb_arg, -ENOMEM);
+			free(ctx);
+			return;
+		}
+
+		spdk_bs_sequence_read_dev(seq, ctx->super, _spdk_bs_page_to_lba(blob->bs, 0),
+					  _spdk_bs_byte_to_lba(blob->bs, sizeof(*ctx->super)),
+					  _spdk_blob_persist_dirty, ctx);
+	} else {
+		_spdk_blob_persist_start(ctx);
+	}
 }
 
 struct spdk_blob_copy_cluster_ctx {
@@ -2617,7 +2661,7 @@ _spdk_bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 }
 
 static void
-_spdk_bs_load_write_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+_spdk_bs_load_read_used_pages(spdk_bs_sequence_t *seq, void *cb_arg)
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 	uint64_t lba, lba_count, mask_size;
@@ -2667,7 +2711,7 @@ _spdk_bs_load_replay_md_parse_page(const struct spdk_blob_md_page *page, struct 
 					if (cluster_idx != 0) {
 						spdk_bit_array_set(bs->used_clusters, cluster_idx + j);
 						if (bs->num_free_clusters == 0) {
-							return -1;
+							return -ENOSPC;
 						}
 						bs->num_free_clusters--;
 					}
@@ -2675,7 +2719,7 @@ _spdk_bs_load_replay_md_parse_page(const struct spdk_blob_md_page *page, struct 
 				}
 			}
 			if (cluster_count == 0) {
-				return -1;
+				return -EINVAL;
 			}
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
 			/* Skip this item */
@@ -2685,7 +2729,7 @@ _spdk_bs_load_replay_md_parse_page(const struct spdk_blob_md_page *page, struct 
 			/* Skip this item */
 		} else {
 			/* Error */
-			return -1;
+			return -EINVAL;
 		}
 		/* Advance to the next descriptor */
 		cur_desc += sizeof(*desc) + desc->length;
@@ -2905,6 +2949,7 @@ _spdk_bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	/* Parse the super block */
+	ctx->bs->clean = 1;
 	ctx->bs->cluster_sz = ctx->super->cluster_size;
 	ctx->bs->total_clusters = ctx->bs->dev->blockcnt / (ctx->bs->cluster_sz / ctx->bs->dev->blocklen);
 	ctx->bs->pages_per_cluster = ctx->bs->cluster_sz / SPDK_BS_PAGE_SIZE;
@@ -2924,10 +2969,10 @@ _spdk_bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		 *  using _spdk_bs_recover.
 		 */
 		ctx->super->clean = 0;
+		ctx->bs->clean = 0;
 		_spdk_bs_write_super(seq, ctx->bs, ctx->super, _spdk_bs_recover, ctx);
 	} else {
-		ctx->super->clean = 0;
-		_spdk_bs_write_super(seq, ctx->bs, ctx->super, _spdk_bs_load_write_super_cpl, ctx);
+		_spdk_bs_load_read_used_pages(seq, ctx);
 	}
 }
 
@@ -2986,6 +3031,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	if (!ctx->super) {
 		free(ctx);
 		_spdk_bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
 
@@ -3125,6 +3171,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	if (!ctx->super) {
 		free(ctx);
 		_spdk_bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
 	memcpy(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
@@ -4795,7 +4842,7 @@ _spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value
 
 	xattr = calloc(1, sizeof(*xattr));
 	if (!xattr) {
-		return -1;
+		return -ENOMEM;
 	}
 	xattr->name = strdup(name);
 	xattr->value_len = value_len;

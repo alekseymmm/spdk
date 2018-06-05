@@ -144,6 +144,15 @@ struct spdk_nvme_ctrlr_opts {
 	 * Set to all zeroes to specify that no host ID should be provided to the controller.
 	 */
 	uint8_t extended_host_id[16];
+
+	/**
+	 * The I/O command set to select.
+	 *
+	 * If the requested command set is not supported, the controller
+	 * initialization process will not proceed. By default, the NVM
+	 * command set is used.
+	 */
+	enum spdk_nvme_cc_css command_set;
 };
 
 /**
@@ -802,7 +811,7 @@ int spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr,
  *              For admin commands, pass NULL for the qpair.
  * \param cid Command ID of the command to abort.
  * \param cb_fn Callback function to invoke when the abort has completed.
- * \param cb_arg Argument to pass to the callback function.\
+ * \param cb_arg Argument to pass to the callback function.
  *
  * \return 0 if successfully submitted, negated errno value otherwise.
  *
