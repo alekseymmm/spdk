@@ -15,7 +15,7 @@
 #include "spdk/bdev.h"
 #include "spdk/log.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "stddef.h"
 
 extern struct rdx_raid *g_raid;

@@ -9,7 +9,7 @@
 #include "spdk/bdev.h"
 #include "spdk/log.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 
 #include "vbdev_common.h"
 #include "vbdev_dev.h"
