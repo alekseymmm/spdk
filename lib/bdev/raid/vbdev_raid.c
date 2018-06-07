@@ -15,7 +15,7 @@
 #include "vbdev_dev.h"
 #include "vbdev_raid.h"
 
-
+#include "llist.h"
 
 static int rdx_raid_create_devices(struct rdx_raid *raid,
 				struct rdx_devices *devices);
