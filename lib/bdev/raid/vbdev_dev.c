@@ -64,8 +64,9 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
 	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
 			block_size_sectors - RDX_MD_OFFSET;
-	if (raid->size) { //create raid
-		if (dev->size < raid->dev_size) {
+	//TODO: do it the same way as in raidix_nvme, not like this!
+	if (!raid->size) { //create raid
+		if (dev->size < raid->dev_size || raid->dev_size == 0) {
 			raid->dev_size = dev->size;
 		}
 	} else { // restore raid

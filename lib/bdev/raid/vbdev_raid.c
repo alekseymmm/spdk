@@ -64,7 +64,12 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 	g_raid->raid_bdev.optimal_io_boundary = 1; // test 0
 	g_raid->raid_bdev.blocklen = RDX_BLOCK_SIZE;
 	g_raid->raid_bdev.blockcnt = raid_size / RDX_BLOCK_SIZE_SECTORS;
-	g_raid->raid_bdev.ctxt = g_raid; // not so sure about this
+	// not so sure about this,
+	// why not ? it seems fine.  You can get ptr to raid, having ptr to bdev
+	// for example in submit request. Though you can alose get ptr to raid
+	// from io_cahnnel there...
+	g_raid->raid_bdev.ctxt = g_raid;
+
 	g_raid->raid_bdev.fn_table = &vbdev_raid_fn_table;
 	g_raid->raid_bdev.module = &raid_if;
 //	if (!raid_size)
@@ -161,7 +166,7 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 
 	req = rdx_req_create(bdev_io);
 	if (!req) {
-		SPDK_ERRLOG("Cannot crete request \n");
+		SPDK_ERRLOG("Cannot create request \n");
 		return;
 	}
 
