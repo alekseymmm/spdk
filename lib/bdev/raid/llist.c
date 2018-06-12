@@ -1,6 +1,8 @@
 #include <stdatomic.h>
 
+#include "vbdev_common.h"
 #include "compiler.h"
+#include "llist.h"
 
 /**
  * llist_add_batch - add several linked entries in batch

@@ -20,14 +20,18 @@
 static int rdx_raid_create_devices(struct rdx_raid *raid,
 				struct rdx_devices *devices);
 
+static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
+				struct spdk_bdev_io *bdev_io);
 static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx);
+
 static void vbdev_raid_write_json_config(struct spdk_bdev *bdev,
 					 struct spdk_json_write_ctx *w);
+
 
 /* When we regsiter our bdev this is how we specify our entry points. */
 static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
 	.destruct		= NULL,//vbdev_passthru_destruct,
-	.submit_request		= NULL,//vbdev_passthru_submit_request,
+	.submit_request		= vbdev_raid_submit_request,
 	.io_type_supported	= NULL,//vbdev_passthru_io_type_supported,
 	.get_io_channel		= vbdev_raid_get_io_channel,
 	.dump_info_json		= NULL,//vbdev_passthru_info_config_json,
@@ -146,6 +150,33 @@ int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
 	SPDK_NOTICELOG("raid %s device=%s replaced on pos %d\n",
 			raid->name, bdev->name, dev_num);
 	return 0;
+}
+
+static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
+				struct spdk_bdev_io *bdev_io)
+{
+	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
+			assert(bdev_io->u.bdev.iovcnt == 1);
+			bdev_io->u.bdev.iovs[0].iov_base = g_null_read_buf;
+			bdev_io->u.bdev.iovs[0].iov_len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+		}
+		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+	case SPDK_BDEV_IO_TYPE_RESET:
+		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
+		break;
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	default:
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		break;
+	}
 }
 
 static int vbdev_raid_poll(void *arg)

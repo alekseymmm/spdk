@@ -97,6 +97,14 @@ struct rdx_raid {
 	TAILQ_ENTRY(vbdev_passthru)	link;
 };
 
+struct rdx_req {
+	uibt64_t addr;
+	unsigned int len;
+	struct rdx_raid *raid;
+	struct spdk_bdev_io *bdev_io;
+	struct llist_node thread_lnode;
+};
+
 static inline bool rdx_dev_is_null(char *name)
 {
 	if (!strncmp(name, "null", RDX_MAX_PATH_LEN))
