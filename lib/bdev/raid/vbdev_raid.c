@@ -15,6 +15,7 @@
 #include "vbdev_dev.h"
 #include "vbdev_raid.h"
 
+#include "vbdev_req.h"
 #include "llist.h"
 
 static int rdx_raid_create_devices(struct rdx_raid *raid,
@@ -156,31 +157,28 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io)
 {
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct rdx_req *req;
 
-	switch (bdev_io->type) {
-	case SPDK_BDEV_IO_TYPE_READ:
-		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
-			assert(bdev_io->u.bdev.iovcnt == 1);
-			bdev_io->u.bdev.iovs[0].iov_base = g_null_read_buf;
-			bdev_io->u.bdev.iovs[0].iov_len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
-		}
-		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE:
-	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-	case SPDK_BDEV_IO_TYPE_RESET:
-		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
-		break;
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-	case SPDK_BDEV_IO_TYPE_UNMAP:
-	default:
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		break;
+	req = rdx_req_create(bdev_io);
+	if (!req) {
+		SPDK_ERRLOG("Cannot crete request \n");
+		return;
 	}
+
+	llist_add(&req->thread_lnode, &ch->req_llist);
 }
 
 static int vbdev_raid_poll(void *arg)
 {
+	struct rdx_raid_io_channel *ch = arg;
+	struct rdx_req *req;
+	struct llist_node *first;
+
+	first = llist_del_first(&ch->req_llist);
+	req = llist_entry(first, struct rdx_req, thread_lnode);
+
+	spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+
 	return 0;
 }
 /* We provide this callback for the SPDK channel code to create a channel using
@@ -198,6 +196,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 
 	raid_ch->raid = raid;
 	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
+	init_llist_head(&raid_ch->req_llist);
 
 	return 0;
 }

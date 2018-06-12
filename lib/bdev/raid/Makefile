@@ -41,6 +41,7 @@ C_SRCS = vbdev_raid.c 		\
 	 vbdev_raid_rpc.c 	\
 	 vbdev_main.c 		\
 	 vbdev_bitops.c 	\
+	 vbdev_req.c 		\
 	 llist.c
 	 
 LIBNAME = vbdev_raid

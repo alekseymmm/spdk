@@ -18,6 +18,8 @@
 #include "spdk/bdev_module.h"
 #include "stddef.h"
 
+#include "llist.h"
+
 extern struct rdx_raid *g_raid;
 extern struct spdk_bdev_module raid_if;
 
@@ -49,13 +51,25 @@ enum rdx_raid_state_shift {
 	RDX_RAID_STATE_NEED_RESTRIPING_SHIFT,
 };
 
+
 #define RDX_RAID_STATE_ONLINE (1 << RDX_RAID_STATE_ONLINE_SHIFT)
 #define RDX_RAID_STATE_DEGRADED (1 << RDX_RAID_STATE_DEGRADED_SHIFT)
 #define RDX_RAID_STATE_CREATE (1 << RDX_RAID_STATE_CREATE_SHIFT)
 
+enum rdx_req_type {
+	RDX_REQ_TYPE_READ = 0,
+	RDX_REQ_TYPE_WRITE,
+	RDX_REQ_TYPE_RECON,
+	RDX_REQ_TYPE_INIT,
+	RDX_REQ_TYPE_RESTRIPE,
+	RDX_REQ_TYPE_BACKUP,
+	RDX_REQ_TYPE_COUNT,
+};
+
 struct rdx_raid_io_channel {
 	struct spdk_poller *poller;
 	struct rdx_raid *raid;
+	struct llist_head req_llist;
 	//something else
 };
 
@@ -98,11 +112,12 @@ struct rdx_raid {
 };
 
 struct rdx_req {
-	uibt64_t addr;
+	uint64_t addr;
 	unsigned int len;
 	struct rdx_raid *raid;
 	struct spdk_bdev_io *bdev_io;
 	struct llist_node thread_lnode;
+	enum rdx_req_type type;
 };
 
 static inline bool rdx_dev_is_null(char *name)
