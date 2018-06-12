@@ -75,17 +75,57 @@ struct spdk_io_channel;
 struct spdk_blob;
 struct spdk_xattr_names;
 
+/**
+ * Blobstore operation completion callback.
+ *
+ * \param cb_arg Callback argument.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_bs_op_complete)(void *cb_arg, int bserrno);
+
+/**
+ * Blobstore operation completion callback with handle.
+ *
+ * \param cb_arg Callback argument.
+ * \param bs Handle to a blobstore.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_bs_op_with_handle_complete)(void *cb_arg, struct spdk_blob_store *bs,
 		int bserrno);
+
+/**
+ * Blob operation completion callback.
+ *
+ * \param cb_arg Callback argument.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_blob_op_complete)(void *cb_arg, int bserrno);
+
+/**
+ * Blob operation completion callback with blob ID.
+ *
+ * \param cb_arg Callback argument.
+ * \param blobid Blob ID.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_blob_op_with_id_complete)(void *cb_arg, spdk_blob_id blobid, int bserrno);
+
+/**
+ * Blob operation completion callback with handle.
+ *
+ * \param cb_arg Callback argument.
+ * \param bs Handle to a blob.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_blob_op_with_handle_complete)(void *cb_arg, struct spdk_blob *blb, int bserrno);
 
-
-/* Calls to function pointers of this type must obey all of the normal
-   rules for channels. The channel passed to this completion must match
-   the channel the operation was initiated on. */
+/**
+ * Blobstore device completion callback.
+ *
+ * \param channel I/O channel the operation was initiated on.
+ * \param cb_arg Callback argument.
+ * \param bserrno 0 if it completed successfully, or negative errno if it failed.
+ */
 typedef void (*spdk_bs_dev_cpl)(struct spdk_io_channel *channel,
 				void *cb_arg, int bserrno);
 
@@ -198,6 +238,20 @@ void spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 void spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
 
+typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const char *name,
+		const void *value, size_t value_length);
+
+/**
+ * Dump a blobstore's metadata to a given FILE in human-readable format.
+ *
+ * \param dev Blobstore block device.
+ * \param fp FILE pointer to dump the metadata contents.
+ * \param print_xattr_fn Callback function to interpret external xattrs.
+ * \param cb_fn Called when the dump is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
+		  spdk_bs_op_complete cb_fn, void *cb_arg);
 /**
  * Destroy the blobstore.
  *
@@ -494,6 +548,7 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until
  * spdk_bs_md_sync_blob() is called.
+ * If called before previous resize finish, it will fail with errno -EBUSY
  *
  * \param blob Blob to resize.
  * \param sz The new number of clusters.

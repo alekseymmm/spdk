@@ -211,6 +211,20 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_error_bdev)
 
     @call_cmd
+    def construct_iscsi_bdev(args):
+        rpc.bdev.construct_iscsi_bdev(args.client,
+                                      name=args.name,
+                                      url=args.url,
+                                      initiator_iqn=args.initiator_iqn)
+
+    p = subparsers.add_parser('construct_iscsi_bdev',
+                              help='Add bdev with iSCSI initiator backend')
+    p.add_argument('-b', '--name', help="Name of the bdev", required=True)
+    p.add_argument('-i', '--initiator-iqn', help="Initiator IQN", required=True)
+    p.add_argument('--url', help="iSCSI Lun URL", required=True)
+    p.set_defaults(func=construct_iscsi_bdev)
+
+    @call_cmd
     def construct_pmem_bdev(args):
         print_array(rpc.bdev.construct_pmem_bdev(args.client,
                                                  pmem_file=args.pmem_file,
@@ -763,9 +777,9 @@ if __name__ == "__main__":
     # nbd
     @call_cmd
     def start_nbd_disk(args):
-        rpc.nbd.start_nbd_disk(args.client,
-                               bdev_name=args.bdev_name,
-                               nbd_device=args.nbd_device)
+        print(rpc.nbd.start_nbd_disk(args.client,
+                                     bdev_name=args.bdev_name,
+                                     nbd_device=args.nbd_device))
 
     p = subparsers.add_parser('start_nbd_disk', help='Export a bdev as a nbd disk')
     p.add_argument('bdev_name', help='Blockdev name to be exported. Example: Malloc0.')
@@ -818,6 +832,27 @@ if __name__ == "__main__":
     p.set_defaults(func=get_interfaces)
 
     # NVMe-oF
+    @call_cmd
+    def set_nvmf_target_options(args):
+        rpc.nvmf.set_nvmf_target_options(args.client, args)
+
+    p = subparsers.add_parser('set_nvmf_target_options', help='Set NVMf target options')
+    p.add_argument('-q', '--max-queue-depth', help='Max number of outstanding I/O per queue', type=int)
+    p.add_argument('-p', '--max-qpairs-per-session', help='Max number of SQ and CQ per session', type=int)
+    p.add_argument('-c', '--in-capsule-data-size', help='Max number of in-capsule data size', type=int)
+    p.add_argument('-i', '--max-io-size', help='Max I/O size', type=int)
+    p.add_argument('-x', '--max-subsystems', help='Max number of NVMf subsystems', type=int)
+    p.add_argument('-u', '--io-unit-size', help='I/O unit size', type=int)
+    p.set_defaults(func=set_nvmf_target_options)
+
+    @call_cmd
+    def set_nvmf_target_config(args):
+        rpc.nvmf.set_nvmf_target_config(args.client, args)
+
+    p = subparsers.add_parser('set_nvmf_target_config', help='Set NVMf target config')
+    p.add_argument('-r', '--acceptor-poll-rate', help='How often the acceptor polls for incoming connections', type=int)
+    p.set_defaults(func=set_nvmf_target_config)
+
     @call_cmd
     def get_nvmf_subsystems(args):
         print_dict(rpc.nvmf.get_nvmf_subsystems(args.client, args))
@@ -894,6 +929,7 @@ if __name__ == "__main__":
     p.add_argument('-n', '--nsid', help='The requested NSID (optional)', type=int)
     p.add_argument('-g', '--nguid', help='Namespace globally unique identifier (optional)')
     p.add_argument('-e', '--eui64', help='Namespace EUI-64 identifier (optional)')
+    p.add_argument('-u', '--uuid', help='Namespace UUID (optional)')
     p.set_defaults(func=nvmf_subsystem_add_ns)
 
     @call_cmd

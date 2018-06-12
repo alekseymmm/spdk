@@ -100,11 +100,11 @@ extern pid_t g_spdk_nvme_pid;
 #define NVME_QUIRK_IDENTIFY_CNS 0x40
 
 /*
- * The controller supports LightNVM command set if matching additional
+ * The controller supports Open Channel command set if matching additional
  * condition, like the first byte (value 0x1) in the vendor specific
  * bits of the namespace identify structure is set.
  */
-#define NVME_QUIRK_LIGHTNVM 0x80
+#define NVME_QUIRK_OCSSD 0x80
 
 #define NVME_MAX_ASYNC_EVENTS	(8)
 
@@ -191,6 +191,8 @@ struct nvme_request {
 
 	uint8_t				retries;
 
+	bool				timed_out;
+
 	/**
 	 * Number of children requests still outstanding for this
 	 *  request which was split into multiple child requests.
@@ -216,6 +218,12 @@ struct nvme_request {
 	STAILQ_ENTRY(nvme_request)	stailq;
 
 	struct spdk_nvme_qpair		*qpair;
+
+	/*
+	 * The value of spdk_get_ticks() when the request was submitted to the hardware.
+	 * Only set if ctrlr->timeout_enabled is true.
+	 */
+	uint64_t			submit_tick;
 
 	/**
 	 * The active admin request can be moved to a per process pending
@@ -432,6 +440,8 @@ struct spdk_nvme_ctrlr {
 
 	bool				is_failed;
 
+	bool				timeout_enabled;
+
 	uint16_t			max_sges;
 
 	/** Controller support flags */
@@ -637,6 +647,7 @@ int	nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 			struct spdk_nvme_ctrlr *ctrlr,
 			enum spdk_nvme_qprio qprio,
 			uint32_t num_requests);
+void	nvme_qpair_deinit(struct spdk_nvme_qpair *qpair);
 void	nvme_qpair_enable(struct spdk_nvme_qpair *qpair);
 void	nvme_qpair_disable(struct spdk_nvme_qpair *qpair);
 int	nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair,
@@ -725,6 +736,8 @@ nvme_free_request(struct nvme_request *req)
 }
 
 void	nvme_request_remove_child(struct nvme_request *parent, struct nvme_request *child);
+int	nvme_request_check_timeout(struct nvme_request *req, uint16_t cid,
+				   struct spdk_nvme_ctrlr_process *active_proc, uint64_t now_tick);
 uint64_t nvme_get_quirks(const struct spdk_pci_id *id);
 
 int	nvme_robust_mutex_init_shared(pthread_mutex_t *mtx);

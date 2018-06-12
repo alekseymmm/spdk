@@ -37,7 +37,7 @@
 #include "spdk/conf.h"
 #include "spdk/env.h"
 #include "spdk/fd.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/util.h"
 #include "spdk/rpc.h"
@@ -49,7 +49,12 @@
 #include "iscsi/iscsi.h"
 #include "iscsi/scsi-lowlevel.h"
 
+#include "bdev_iscsi.h"
+
 struct bdev_iscsi_lun;
+
+#define BDEV_ISCSI_CONNECTION_POLL_US 500 /* 0.5 ms */
+#define BDEV_ISCSI_NO_MASTER_CH_POLL_US 10000 /* 10ms */
 
 #define DEFAULT_INITIATOR_NAME "iqn.2016-06.io.spdk:init"
 
@@ -58,7 +63,6 @@ static TAILQ_HEAD(, bdev_iscsi_lun) g_iscsi_lun_head = TAILQ_HEAD_INITIALIZER(g_
 static TAILQ_HEAD(, bdev_iscsi_conn_req) g_iscsi_conn_req = TAILQ_HEAD_INITIALIZER(
 			g_iscsi_conn_req);
 static struct spdk_poller *g_conn_poller = NULL;
-static bool g_module_is_initialized;
 
 struct bdev_iscsi_io {
 	struct spdk_thread *submit_td;
@@ -78,6 +82,8 @@ struct bdev_iscsi_lun {
 	uint32_t			ch_count;
 	struct bdev_iscsi_io_channel	*master_ch;
 	struct spdk_thread		*master_td;
+	struct spdk_poller		*no_master_ch_poller;
+	struct spdk_thread		*no_master_ch_poller_td;
 	TAILQ_ENTRY(bdev_iscsi_lun)	link;
 };
 
@@ -91,7 +97,10 @@ struct bdev_iscsi_conn_req {
 	char					*bdev_name;
 	char					*initiator_iqn;
 	struct iscsi_context			*context;
+	spdk_bdev_iscsi_create_cb		create_cb;
+	spdk_bdev_iscsi_create_cb		create_cb_arg;
 	TAILQ_ENTRY(bdev_iscsi_conn_req)	link;
+	bool					deleted;
 };
 
 static int
@@ -101,19 +110,14 @@ bdev_iscsi_get_ctx_size(void)
 }
 
 static void
-bdev_iscsi_remove_conn_req(struct bdev_iscsi_conn_req *req)
-{
-	TAILQ_REMOVE(&g_iscsi_conn_req, req, link);
-	free(req);
-}
-
-static void
 bdev_iscsi_finish_done(void)
 {
-	struct bdev_iscsi_conn_req *req, *tmp;
+	struct bdev_iscsi_conn_req *req;
 
-	TAILQ_FOREACH_SAFE(req, &g_iscsi_conn_req, link, tmp) {
-		bdev_iscsi_remove_conn_req(req);
+	while (!TAILQ_EMPTY(&g_iscsi_conn_req)) {
+		req = TAILQ_FIRST(&g_iscsi_conn_req);
+		TAILQ_REMOVE(&g_iscsi_conn_req, req, link);
+		free(req);
 	}
 
 	if (g_conn_poller) {
@@ -209,8 +213,9 @@ bdev_iscsi_io_complete(struct bdev_iscsi_io *iscsi_io, enum spdk_bdev_io_status 
 	}
 }
 
+/* Common call back function for read/write/flush command */
 static void
-bdev_iscsi_rw_cb(struct iscsi_context *context, int status, void *_task, void *_iscsi_io)
+bdev_iscsi_command_cb(struct iscsi_context *context, int status, void *_task, void *_iscsi_io)
 {
 	struct scsi_task *task = _task;
 	struct bdev_iscsi_io *iscsi_io = _iscsi_io;
@@ -234,7 +239,7 @@ bdev_iscsi_readv(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io,
 		      iovcnt, nbytes, lba);
 
 	task = iscsi_read16_task(lun->context, 0, lba, nbytes, lun->bdev.blocklen, 0, 0, 0, 0, 0,
-				 bdev_iscsi_rw_cb, iscsi_io);
+				 bdev_iscsi_command_cb, iscsi_io);
 	if (task == NULL) {
 		SPDK_ERRLOG("failed to get read16_task\n");
 		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -261,7 +266,7 @@ bdev_iscsi_writev(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io,
 		      iovcnt, nbytes, lba);
 
 	task = iscsi_write16_task(lun->context, 0, lba, NULL, nbytes, lun->bdev.blocklen, 0, 0, 0, 0, 0,
-				  bdev_iscsi_rw_cb, iscsi_io);
+				  bdev_iscsi_command_cb, iscsi_io);
 	if (task == NULL) {
 		SPDK_ERRLOG("failed to get write16_task\n");
 		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -278,21 +283,44 @@ bdev_iscsi_writev(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io,
 #endif
 }
 
+static void
+bdev_iscsi_destruct_cb(void *ctx)
+{
+	struct bdev_iscsi_lun *lun = ctx;
+
+	spdk_poller_unregister(&lun->no_master_ch_poller);
+	bdev_iscsi_lun_cleanup(lun);
+	spdk_bdev_destruct_done(&lun->bdev, 0);
+}
+
 static int
 bdev_iscsi_destruct(void *ctx)
 {
 	struct bdev_iscsi_lun *lun = ctx;
-	int rc = 0;
 
-	TAILQ_REMOVE(&g_iscsi_lun_head, lun, link);
-	return rc;
+	assert(lun->no_master_ch_poller_td);
+	spdk_thread_send_msg(lun->no_master_ch_poller_td, bdev_iscsi_destruct_cb, lun);
+	return 1;
+}
+
+static void
+bdev_iscsi_flush(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io, uint32_t num_blocks,
+		 int immed, uint64_t lba)
+{
+	struct scsi_task *task;
+
+	task = iscsi_synchronizecache16_task(lun->context, 0, lba,
+					     num_blocks, 0, immed, bdev_iscsi_command_cb, iscsi_io);
+	if (task == NULL) {
+		SPDK_ERRLOG("failed to get sync16_task\n");
+		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 }
 
 static int
-bdev_iscsi_poll(void *arg)
+bdev_iscsi_poll_lun(struct bdev_iscsi_lun *lun)
 {
-	struct bdev_iscsi_io_channel *ch = arg;
-	struct bdev_iscsi_lun *lun = ch->lun;
 	struct pollfd pfd = {};
 
 	pfd.fd = iscsi_get_fd(lun->context);
@@ -310,6 +338,33 @@ bdev_iscsi_poll(void *arg)
 	}
 
 	return 0;
+}
+
+static int
+bdev_iscsi_no_master_ch_poll(void *arg)
+{
+	struct bdev_iscsi_lun *lun = arg;
+	int rc = 0;
+
+	if (pthread_mutex_trylock(&lun->mutex)) {
+		/* Don't care about the error code here. */
+		return -1;
+	}
+
+	if (lun->ch_count == 0) {
+		rc = bdev_iscsi_poll_lun(arg);
+	}
+
+	pthread_mutex_unlock(&lun->mutex);
+	return rc;
+}
+
+static int
+bdev_iscsi_poll(void *arg)
+{
+	struct bdev_iscsi_io_channel *ch = arg;
+
+	return bdev_iscsi_poll_lun(ch->lun);
 }
 
 static void bdev_iscsi_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
@@ -341,6 +396,12 @@ static void _bdev_iscsi_submit_request(void *_bdev_io)
 				  bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen,
 				  bdev_io->u.bdev.offset_blocks);
 		break;
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		bdev_iscsi_flush(lun, iscsi_io,
+				 bdev_io->u.bdev.num_blocks,
+				 ISCSI_IMMEDIATE_DATA_NO,
+				 bdev_io->u.bdev.offset_blocks);
+		break;
 	default:
 		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
 		break;
@@ -368,6 +429,7 @@ bdev_iscsi_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	switch (io_type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_FLUSH:
 		return true;
 
 	default:
@@ -407,6 +469,8 @@ bdev_iscsi_destroy_cb(void *io_device, void *ctx_buf)
 	if (lun->ch_count == 0) {
 		assert(lun->master_ch != NULL);
 		assert(lun->master_td != NULL);
+		assert(lun->master_td == spdk_get_thread());
+
 		lun->master_ch = NULL;
 		lun->master_td = NULL;
 		spdk_poller_unregister(&io_channel->poller);
@@ -438,17 +502,47 @@ bdev_iscsi_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	return 0;
 }
 
+static void
+bdev_iscsi_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	struct bdev_iscsi_lun *lun = bdev->ctxt;
+
+	pthread_mutex_lock(&lun->mutex);
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_iscsi_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	spdk_json_write_named_string(w, "initiator_iqn", lun->initiator_iqn);
+	spdk_json_write_named_string(w, "url", lun->url);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+	pthread_mutex_unlock(&lun->mutex);
+}
+
 static const struct spdk_bdev_fn_table iscsi_fn_table = {
 	.destruct		= bdev_iscsi_destruct,
 	.submit_request		= bdev_iscsi_submit_request,
 	.io_type_supported	= bdev_iscsi_io_type_supported,
 	.get_io_channel		= bdev_iscsi_get_io_channel,
 	.dump_info_json		= bdev_iscsi_dump_info_json,
+	.write_config_json	= bdev_iscsi_write_config_json,
 };
 
-static struct spdk_bdev *
-create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn,
-		 const char *name, uint64_t num_blocks, uint32_t block_size)
+static void
+complete_conn_req(struct bdev_iscsi_conn_req *req, struct spdk_bdev *bdev,
+		  int status)
+{
+	TAILQ_REMOVE(&g_iscsi_conn_req, req, link);
+	req->create_cb(req->create_cb_arg, bdev, status);
+	req->deleted = true;
+}
+
+static int
+create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn, char *name,
+		 uint64_t num_blocks, uint32_t block_size, struct spdk_bdev **bdev)
 {
 	struct bdev_iscsi_lun *lun;
 	int rc;
@@ -456,7 +550,7 @@ create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn,
 	lun = calloc(sizeof(*lun), 1);
 	if (!lun) {
 		SPDK_ERRLOG("Unable to allocate enough memory for iscsi backend\n");
-		return NULL;
+		return -ENOMEM;
 	}
 
 	lun->context = context;
@@ -465,10 +559,7 @@ create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn,
 
 	pthread_mutex_init(&lun->mutex, NULL);
 
-	lun->bdev.name = strdup(name);
-	if (!lun->bdev.name) {
-		goto error_return;
-	}
+	lun->bdev.name = name;
 	lun->bdev.product_name = "iSCSI LUN";
 	lun->bdev.module = &g_iscsi_bdev_module;
 	lun->bdev.blocklen = block_size;
@@ -485,27 +576,17 @@ create_iscsi_lun(struct iscsi_context *context, char *url, char *initiator_iqn,
 		goto error_return;
 	}
 
+	lun->no_master_ch_poller_td = spdk_get_thread();
+	lun->no_master_ch_poller = spdk_poller_register(bdev_iscsi_no_master_ch_poll, lun,
+				   BDEV_ISCSI_NO_MASTER_CH_POLL_US);
+
 	TAILQ_INSERT_TAIL(&g_iscsi_lun_head, lun, link);
-	return &lun->bdev;
+	*bdev = &lun->bdev;
+	return 0;
 
 error_return:
 	iscsi_free_lun(lun);
-	return NULL;
-}
-
-static void
-_bdev_iscsi_set_module_init(void)
-{
-	spdk_bdev_module_init_done(&g_iscsi_bdev_module);
-	g_module_is_initialized = true;
-}
-
-static void
-bdev_iscsi_set_module_init(void)
-{
-	if (!g_module_is_initialized && TAILQ_EMPTY(&g_iscsi_conn_req)) {
-		_bdev_iscsi_set_module_init();
-	}
+	return rc;
 }
 
 static void
@@ -514,24 +595,29 @@ iscsi_readcapacity16_cb(struct iscsi_context *iscsi, int status,
 {
 	struct bdev_iscsi_conn_req *req = private_data;
 	struct scsi_readcapacity16 *readcap16;
-	struct spdk_bdev *bdev;
+	struct spdk_bdev *bdev = NULL;
 	struct scsi_task *task = command_data;
 
 	if (status != SPDK_SCSI_STATUS_GOOD) {
+		SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(iscsi));
 		goto ret;
 	}
 
 	readcap16 = scsi_datain_unmarshall(task);
-	bdev = create_iscsi_lun(req->context, req->url, req->initiator_iqn, req->bdev_name,
-				readcap16->returned_lba + 1, readcap16->block_length);
-	if (!bdev) {
-		SPDK_ERRLOG("Unable to create iscsi bdev\n");
+	if (!readcap16) {
+		status = -ENOMEM;
+		goto ret;
+	}
+
+	status = create_iscsi_lun(req->context, req->url, req->initiator_iqn, req->bdev_name,
+				  readcap16->returned_lba + 1, readcap16->block_length, &bdev);
+	if (status) {
+		SPDK_ERRLOG("Unable to create iscsi bdev: %s (%d)\n", spdk_strerror(-status), status);
 	}
 
 ret:
 	scsi_free_scsi_task(task);
-	bdev_iscsi_remove_conn_req(req);
-	bdev_iscsi_set_module_init();
+	complete_conn_req(req, bdev, status);
 }
 
 static void
@@ -549,10 +635,10 @@ iscsi_connect_cb(struct iscsi_context *iscsi, int status,
 	if (task) {
 		return;
 	}
+
 ret:
 	SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(req->context));
-	bdev_iscsi_remove_conn_req(req);
-	bdev_iscsi_set_module_init();
+	complete_conn_req(req, NULL, status);
 }
 
 static int
@@ -575,19 +661,24 @@ iscsi_bdev_conn_poll(void *arg)
 				SPDK_ERRLOG("iscsi_service failed: %s\n", iscsi_get_error(req->context));
 			}
 		}
+
+		if (req->deleted) {
+			free(req);
+		}
 	}
 
 	return 0;
 }
 
-static int
-create_iscsi_disk(const char *bdev_name, const char *url, const char *initiator_iqn)
+int
+create_iscsi_disk(const char *bdev_name, const char *url, const char *initiator_iqn,
+		  spdk_bdev_iscsi_create_cb cb_fn, void *cb_arg)
 {
 	struct bdev_iscsi_conn_req *req;
 	struct iscsi_url *iscsi_url = NULL;
 	int rc;
 
-	if (!bdev_name || !url || !initiator_iqn || strlen(initiator_iqn) == 0) {
+	if (!bdev_name || !url || !initiator_iqn || strlen(initiator_iqn) == 0 || !cb_fn) {
 		return -EINVAL;
 	}
 
@@ -606,6 +697,9 @@ create_iscsi_disk(const char *bdev_name, const char *url, const char *initiator_
 		rc = -ENOMEM;
 		goto err;
 	}
+
+	req->create_cb = cb_fn;
+	req->create_cb_arg = cb_arg;
 
 	iscsi_url = iscsi_parse_full_url(req->context, url);
 	if (iscsi_url == NULL) {
@@ -630,6 +724,10 @@ create_iscsi_disk(const char *bdev_name, const char *url, const char *initiator_
 
 	iscsi_destroy_url(iscsi_url);
 	TAILQ_INSERT_TAIL(&g_iscsi_conn_req, req, link);
+	if (!g_conn_poller) {
+		g_conn_poller = spdk_poller_register(iscsi_bdev_conn_poll, NULL, BDEV_ISCSI_CONNECTION_POLL_US);
+	}
+
 	return 0;
 
 err:
@@ -649,6 +747,14 @@ err:
 	return rc;
 }
 
+static void
+bdev_iscsi_initialize_cb(void *cb_arg, struct spdk_bdev *bdev, int status)
+{
+	if (TAILQ_EMPTY(&g_iscsi_conn_req)) {
+		spdk_bdev_module_init_done(&g_iscsi_bdev_module);
+	}
+}
+
 static int
 bdev_iscsi_initialize(void)
 {
@@ -659,7 +765,7 @@ bdev_iscsi_initialize(void)
 
 	sp = spdk_conf_find_section(NULL, "iSCSI_Initiator");
 	if (sp == NULL) {
-		_bdev_iscsi_set_module_init();
+		spdk_bdev_module_init_done(&g_iscsi_bdev_module);
 		return 0;
 	}
 
@@ -677,18 +783,14 @@ bdev_iscsi_initialize(void)
 			break;
 		}
 
-		rc = create_iscsi_disk(bdev_name, url, initiator_iqn);
+		rc = create_iscsi_disk(bdev_name, url, initiator_iqn, bdev_iscsi_initialize_cb, NULL);
 		if (rc) {
 			break;
 		}
 	}
 
-	if (!TAILQ_EMPTY(&g_iscsi_conn_req)) {
-		g_conn_poller = spdk_poller_register(iscsi_bdev_conn_poll, NULL, 0);
-	}
-
-	if (rc) {
-		bdev_iscsi_set_module_init();
+	if (i == 0) {
+		spdk_bdev_module_init_done(&g_iscsi_bdev_module);
 	}
 
 	return rc;

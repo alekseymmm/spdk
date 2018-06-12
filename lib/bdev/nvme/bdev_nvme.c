@@ -41,7 +41,7 @@
 #include "spdk/bdev.h"
 #include "spdk/json.h"
 #include "spdk/nvme.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/string.h"
 #include "spdk/likely.h"
 #include "spdk/util.h"
@@ -1062,6 +1062,17 @@ bdev_nvme_library_init(void)
 			rc = -1;
 			goto end;
 		}
+
+		for (i = 0; i < probe_ctx->count; i++) {
+			if (probe_ctx->trids[i].trtype != SPDK_NVME_TRANSPORT_PCIE) {
+				continue;
+			}
+
+			if (!nvme_ctrlr_get(&probe_ctx->trids[i])) {
+				SPDK_ERRLOG("NVMe SSD \"%s\" could not be found.\n", probe_ctx->trids[i].traddr);
+				SPDK_ERRLOG("Check PCIe BDF and that it is attached to UIO/VFIO driver.\n");
+			}
+		}
 	}
 
 	if (g_nvme_hotplug_enabled) {
@@ -1101,11 +1112,6 @@ nvme_ctrlr_create_bdevs(struct nvme_ctrlr *nvme_ctrlr)
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 		if (!ns) {
 			SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Skipping invalid NS %d\n", nsid);
-			continue;
-		}
-
-		if (!spdk_nvme_ns_is_active(ns)) {
-			SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Skipping inactive NS %d\n", nsid);
 			continue;
 		}
 

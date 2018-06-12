@@ -2,12 +2,32 @@
 
 ## v18.07: (Upcoming Release)
 
+### RPC
+
+The `start_nbd_disk` RPC method now returns the path to the kernel NBD device node
+rather than always returning `true`.
+
 ### Bdev
 
 The spdk_bdev_get_io_stat() function now returns cumulative totals instead of resetting
 on each call. This allows multiple callers to query I/O statistics without conflicting
 with each other. Existing users will need to adjust their code to record the previous
 I/O statistics to calculate the delta between calls.
+
+### Env
+
+The spdk_mem_map_translate() function now takes a size parameter to indicate the size of
+the memory region.  This can be used by environment implementations to validate the
+requested translation.
+
+The I/O Channel implementation has been moved to its own library - lib/thread. The
+public API that was previously in spdk/io_channel.h is now in spdk/thread.h The
+file spdk/io_channel.h remains and includes spdk/thread.h.
+
+### NVMe Over Fabrics
+
+The spdk_nvmf_tgt_destroy() function is now asynchronous and takes a callback
+as a parameter.
 
 ### git pre-commit and pre-push hooks
 
@@ -19,6 +39,12 @@ Results are recorded in the `make.log` file.
 
 To enable type: 'git config core.hooksPath .githooks'. To override after configuration use
 the `git --no-verify` flag.
+
+### IOAT
+
+IOAT for copy engine is disabled by default. It can be enabled by specifying the Enable
+option with "Yes" in `[Ioat]` section of the configuration file. The Disable option is
+now deprecated and will be removed in a future release.
 
 ## v18.04: Logical Volume Snapshot/Clone, iSCSI Initiator, Bdev QoS, VPP Userspace TCP/IP
 

@@ -75,6 +75,9 @@ struct spdk_nvmf_tgt {
 	struct spdk_nvmf_discovery_log_page	*discovery_log_page;
 	size_t					discovery_log_page_size;
 	TAILQ_HEAD(, spdk_nvmf_transport)	transports;
+
+	spdk_nvmf_tgt_destroy_done_fn		*destroy_cb_fn;
+	void					*destroy_cb_arg;
 };
 
 struct spdk_nvmf_host {
@@ -201,9 +204,10 @@ struct spdk_nvmf_ctrlr {
 	struct spdk_nvmf_ctrlr_feat feat;
 
 	struct spdk_nvmf_qpair *admin_qpair;
+
 	TAILQ_HEAD(, spdk_nvmf_qpair) qpairs;
-	int num_qpairs;
-	int max_qpairs_allowed;
+	struct spdk_bit_array *qpair_mask;
+
 	struct spdk_nvmf_request *aer_req;
 	union spdk_nvme_async_event_completion notice_event;
 	uint8_t hostid[16];

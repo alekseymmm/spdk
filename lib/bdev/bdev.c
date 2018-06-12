@@ -39,7 +39,7 @@
 
 #include "spdk/env.h"
 #include "spdk/event.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/likely.h"
 #include "spdk/queue.h"
 #include "spdk/nvme_spec.h"
@@ -65,7 +65,17 @@ int __itt_init_ittlib(const char *, __itt_group_id);
 #define SPDK_BDEV_QOS_TIMESLICE_IN_USEC		1000
 #define SPDK_BDEV_SEC_TO_USEC			1000000ULL
 #define SPDK_BDEV_QOS_MIN_IO_PER_TIMESLICE	1
+#define SPDK_BDEV_QOS_MIN_BYTE_PER_TIMESLICE	512
 #define SPDK_BDEV_QOS_MIN_IOS_PER_SEC		10000
+#define SPDK_BDEV_QOS_MIN_BW_IN_MB_PER_SEC	10
+
+enum spdk_bdev_qos_type {
+	SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT = 0,
+	SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT,
+	SPDK_BDEV_QOS_NUM_TYPES /* Keep last */
+};
+
+static const char *qos_type_str[SPDK_BDEV_QOS_NUM_TYPES] = {"Limit_IOPS", "Limit_BWPS"};
 
 struct spdk_bdev_mgr {
 	struct spdk_mempool *bdev_io_pool;
@@ -103,7 +113,10 @@ static struct spdk_thread	*g_fini_thread = NULL;
 
 struct spdk_bdev_qos {
 	/** Rate limit, in I/O per second */
-	uint64_t rate_limit;
+	uint64_t iops_rate_limit;
+
+	/** Rate limit, in byte per second */
+	uint64_t byte_rate_limit;
 
 	/** The channel that all I/O are funneled through */
 	struct spdk_bdev_channel *ch;
@@ -118,8 +131,15 @@ struct spdk_bdev_qos {
 	 *  only valid for the master channel which manages the outstanding IOs. */
 	uint64_t max_ios_per_timeslice;
 
+	/** Maximum allowed bytes to be issued in one timeslice (e.g., 1ms) and
+	 *  only valid for the master channel which manages the outstanding IOs. */
+	uint64_t max_byte_per_timeslice;
+
 	/** Submitted IO in one timeslice (e.g., 1ms) */
 	uint64_t io_submitted_this_timeslice;
+
+	/** Submitted byte in one timeslice (e.g., 1ms) */
+	uint64_t byte_submitted_this_timeslice;
 
 	/** Polller that processes queued I/O commands each time slice. */
 	struct spdk_poller *poller;
@@ -850,6 +870,26 @@ spdk_bdev_put_io(struct spdk_bdev_io *bdev_io)
 	}
 }
 
+static uint64_t
+_spdk_bdev_get_io_size_in_byte(struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_bdev	*bdev = bdev_io->bdev;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+		return bdev_io->u.nvme_passthru.nbytes;
+	case SPDK_BDEV_IO_TYPE_READ:
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		return bdev_io->u.bdev.num_blocks * bdev->blocklen;
+	default:
+		return 0;
+	}
+}
+
 static void
 _spdk_bdev_qos_io_submit(struct spdk_bdev_channel *ch)
 {
@@ -859,16 +899,23 @@ _spdk_bdev_qos_io_submit(struct spdk_bdev_channel *ch)
 	struct spdk_bdev_shared_resource *shared_resource = ch->shared_resource;
 
 	while (!TAILQ_EMPTY(&qos->queued)) {
-		if (qos->io_submitted_this_timeslice < qos->max_ios_per_timeslice) {
-			bdev_io = TAILQ_FIRST(&qos->queued);
-			TAILQ_REMOVE(&qos->queued, bdev_io, link);
-			qos->io_submitted_this_timeslice++;
-			ch->io_outstanding++;
-			shared_resource->io_outstanding++;
-			bdev->fn_table->submit_request(ch->channel, bdev_io);
-		} else {
+		if (qos->max_ios_per_timeslice > 0 &&
+		    qos->io_submitted_this_timeslice >= qos->max_ios_per_timeslice) {
 			break;
 		}
+
+		if (qos->max_byte_per_timeslice > 0 &&
+		    qos->byte_submitted_this_timeslice >= qos->max_byte_per_timeslice) {
+			break;
+		}
+
+		bdev_io = TAILQ_FIRST(&qos->queued);
+		TAILQ_REMOVE(&qos->queued, bdev_io, link);
+		qos->io_submitted_this_timeslice++;
+		qos->byte_submitted_this_timeslice += _spdk_bdev_get_io_size_in_byte(bdev_io);
+		ch->io_outstanding++;
+		shared_resource->io_outstanding++;
+		bdev->fn_table->submit_request(ch->channel, bdev_io);
 	}
 }
 
@@ -988,14 +1035,23 @@ spdk_bdev_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 }
 
 static void
-spdk_bdev_qos_update_max_ios_per_timeslice(struct spdk_bdev_qos *qos)
+spdk_bdev_qos_update_max_quota_per_timeslice(struct spdk_bdev_qos *qos)
 {
-	uint64_t max_ios_per_timeslice = 0;
+	uint64_t max_ios_per_timeslice = 0, max_byte_per_timeslice = 0;
 
-	max_ios_per_timeslice = qos->rate_limit * SPDK_BDEV_QOS_TIMESLICE_IN_USEC /
-				SPDK_BDEV_SEC_TO_USEC;
-	qos->max_ios_per_timeslice = spdk_max(max_ios_per_timeslice,
-					      SPDK_BDEV_QOS_MIN_IO_PER_TIMESLICE);
+	if (qos->iops_rate_limit > 0) {
+		max_ios_per_timeslice = qos->iops_rate_limit * SPDK_BDEV_QOS_TIMESLICE_IN_USEC /
+					SPDK_BDEV_SEC_TO_USEC;
+		qos->max_ios_per_timeslice = spdk_max(max_ios_per_timeslice,
+						      SPDK_BDEV_QOS_MIN_IO_PER_TIMESLICE);
+	}
+
+	if (qos->byte_rate_limit > 0) {
+		max_byte_per_timeslice = qos->byte_rate_limit * SPDK_BDEV_QOS_TIMESLICE_IN_USEC /
+					 SPDK_BDEV_SEC_TO_USEC;
+		qos->max_byte_per_timeslice = spdk_max(max_byte_per_timeslice,
+						       SPDK_BDEV_QOS_MIN_BYTE_PER_TIMESLICE);
+	}
 }
 
 static int
@@ -1005,6 +1061,7 @@ spdk_bdev_channel_poll_qos(void *arg)
 
 	/* Reset for next round of rate limiting */
 	qos->io_submitted_this_timeslice = 0;
+	qos->byte_submitted_this_timeslice = 0;
 
 	_spdk_bdev_qos_io_submit(qos->ch);
 
@@ -1063,8 +1120,9 @@ _spdk_bdev_enable_qos(struct spdk_bdev *bdev, struct spdk_bdev_channel *ch)
 			qos->thread = spdk_io_channel_get_thread(io_ch);
 
 			TAILQ_INIT(&qos->queued);
-			spdk_bdev_qos_update_max_ios_per_timeslice(qos);
+			spdk_bdev_qos_update_max_quota_per_timeslice(qos);
 			qos->io_submitted_this_timeslice = 0;
+			qos->byte_submitted_this_timeslice = 0;
 
 			qos->poller = spdk_poller_register(spdk_bdev_channel_poll_qos,
 							   qos,
@@ -1254,7 +1312,9 @@ spdk_bdev_qos_destroy(struct spdk_bdev *bdev)
 	new_qos->ch = NULL;
 	new_qos->thread = NULL;
 	new_qos->max_ios_per_timeslice = 0;
+	new_qos->max_byte_per_timeslice = 0;
 	new_qos->io_submitted_this_timeslice = 0;
+	new_qos->byte_submitted_this_timeslice = 0;
 	new_qos->poller = NULL;
 	TAILQ_INIT(&new_qos->queued);
 
@@ -1381,15 +1441,15 @@ spdk_bdev_get_num_blocks(const struct spdk_bdev *bdev)
 uint64_t
 spdk_bdev_get_qos_ios_per_sec(struct spdk_bdev *bdev)
 {
-	uint64_t rate_limit = 0;
+	uint64_t iops_rate_limit = 0;
 
 	pthread_mutex_lock(&bdev->mutex);
 	if (bdev->qos) {
-		rate_limit = bdev->qos->rate_limit;
+		iops_rate_limit = bdev->qos->iops_rate_limit;
 	}
 	pthread_mutex_unlock(&bdev->mutex);
 
-	return rate_limit;
+	return iops_rate_limit;
 }
 
 size_t
@@ -2426,54 +2486,94 @@ spdk_bdev_io_get_thread(struct spdk_bdev_io *bdev_io)
 }
 
 static void
+_spdk_bdev_qos_config_type(struct spdk_bdev *bdev, uint64_t qos_set,
+			   enum spdk_bdev_qos_type qos_type)
+{
+	uint64_t	min_qos_set = 0;
+
+	switch (qos_type) {
+	case SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT:
+		min_qos_set = SPDK_BDEV_QOS_MIN_IOS_PER_SEC;
+		break;
+	case SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT:
+		min_qos_set = SPDK_BDEV_QOS_MIN_BW_IN_MB_PER_SEC;
+		break;
+	default:
+		SPDK_ERRLOG("Unsupported QoS type.\n");
+		return;
+	}
+
+	if (qos_set % min_qos_set) {
+		SPDK_ERRLOG("Assigned QoS %" PRIu64 " on bdev %s is not multiple of %lu\n",
+			    qos_set, bdev->name, min_qos_set);
+		SPDK_ERRLOG("Failed to enable QoS on this bdev %s\n", bdev->name);
+		return;
+	}
+
+	if (!bdev->qos) {
+		bdev->qos = calloc(1, sizeof(*bdev->qos));
+		if (!bdev->qos) {
+			SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
+			return;
+		}
+	}
+
+	switch (qos_type) {
+	case SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT:
+		bdev->qos->iops_rate_limit = qos_set;
+		break;
+	case SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT:
+		bdev->qos->byte_rate_limit = qos_set * 1024 * 1024;
+		break;
+	default:
+		break;
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Bdev:%s QoS type:%d set:%lu\n",
+		      bdev->name, qos_type, qos_set);
+
+	return;
+}
+
+static void
 _spdk_bdev_qos_config(struct spdk_bdev *bdev)
 {
 	struct spdk_conf_section	*sp = NULL;
 	const char			*val = NULL;
-	uint64_t			ios_per_sec = 0;
-	int				i = 0;
+	uint64_t			qos_set = 0;
+	int				i = 0, j = 0;
 
 	sp = spdk_conf_find_section(NULL, "QoS");
 	if (!sp) {
 		return;
 	}
 
-	while (true) {
-		val = spdk_conf_section_get_nmval(sp, "Limit_IOPS", i, 0);
-		if (!val) {
+	while (j < SPDK_BDEV_QOS_NUM_TYPES) {
+		i = 0;
+		while (true) {
+			val = spdk_conf_section_get_nmval(sp, qos_type_str[j], i, 0);
+			if (!val) {
+				break;
+			}
+
+			if (strcmp(bdev->name, val) != 0) {
+				i++;
+				continue;
+			}
+
+			val = spdk_conf_section_get_nmval(sp, qos_type_str[j], i, 1);
+			if (val) {
+				qos_set = strtoull(val, NULL, 10);
+				_spdk_bdev_qos_config_type(bdev, qos_set, j);
+			}
+
 			break;
 		}
 
-		if (strcmp(bdev->name, val) != 0) {
-			i++;
-			continue;
-		}
-
-		val = spdk_conf_section_get_nmval(sp, "Limit_IOPS", i, 1);
-		if (!val) {
-			return;
-		}
-
-		ios_per_sec = strtoull(val, NULL, 10);
-		if (ios_per_sec > 0) {
-			if (ios_per_sec % SPDK_BDEV_QOS_MIN_IOS_PER_SEC) {
-				SPDK_ERRLOG("Assigned IOPS %" PRIu64 " on bdev %s is not multiple of %u\n",
-					    ios_per_sec, bdev->name, SPDK_BDEV_QOS_MIN_IOS_PER_SEC);
-				SPDK_ERRLOG("Failed to enable QoS on this bdev %s\n", bdev->name);
-			} else {
-				bdev->qos = calloc(1, sizeof(*bdev->qos));
-				if (!bdev->qos) {
-					SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
-					return;
-				}
-				bdev->qos->rate_limit = ios_per_sec;
-				SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Bdev:%s QoS:%lu\n",
-					      bdev->name, bdev->qos->rate_limit);
-			}
-		}
-
-		return;
+		j++;
 	}
+
+	return;
 }
 
 static int
@@ -3025,7 +3125,7 @@ _spdk_bdev_update_qos_limit_iops_msg(void *cb_arg)
 	struct spdk_bdev *bdev = ctx->bdev;
 
 	pthread_mutex_lock(&bdev->mutex);
-	spdk_bdev_qos_update_max_ios_per_timeslice(bdev->qos);
+	spdk_bdev_qos_update_max_quota_per_timeslice(bdev->qos);
 	pthread_mutex_unlock(&bdev->mutex);
 
 	_spdk_bdev_set_qos_limit_done(ctx, 0);
@@ -3098,13 +3198,13 @@ spdk_bdev_set_qos_limit_iops(struct spdk_bdev *bdev, uint64_t ios_per_sec,
 				return;
 			}
 
-			bdev->qos->rate_limit = ios_per_sec;
+			bdev->qos->iops_rate_limit = ios_per_sec;
 			spdk_for_each_channel(__bdev_to_io_dev(bdev),
 					      _spdk_bdev_enable_qos_msg, ctx,
 					      _spdk_bdev_enable_qos_done);
 		} else {
 			/* Updating */
-			bdev->qos->rate_limit = ios_per_sec;
+			bdev->qos->iops_rate_limit = ios_per_sec;
 			spdk_thread_send_msg(bdev->qos->thread, _spdk_bdev_update_qos_limit_iops_msg, ctx);
 		}
 	} else {
