@@ -36,6 +36,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 DIRS-$(CONFIG_FIO_PLUGIN) = fio_plugin
 DIRS-y += hello_world
+DIRS-y += test_io
 
 .PHONY: all clean $(DIRS-y)
 

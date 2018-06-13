@@ -15,9 +15,9 @@ struct rdx_req *rdx_req_create(struct spdk_bdev_io *bdev_io /*,
 	// may be it is better to pass raid as argument?
 	req->raid = (struct rdx_raid *)bdev_io->bdev->ctxt;
 	req->bdev_io = bdev_io;
-	//TODO: convert to linux kernel block size
-	req->addr = bdev_io->u.bdev.offset_blocks;
-	req->len = bdev_io->u.bdev.num_blocks;
+
+	req->addr = bdev_io->u.bdev.offset_blocks * RDX_BLOCK_SIZE_SECTORS;
+	req->len = bdev_io->u.bdev.num_blocks * RDX_BLOCK_SIZE_SECTORS;
 
 	req->thread_lnode.next = NULL;
 	switch (bdev_io->type) {
