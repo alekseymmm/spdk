@@ -120,11 +120,44 @@ struct rdx_req {
 	enum rdx_req_type type;
 };
 
+struct rdx_io_ctx {
+	union {
+		/* used for generic requests */
+		struct rdx_req *req;
+		/* used for metadata requests */
+		//struct md_io_ctx *md_ctx;
+	};
+	struct rdx_dev *dev;
+};
+
 static inline bool rdx_dev_is_null(char *name)
 {
 	if (!strncmp(name, "null", RDX_MAX_PATH_LEN))
 		return true;
 	return false;
 }
+
+//static inline int rdx_raid_get_dev_num(struct rdx_raid_dsc *raid_dsc,
+//					u64 stripe_num, int strip_num)
+//{
+//	int dev_num = 0;
+//	int left_shift;
+//
+//	switch (raid_dsc->level) {
+//	case 0:
+//	case 1 :
+//		dev_num = strip_num;
+//		break;
+//	case 5:
+//	case 6:
+//	case 7:
+//		left_shift = stripe_num % raid_dsc->dev_cnt;
+//		dev_num = (strip_num + raid_dsc->dev_cnt - left_shift) %
+//				raid_dsc->dev_cnt;
+//		break;
+//	}
+//
+//	return dev_num;
+//}
 
 #endif /* LIB_BDEV_RAID_VBDEV_COMMON_H_ */

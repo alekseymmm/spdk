@@ -176,13 +176,24 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 static int vbdev_raid_poll(void *arg)
 {
 	struct rdx_raid_io_channel *ch = arg;
+	struct rdx_raid *raid = ch->raid;
 	struct rdx_req *req;
 	struct llist_node *first;
+	struct spdk_bdev_io *split_io;
+	unsigned int sectors_to_split, len = 0;
 
 	first = llist_del_first(&ch->req_llist);
 	req = llist_entry(first, struct rdx_req, thread_lnode);
 
-	spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	sectors_to_split = req->len;
+
+	while (sectors_to_split) {
+		req->bdev_io->caller_ctx = req;
+		len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+		sectors_to_split -=len;
+	}
+
+	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 
 	return 0;
 }
