@@ -4,7 +4,7 @@
 void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 			void *cb_arg)
 {
-	SPDK_NOTICELOG("Called end_io for bdev_io=%p\n");
+	SPDK_NOTICELOG("Called end_io for bdev_io=%p\n", bdev_io);
 }
 
 struct rdx_req *rdx_req_create(struct spdk_bdev_io *bdev_io /*,
@@ -52,22 +52,21 @@ struct rdx_req *rdx_req_create(struct spdk_bdev_io *bdev_io /*,
 unsigned int rdx_bdev_io_split_per_dev(struct spdk_bdev_io *bdev_io,
 					int split_type)
 {
-	struct spdk_bdev_channel *channel = bdev_io->ch;
 	struct rdx_raid *raid = (struct rdx_raid *)bdev_io->bdev->ctxt;
 	struct rdx_req *req = bdev_io->caller_ctx;
 	struct rdx_dev *dev;
 	struct rdx_io_ctx *io_ctx;
-	unsigned int stripe_len = 8;
-	unsigned int stripe_data_len = 8;
+	unsigned int stripe_len = 16;
+	unsigned int stripe_data_len = 16;
 	unsigned int stripe_size = 8;
 	unsigned int offset_in_strip;
 	unsigned int slen, len;
-	unsigned int buf_offset;
+	unsigned int buf_offset, buf_len;
 	uint64_t addr;
-	uint64_t stripe_num = 0;
+	uint64_t stripe_num = 1;
 	unsigned int offset_in_stripe;
 	int strip_num, dev_num;
-	uint64_t sector;
+	uint64_t bdev_offset;
 
 	addr = bdev_io->u.bdev.split_current_offset_blocks *
 		RDX_BLOCK_SIZE_SECTORS;
@@ -95,18 +94,29 @@ unsigned int rdx_bdev_io_split_per_dev(struct spdk_bdev_io *bdev_io,
 
 //	sector = RDX_MD_OFFSET + RDX_BACKUP_OFFSET +
 //			stripe_num * stripe_size + offset_in_strip;
-	sector = stripe_num * stripe_size + offset_in_strip;
+	bdev_offset = (stripe_num * stripe_size + offset_in_strip) *
+			KERNEL_SECTOR_SIZE;
 	buf_offset = (bdev_io->u.bdev.split_current_offset_blocks -
 		bdev_io->u.bdev.offset_blocks) * RDX_BLOCK_SIZE;
-
+	buf_len = slen * KERNEL_SECTOR_SIZE;
 	//fix it!
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
 		spdk_bdev_read(dev->base_desc,
 				dev->io_channel,
 				bdev_io->u.bdev.iov.iov_base + buf_offset,
-				offset_bytes, split_io->buf_len,
+				bdev_offset, buf_len,
 				rdx_bdev_io_end_io, io_ctx);
 	}
+	if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+		spdk_bdev_write(dev->base_desc,
+				dev->io_channel,
+				bdev_io->u.bdev.iov.iov_base + buf_offset,
+				bdev_offset, buf_len,
+				rdx_bdev_io_end_io, io_ctx);
+	}
+
+	bdev_io->u.bdev.split_current_offset_blocks += slen / RDX_BLOCK_SIZE_SECTORS;
+	bdev_io->u.bdev.split_remaining_num_blocks -= slen / RDX_BLOCK_SIZE_SECTORS;
 
 	return slen;
 out_err_ctx:
