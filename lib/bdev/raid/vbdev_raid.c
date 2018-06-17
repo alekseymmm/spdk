@@ -16,6 +16,7 @@
 #include "vbdev_raid.h"
 
 #include "vbdev_req.h"
+#include "vbdev_blk_req.h"
 #include "llist.h"
 
 static int rdx_raid_create_devices(struct rdx_raid *raid,
@@ -162,15 +163,29 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io)
 {
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
-	struct rdx_req *req;
+	struct rdx_blk_req *blk_req;
 
-	req = rdx_req_create(bdev_io);
-	if (!req) {
-		SPDK_ERRLOG("Cannot create request \n");
+	/* TODO: BUG with mkfs.ext4 and page cache */
+	blk_req = calloc(1, sizeof(struct rdx_blk_req));
+	if (!blk_req) {
+		SPDK_ERRLOG("Cannot allocate blk_req for bdev_io\n");
 		return;
 	}
 
-	llist_add(&req->thread_lnode, &ch->req_llist);
+	blk_req->addr = bdev_io->u.bdev.offset_blocks * RDX_BLOCK_SIZE_SECTORS;
+	blk_req->len = bdev_io->u.bdev.num_blocks * RDX_BLOCK_SIZE_SECTORS;
+	blk_req->rw = bdev_io->type;
+	blk_req->bdev_io = bdev_io;
+	blk_req->raid = ch->raid;
+	blk_req->ch = ch;
+	atomic_init(&blk_req->ref_cnt, 0);
+
+	SPDK_DEBUG("For bdev_io=%p, created blk_req=%p dir=[%s], addr=%lu, len=%u\n",
+		 bdev_io, blk_req,
+		 blk_req->rw == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
+		 blk_req->addr, blk_req->len);
+
+	rdx_blk_submit(blk_req);
 }
 
 static int vbdev_raid_poll(void *arg)
@@ -184,17 +199,12 @@ static int vbdev_raid_poll(void *arg)
 	req = llist_entry(first, struct rdx_req, thread_lnode);
 
 	sectors_to_split = req->len;
-
-	//may be it is not the best place to set split parameters
-	// or should we have to initialize them from req ?
-	req->bdev_io->u.bdev.split_current_offset_blocks =
-		req->bdev_io->u.bdev.offset_blocks;
-	req->bdev_io->u.bdev.split_remaining_num_blocks =
-				req->bdev_io->u.bdev.num_blocks;
-	req->bdev_io->caller_ctx = req;
+	req->split_offset = 0;
 	while (sectors_to_split) {
-		len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+		//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+		len = rdx_req_split_per_dev(req, 0);
 		sectors_to_split -=len;
+		req->split_offset += len;
 	}
 
 	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);

@@ -112,12 +112,30 @@ struct rdx_raid {
 };
 
 struct rdx_req {
-	uint64_t addr;
-	unsigned int len;
+	uint64_t addr; //sectors
+	unsigned int len; //sectors
+	unsigned int split_offset; //sectors
+	uint64_t buf_offset; //bytes
 	struct rdx_raid *raid;
 	struct spdk_bdev_io *bdev_io;
 	struct llist_node thread_lnode;
 	enum rdx_req_type type;
+	void *priv;
+	struct rdx_raid_io_channel *ch;
+	struct rdx_blk_req *blk_teq;
+	int ref_cnt;
+};
+
+struct rdx_blk_req {
+	uint64_t addr;
+	unsigned int len;	/* sectors */
+	int rw;
+	//atomic_int ref_cnt;
+	int ref_cnt;
+	struct rdx_raid *raid;
+	struct spdk_bdev_io *bdev_io;
+	int err;
+	struct rdx_raid_io_channel *ch;
 };
 
 struct rdx_io_ctx {
