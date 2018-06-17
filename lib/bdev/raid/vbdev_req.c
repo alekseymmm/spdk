@@ -8,7 +8,9 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 			void *cb_arg)
 {
-	SPDK_DEBUG("Called end_io for bdev_io=%p\n", bdev_io);
+	struct rdx_io_ctx *io_ctx = cb_arg;
+	struct rdx_req *req = io_ctx->req;
+	SPDK_DEBUG("Called end_io for bdev_io=%p\n", req->bdev_io);
 }
 
 struct rdx_req *rdx_req_create(struct rdx_raid *raid,
@@ -88,7 +90,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	uint64_t bdev_offset;
 	char *io_buf;
 
-	addr = req->addr;
+	addr = req->addr + req->split_offset;
 	offset_in_stripe = addr % stripe_len;
 	strip_num = offset_in_stripe / stripe_size;
 
@@ -115,7 +117,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 //			stripe_num * stripe_size + offset_in_strip;
 	bdev_offset = (stripe_num * stripe_size + offset_in_strip) *
 			KERNEL_SECTOR_SIZE;
-	split_offset = req->split_offset * RDX_BLOCK_SIZE;
+	split_offset = req->split_offset * KERNEL_SECTOR_SIZE;
 	buf_len = slen * KERNEL_SECTOR_SIZE;
 	io_buf = bdev_io->u.bdev.iov.iov_base + req->buf_offset + split_offset;
 

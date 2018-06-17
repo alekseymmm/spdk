@@ -203,8 +203,7 @@ static int vbdev_raid_poll(void *arg)
 	while (sectors_to_split) {
 		//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
 		len = rdx_req_split_per_dev(req, 0);
-		sectors_to_split -=len;
-		req->split_offset += len;
+		sectors_to_split -= len;
 	}
 
 	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
