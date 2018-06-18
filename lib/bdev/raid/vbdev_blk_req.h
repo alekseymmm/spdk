@@ -15,4 +15,6 @@ static inline void rdx_blk_req_get_ref(struct rdx_blk_req *blk_req)
 	atomic_fetch_add(&blk_req->ref_cnt, 1);
 }
 
+void rdx_blk_req_put_ref(struct rdx_blk_req *blk_req);
+
 #endif /* LIB_BDEV_RAID_VBDEV_BLK_REQ_H_ */

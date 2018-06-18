@@ -19,4 +19,7 @@ static inline void rdx_req_get_ref(struct rdx_req *req)
 {
 	atomic_fetch_add(&req->ref_cnt, 1);
 }
+
+void rdx_req_put_ref(struct rdx_req *req);
+
 #endif /* LIB_BDEV_RAID_VBDEV_REQ_H_ */

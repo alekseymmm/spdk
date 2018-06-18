@@ -2,6 +2,7 @@
 #include "vbdev_req.h"
 #include "vbdev_blk_req.h"
 
+static struct rdx_req *rdx_req_split(struct rdx_req *req, unsigned int len);
 void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 			void *cb_arg);
 
@@ -10,7 +11,22 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 {
 	struct rdx_io_ctx *io_ctx = cb_arg;
 	struct rdx_req *req = io_ctx->req;
-	SPDK_DEBUG("Called end_io for bdev_io=%p\n", req->bdev_io);
+	struct rdx_dev *dev = io_ctx->dev;
+
+	SPDK_DEBUG("Called for bdev_io=%p, req=%p dir=[%s], addr=%lu, len=%u\n",
+		 req->bdev_io, req,
+		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
+		 req->addr, req->len);
+
+	if (success) {
+		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
+		       req->bdev_io, success, req, dev->bdev_name);
+		//rdx_req_err_io(req, dev, bio_data_dir(bio));
+	}
+
+	rdx_req_put_ref(req);
+	//rdx_dev_put_ref(dev);
+	free(io_ctx);
 }
 
 struct rdx_req *rdx_req_create(struct rdx_raid *raid,
@@ -144,7 +160,7 @@ out_err_ctx:
 	return slen;
 }
 
-struct rdx_req *rdx_req_split(struct rdx_req *req, unsigned int len)
+static struct rdx_req *rdx_req_split(struct rdx_req *req, unsigned int len)
 {
 	struct rdx_req *split_req;
 
@@ -226,4 +242,99 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 
 		sectors_to_split -= slen;
 	}
+}
+
+static void rdx_req_end_io(struct rdx_req *req)
+{
+//	struct rdx_raid_dsc *raid_dsc = req->raid_dsc;
+//	int failed_cnt = __builtin_popcountll(req->failed_bitmap);
+//	bool can_process;
+//
+//	if (!rdx_raid_can_recover(raid_dsc, failed_cnt))
+//		req->event = RDX_REQ_EVENT_XFER_FAILED;
+//	else if (req->state == RDX_REQ_STATE_READ)
+//		rdx_req_end_io_read(req);
+//	else if (req->state == RDX_REQ_STATE_WRITE)
+//		rdx_req_end_io_write(req);
+//
+//	if (req->event == RDX_REQ_EVENT_XFER_FAILED) {
+//		pr_err("Req failed %p, type %d, failed cnt %d, fd_mask=%llu\n",
+//		       req, req->type, failed_cnt, req->failed_bitmap);
+//		set_bit(RDX_REQ_FLAG_ERR, &req->flags);
+//	}
+//
+//	/* Clear specific flags after each xfer step */
+//	clear_bit(RDX_REQ_FLAG_BIO_ERR, &req->flags);
+//
+//	/* Allow FRONT READ and WRITE requests to complete in process context */
+//	can_process = (req->type == RDX_REQ_TYPE_READ &&
+//			req->event == RDX_REQ_EVENT_XFER_COMPLETED &&
+//			test_bit(RDX_REQ_FLAG_USER, &req->flags)) ||
+//			(req->type == RDX_REQ_TYPE_WRITE &&
+//			req->state == RDX_REQ_STATE_WRITE);
+//	if (can_process)
+//		rdx_req_process(req);
+//	else
+//		rdx_thread_queue_work(req->thread_num, &req->thread_lnode);
+}
+
+void rdx_req_put_ref(struct rdx_req *req)
+{
+	SPDK_DEBUG("for req=%p before dec_and_test ref_cnt=%d\n",
+			req, atomic_load(&req->ref_cnt));
+
+	if (__atomic_sub_fetch(&req->ref_cnt, 1, memory_order_seq_cst) == 0) {
+		SPDK_DEBUG("For req=%p achieved ref_cnt=0, complete it\n",
+			 req);
+
+		rdx_req_end_io(req);
+	}
+}
+
+int rdx_req_complete(struct rdx_req *req)
+{
+	int err =0;
+	//int err = test_bit(RDX_REQ_FLAG_ERR, &req->flags);
+
+	if (1 /*test_bit(RDX_REQ_FLAG_USER, &req->flags*/) {
+		struct rdx_blk_req *blk_req = req->blk_teq;//req->priv;
+		if (err)
+			blk_req->err = -EIO;
+		rdx_blk_req_put_ref(blk_req);
+	} else {
+//		struct rdx_req *priv = req->priv;
+//		if (err)
+//			bitmap_fill((unsigned long *)&req->failed_bitmap,
+//				    req->raid_dsc->dev_cnt);
+//		rdx_req_put_ref(priv);
+	}
+
+	//bio_put(req->bio);
+
+//	req->event = RDX_REQ_EVENT_COMPLETED;
+//	rdx_thread_queue_work(req->thread_num, &req->thread_lnode);
+	rdx_req_destroy(req);
+
+	return 0;
+}
+
+int rdx_req_destroy(struct rdx_req *req)
+{
+//	struct rdx_raid *raid = req->raid;
+//
+//	if (req->stripe)
+//		rdx_req_release(req);
+//
+//	rdx_raid_threads_map_put(req->raid, req);
+//
+//	if (test_bit(RDX_REQ_FLAG_IN_STATS, &req->flags))
+//		atomic_dec(&raid->stats->req_cnt[req->type]);
+//
+//	if (test_bit(RDX_REQ_FLAG_IN_RESTRIPE, &req->flags))
+//		rdx_req_put_raid_dsc(req);
+//
+//	kmem_cache_free(rdx_req_cachep, req);
+	free(req);
+
+	return 0;
 }
