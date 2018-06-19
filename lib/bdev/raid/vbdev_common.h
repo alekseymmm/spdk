@@ -70,6 +70,7 @@ struct rdx_raid_io_channel {
 	struct spdk_poller *poller;
 	struct rdx_raid *raid;
 	struct llist_head req_llist;
+	struct spdk_io_channel **dev_io_channels;
 	//something else
 };
 
@@ -85,7 +86,6 @@ struct rdx_dev {
 	struct rdx_raid *raid;
 	char *bdev_name;
 	struct spdk_bdev_desc *base_desc;
-	struct spdk_io_channel *io_channel;
 };
 
 struct rdx_stripe_dsc {

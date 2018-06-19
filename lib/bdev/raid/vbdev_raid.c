@@ -197,15 +197,18 @@ static int vbdev_raid_poll(void *arg)
 	struct llist_node *first;
 	unsigned int sectors_to_split, len = 0;
 
-	first = llist_del_first(&ch->req_llist);
-	req = llist_entry(first, struct rdx_req, thread_lnode);
+	if /*while*/ (!llist_empty(&ch->req_llist)) {
+		first = llist_del_first(&ch->req_llist);
+		req = llist_entry(first, struct rdx_req, thread_lnode);
 
-	sectors_to_split = req->len;
-	req->split_offset = 0;
-	while (sectors_to_split) {
-		//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-		len = rdx_req_split_per_dev(req, 0);
-		sectors_to_split -= len;
+		sectors_to_split = req->len;
+		req->split_offset = 0;
+		while (sectors_to_split) {
+			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+			len = rdx_req_split_per_dev(req, 0);
+			sectors_to_split -= len;
+		}
+
 	}
 
 	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
@@ -224,10 +227,31 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 
 	struct rdx_raid_io_channel *raid_ch = ctx_buf;
 	struct rdx_raid *raid = io_device;
+	int i;
 
 	raid_ch->raid = raid;
 	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
 	init_llist_head(&raid_ch->req_llist);
+
+	raid_ch->dev_io_channels = calloc(raid->dev_cnt,
+				sizeof(struct spdk_io_channel *));
+	if (!raid_ch->dev_io_channels) {
+		SPDK_ERRLOG("Cannot allocate base bdevs io_channels array\n");
+		return -1;
+	}
+
+	for (i = 0; i < raid->dev_cnt; i++) {
+		raid_ch->dev_io_channels[i] =
+			spdk_bdev_get_io_channel(raid->devices[i]->base_desc);
+		if (!raid_ch->dev_io_channels[i]){
+			SPDK_ERRLOG("could not open io_channel for bdev%s\n",
+				spdk_bdev_get_name(raid->devices[i]->bdev));
+
+//				spdk_bdev_close(dev->base_desc);
+//				spdk_bdev_module_release_bdev(dev->bdev);
+//				goto error;
+		}
+	}
 
 	return 0;
 }
@@ -239,8 +263,13 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 static void
 raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 {
+	int i;
 	struct rdx_raid_io_channel *raid_ch = ctx_buf;
+	struct rdx_raid *raid = raid_ch->raid;
 
+	for (i = 0; i < raid->dev_cnt; i++) {
+		spdk_put_io_channel(raid_ch->dev_io_channels[i]);
+	}
 	spdk_poller_unregister(&raid_ch->poller);
 }
 

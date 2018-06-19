@@ -94,6 +94,7 @@ read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct hello_context_t *hello_context = cb_arg;
 	uint64_t blk_size;
+
 	if (success) {
 		//SPDK_NOTICELOG("Read string from bdev : %s\n", hello_context->buff);
 		blk_size = spdk_bdev_get_block_size(hello_context->bdev) *

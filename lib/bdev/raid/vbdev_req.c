@@ -18,11 +18,14 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
 		 req->addr, req->len);
 
+
 	if (!success) {
 		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
 		       req->bdev_io, success, req, dev->bdev_name);
 		//rdx_req_err_io(req, dev, bio_data_dir(bio));
 	}
+
+	spdk_bdev_free_io(bdev_io);
 
 	rdx_req_put_ref(req);
 	//rdx_dev_put_ref(dev);
@@ -91,6 +94,9 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 
 	bdev_io->cb = rdx_bdev_io_end_io;
 
+	SPDK_DEBUG("For bdev_io=%p created req=%p addr=%lu, len=%d,"
+		" buf_offset=%lu\n", bdev_io, req, req->addr, req->len,
+		req->buf_offset);
 	return req;
 }
 
@@ -101,6 +107,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	struct spdk_bdev_io *bdev_io = req->bdev_io;
 	struct rdx_dev *dev;
 	struct rdx_io_ctx *io_ctx;
+	struct spdk_io_channel *io_channel;
 	unsigned int stripe_len = 16;
 	unsigned int stripe_data_len = 16;
 	unsigned int stripe_size = 8;
@@ -125,6 +132,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	//raid 0 case only
 	dev_num = strip_num;
 	dev = raid->devices[dev_num];
+	io_channel = req->ch->dev_io_channels[dev_num];
 
 	if (slen > len)
 		slen = len;
@@ -149,14 +157,14 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
 		spdk_bdev_read(dev->base_desc,
-				dev->io_channel,
+				io_channel,
 				io_buf,
 				bdev_offset, buf_len,
 				rdx_bdev_io_end_io, io_ctx);
 	}
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
 		spdk_bdev_write(dev->base_desc,
-				dev->io_channel,
+				io_channel,
 				io_buf,
 				bdev_offset, buf_len,
 				rdx_bdev_io_end_io, io_ctx);
@@ -231,7 +239,6 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 
 			split_req = rdx_req_split(req, slen);
 
-
 			/* Error handling is too complex, but it works */
 			if (!split_req) {
 //				struct rdx_blk_req *blk_req = req->priv;
@@ -243,6 +250,12 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //				kmem_cache_free(rdx_req_cachep, req);
 				return;
 			}
+			SPDK_DEBUG("req=%p splitted. splitteq=%p addr=%lu,"
+				   " len=%d buf_offset=%lu. Initial req=%p,"
+				   " addr=%lu, len=%d, buf_offset=%lu\n",
+				   req, split_req, split_req->addr,
+				   split_req->len, split_req->buf_offset, req,
+				   req->addr, req->len, req->buf_offset);
 
 		}
 
