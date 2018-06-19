@@ -111,6 +111,17 @@ if __name__ == "__main__":
 
     # bdev
     @call_cmd
+    def set_bdev_options(args):
+        rpc.bdev.set_bdev_options(args.client,
+                                  bdev_io_pool_size=args.bdev_io_pool_size,
+                                  bdev_io_cache_size=args.bdev_io_cache_size)
+
+    p = subparsers.add_parser('set_bdev_options', help="""Set options of bdev subsystem""")
+    p.add_argument('-p', '--bdev-io-pool-size', help='Number of bdev_io structures in shared buffer pool', type=int)
+    p.add_argument('-c', '--bdev-io-cache-size', help='Maximum number of bdev_io structures cached per thread', type=int)
+    p.set_defaults(func=set_bdev_options)
+
+    @call_cmd
     def construct_malloc_bdev(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         print_array(rpc.bdev.construct_malloc_bdev(args.client,
@@ -834,11 +845,17 @@ if __name__ == "__main__":
     # NVMe-oF
     @call_cmd
     def set_nvmf_target_options(args):
-        rpc.nvmf.set_nvmf_target_options(args.client, args)
+        rpc.nvmf.set_nvmf_target_options(args.client,
+                                         max_queue_depth=args.max_queue_depth,
+                                         max_qpairs_per_ctrlr=args.max_qpairs_per_ctrlr,
+                                         in_capsule_data_size=args.in_capsule_data_size,
+                                         max_io_size=args.max_io_size,
+                                         max_subsystems=args.max_subsystems,
+                                         io_unit_size=args.io_unit_size)
 
     p = subparsers.add_parser('set_nvmf_target_options', help='Set NVMf target options')
     p.add_argument('-q', '--max-queue-depth', help='Max number of outstanding I/O per queue', type=int)
-    p.add_argument('-p', '--max-qpairs-per-session', help='Max number of SQ and CQ per session', type=int)
+    p.add_argument('-p', '--max-qpairs-per-ctrlr', help='Max number of SQ and CQ per controller', type=int)
     p.add_argument('-c', '--in-capsule-data-size', help='Max number of in-capsule data size', type=int)
     p.add_argument('-i', '--max-io-size', help='Max I/O size', type=int)
     p.add_argument('-x', '--max-subsystems', help='Max number of NVMf subsystems', type=int)
@@ -847,7 +864,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def set_nvmf_target_config(args):
-        rpc.nvmf.set_nvmf_target_config(args.client, args)
+        rpc.nvmf.set_nvmf_target_config(args.client,
+                                        acceptor_poll_rate=args.acceptor_poll_rate)
 
     p = subparsers.add_parser('set_nvmf_target_config', help='Set NVMf target config')
     p.add_argument('-r', '--acceptor-poll-rate', help='How often the acceptor polls for incoming connections', type=int)
@@ -855,7 +873,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_nvmf_subsystems(args):
-        print_dict(rpc.nvmf.get_nvmf_subsystems(args.client, args))
+        print_dict(rpc.nvmf.get_nvmf_subsystems(args.client))
 
     p = subparsers.add_parser('get_nvmf_subsystems',
                               help='Display nvmf subsystems')
@@ -863,7 +881,45 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_nvmf_subsystem(args):
-        rpc.nvmf.construct_nvmf_subsystem(args.client, args)
+        listen_addresses = None
+        hosts = None
+        namespaces = None
+        if args.listen:
+            listen_addresses = [
+                dict(
+                    u.split(
+                        ":",
+                        1) for u in a.split(" ")) for a in args.listen.split(",")]
+
+        if args.hosts:
+            hosts = []
+            for u in args.hosts.strip().split(" "):
+                hosts.append(u)
+
+        if args.namespaces:
+            namespaces = []
+            for u in args.namespaces.strip().split(" "):
+                bdev_name = u
+                nsid = 0
+                if ':' in u:
+                    (bdev_name, nsid) = u.split(":")
+
+                ns_params = {'bdev_name': bdev_name}
+
+                nsid = int(nsid)
+                if nsid != 0:
+                    ns_params['nsid'] = nsid
+
+                namespaces.append(ns_params)
+
+        rpc.nvmf.construct_nvmf_subsystem(args.client,
+                                          nqn=args.nqn,
+                                          listen_addresses=listen_addresses,
+                                          hosts=hosts,
+                                          allow_any_host=args.allow_any_host,
+                                          serial_number=args.serial_number,
+                                          namespaces=namespaces,
+                                          max_namespaces=args.max_namespaces)
 
     p = subparsers.add_parser('construct_nvmf_subsystem', help='Add a nvmf subsystem')
     p.add_argument('nqn', help='Target nqn(ASCII)')
@@ -887,7 +943,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_nvmf_subsystem(args):
-        rpc.nvmf.delete_nvmf_subsystem(args.client, args)
+        rpc.nvmf.delete_nvmf_subsystem(args.client,
+                                       nqn=args.subsystem_nqn)
 
     p = subparsers.add_parser('delete_nvmf_subsystem',
                               help='Delete a nvmf subsystem')
@@ -897,7 +954,12 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_add_listener(args):
-        rpc.nvmf.nvmf_subsystem_add_listener(args.client, args)
+        rpc.nvmf.nvmf_subsystem_add_listener(args.client,
+                                             nqn=args.nqn,
+                                             trtype=args.trtype,
+                                             traddr=args.traddr,
+                                             adrfam=args.adrfam,
+                                             trsvcid=args.trsvcid)
 
     p = subparsers.add_parser('nvmf_subsystem_add_listener', help='Add a listener to an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -909,7 +971,12 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_remove_listener(args):
-        rpc.nvmf.nvmf_subsystem_remove_listener(args.client, args)
+        rpc.nvmf.nvmf_subsystem_remove_listener(args.client,
+                                                nqn=args.nqn,
+                                                trtype=args.trtype,
+                                                traddr=args.traddr,
+                                                adrfam=args.adrfam,
+                                                trsvcid=args.trsvcid)
 
     p = subparsers.add_parser('nvmf_subsystem_remove_listener', help='Remove a listener from an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -921,7 +988,13 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_add_ns(args):
-        rpc.nvmf.nvmf_subsystem_add_ns(args.client, args)
+        rpc.nvmf.nvmf_subsystem_add_ns(args.client,
+                                       nqn=args.nqn,
+                                       bdev_name=args.bdev_name,
+                                       nsid=args.nsid,
+                                       nguid=args.nguid,
+                                       eui64=args.eui64,
+                                       uuid=args.uuid)
 
     p = subparsers.add_parser('nvmf_subsystem_add_ns', help='Add a namespace to an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -934,7 +1007,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_remove_ns(args):
-        rpc.nvmf.nvmf_subsystem_remove_ns(args.client, args)
+        rpc.nvmf.nvmf_subsystem_remove_ns(args.client,
+                                          nqn=args.nqn,
+                                          nsid=args.nsid)
 
     p = subparsers.add_parser('nvmf_subsystem_remove_ns', help='Remove a namespace to an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -943,7 +1018,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_add_host(args):
-        rpc.nvmf.nvmf_subsystem_add_host(args.client, args)
+        rpc.nvmf.nvmf_subsystem_add_host(args.client,
+                                         nqn=args.nqn,
+                                         host=args.host)
 
     p = subparsers.add_parser('nvmf_subsystem_add_host', help='Add a host to an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -952,7 +1029,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_remove_host(args):
-        rpc.nvmf.nvmf_subsystem_remove_host(args.client, args)
+        rpc.nvmf.nvmf_subsystem_remove_host(args.client,
+                                            nqn=args.nqn,
+                                            host=args.host)
 
     p = subparsers.add_parser('nvmf_subsystem_remove_host', help='Remove a host from an NVMe-oF subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -961,7 +1040,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def nvmf_subsystem_allow_any_host(args):
-        rpc.nvmf.nvmf_subsystem_allow_any_host(args.client, args)
+        rpc.nvmf.nvmf_subsystem_allow_any_host(args.client,
+                                               nqn=args.nqn,
+                                               disable=args.disable)
 
     p = subparsers.add_parser('nvmf_subsystem_allow_any_host', help='Allow any host to connect to the subsystem')
     p.add_argument('nqn', help='NVMe-oF subsystem NQN')
@@ -1016,7 +1097,10 @@ if __name__ == "__main__":
     # vhost
     @call_cmd
     def set_vhost_controller_coalescing(args):
-        rpc.vhost.set_vhost_controller_coalescing(args.client, args)
+        rpc.vhost.set_vhost_controller_coalescing(args.client,
+                                                  ctrlr=args.ctrlr,
+                                                  delay_base_us=args.delay_base_us,
+                                                  iops_threshold=args.iops_threshold)
 
     p = subparsers.add_parser('set_vhost_controller_coalescing', help='Set vhost controller coalescing')
     p.add_argument('ctrlr', help='controller name')
@@ -1026,7 +1110,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_vhost_scsi_controller(args):
-        rpc.vhost.construct_vhost_scsi_controller(args.client, args)
+        rpc.vhost.construct_vhost_scsi_controller(args.client,
+                                                  ctrlr=args.ctrlr,
+                                                  cpumask=args.cpumask)
 
     p = subparsers.add_parser(
         'construct_vhost_scsi_controller', help='Add new vhost controller')
@@ -1036,7 +1122,10 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_vhost_scsi_lun(args):
-        rpc.vhost.add_vhost_scsi_lun(args.client, args)
+        rpc.vhost.add_vhost_scsi_lun(args.client,
+                                     ctrlr=args.ctrlr,
+                                     scsi_target_num=args.scsi_target_num,
+                                     bdev_name=args.bdev_name)
 
     p = subparsers.add_parser('add_vhost_scsi_lun',
                               help='Add lun to vhost controller')
@@ -1047,7 +1136,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def remove_vhost_scsi_target(args):
-        rpc.vhost.remove_vhost_scsi_target(args.client, args)
+        rpc.vhost.remove_vhost_scsi_target(args.client,
+                                           ctrlr=args.ctrlr,
+                                           scsi_target_num=args.scsi_target_num)
 
     p = subparsers.add_parser('remove_vhost_scsi_target', help='Remove target from vhost controller')
     p.add_argument('ctrlr', help='controller name to remove target from')
@@ -1056,7 +1147,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_vhost_blk_controller(args):
-        rpc.vhost.construct_vhost_blk_controller(args.client, args)
+        rpc.vhost.construct_vhost_blk_controller(args.client,
+                                                 ctrlr=args.ctrlr,
+                                                 dev_name=args.dev_name,
+                                                 cpumask=args.cpumask,
+                                                 readonly=args.readonly)
 
     p = subparsers.add_parser('construct_vhost_blk_controller', help='Add a new vhost block controller')
     p.add_argument('ctrlr', help='controller name')
@@ -1067,7 +1162,10 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_vhost_nvme_controller(args):
-        rpc.vhost.construct_vhost_nvme_controller(args.client, args)
+        rpc.vhost.construct_vhost_nvme_controller(args.client,
+                                                  ctrlr=args.ctrlr,
+                                                  io_queues=args.io_queues,
+                                                  cpumask=args.cpumask)
 
     p = subparsers.add_parser('construct_vhost_nvme_controller', help='Add new vhost controller')
     p.add_argument('ctrlr', help='controller name')
@@ -1077,7 +1175,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_vhost_nvme_ns(args):
-        rpc.vhost.add_vhost_nvme_ns(args.client, args)
+        rpc.vhost.add_vhost_nvme_ns(args.client,
+                                    ctrlr=args.ctrlr,
+                                    bdev_name=args.bdev_name)
 
     p = subparsers.add_parser('add_vhost_nvme_ns', help='Add a Namespace to vhost controller')
     p.add_argument('ctrlr', help='conntroller name where add a Namespace')
@@ -1086,14 +1186,15 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_vhost_controllers(args):
-        print_dict(rpc.vhost.get_vhost_controllers(args.client, args))
+        print_dict(rpc.vhost.get_vhost_controllers(args.client))
 
     p = subparsers.add_parser('get_vhost_controllers', help='List vhost controllers')
     p.set_defaults(func=get_vhost_controllers)
 
     @call_cmd
     def remove_vhost_controller(args):
-        rpc.vhost.remove_vhost_controller(args.client, args)
+        rpc.vhost.remove_vhost_controller(args.client,
+                                          ctrlr=args.ctrlr)
 
     p = subparsers.add_parser('remove_vhost_controller', help='Remove a vhost controller')
     p.add_argument('ctrlr', help='controller name')
@@ -1101,7 +1202,12 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_dev(args):
-        print_dict(rpc.vhost.construct_virtio_dev(args.client, args))
+        print_dict(rpc.vhost.construct_virtio_dev(args.client,
+                                                  trtype=args.trtype,
+                                                  traddr=args.traddr,
+                                                  dev_type=args.dev_type,
+                                                  vq_count=args.vq_count,
+                                                  vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_dev', help="""Construct new virtio device using provided
     transport type and device type. In case of SCSI device type this implies scan and add bdevs offered by
@@ -1119,7 +1225,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_user_scsi_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_user_scsi_bdev(args.client, args))
+        print_dict(rpc.vhost.construct_virtio_user_scsi_bdev(args.client,
+                                                             path=args.path,
+                                                             name=args.name,
+                                                             vq_count=args.vq_count,
+                                                             vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_user_scsi_bdev', help="""Connect to virtio user scsi device.
     This imply scan and add bdevs offered by remote side.
@@ -1133,7 +1243,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_pci_scsi_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_pci_scsi_bdev(args.client, args))
+        print_dict(rpc.vhost.construct_virtio_pci_scsi_bdev(args.client,
+                                                            pci_address=args.pci_address,
+                                                            name=args.name))
 
     p = subparsers.add_parser('construct_virtio_pci_scsi_bdev', help="""Create a Virtio
     SCSI device from a virtio-pci device.""")
@@ -1145,14 +1257,15 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_virtio_scsi_devs(args):
-        print_dict(rpc.vhost.get_virtio_scsi_devs(args.client, args))
+        print_dict(rpc.vhost.get_virtio_scsi_devs(args.client))
 
     p = subparsers.add_parser('get_virtio_scsi_devs', help='List all Virtio-SCSI devices.')
     p.set_defaults(func=get_virtio_scsi_devs)
 
     @call_cmd
     def remove_virtio_scsi_bdev(args):
-        rpc.vhost.remove_virtio_scsi_bdev(args.client, args)
+        rpc.vhost.remove_virtio_scsi_bdev(args.client,
+                                          name=args.name)
 
     p = subparsers.add_parser('remove_virtio_scsi_bdev', help="""Remove a Virtio-SCSI device
     This will delete all bdevs exposed by this device""")
@@ -1161,7 +1274,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_user_blk_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_user_blk_bdev(args.client, args))
+        print_dict(rpc.vhost.construct_virtio_user_blk_bdev(args.client,
+                                                            path=args.path,
+                                                            name=args.name,
+                                                            vq_count=args.vq_count,
+                                                            vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_user_blk_bdev', help='Connect to a virtio user blk device.')
     p.add_argument('path', help='Path to Virtio BLK socket')
@@ -1172,13 +1289,29 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_pci_blk_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_pci_blk_bdev(args.client, args))
+        print_dict(rpc.vhost.construct_virtio_pci_blk_bdev(args.client,
+                                                           pci_address=args.pci_address,
+                                                           name=args.name))
 
     p = subparsers.add_parser('construct_virtio_pci_blk_bdev', help='Create a Virtio Blk device from a virtio-pci device.')
     p.add_argument('pci_address', help="""PCI address in domain:bus:device.function format or
     domain.bus.device.function format""")
     p.add_argument('name', help='Name for the bdev')
     p.set_defaults(func=construct_virtio_pci_blk_bdev)
+
+    # ioat
+    @call_cmd
+    def scan_ioat_copy_engine(args):
+        pci_whitelist = []
+        if args.pci_whitelist:
+            for w in args.pci_whitelist.strip().split(" "):
+                pci_whitelist.append(w)
+        rpc.ioat.scan_ioat_copy_engine(args.client, pci_whitelist)
+
+    p = subparsers.add_parser('scan_ioat_copy_engine', help='Set scan and enable IOAT copy engine offload.')
+    p.add_argument('-w', '--pci-whitelist', help="""Whitespace-separated list of PCI addresses in
+    domain:bus:device.function format or domain.bus.device.function format""")
+    p.set_defaults(func=scan_ioat_copy_engine)
 
     args = parser.parse_args()
 

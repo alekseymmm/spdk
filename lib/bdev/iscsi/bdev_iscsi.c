@@ -63,6 +63,7 @@ static TAILQ_HEAD(, bdev_iscsi_lun) g_iscsi_lun_head = TAILQ_HEAD_INITIALIZER(g_
 static TAILQ_HEAD(, bdev_iscsi_conn_req) g_iscsi_conn_req = TAILQ_HEAD_INITIALIZER(
 			g_iscsi_conn_req);
 static struct spdk_poller *g_conn_poller = NULL;
+static bool g_finish_in_process = false;
 
 struct bdev_iscsi_io {
 	struct spdk_thread *submit_td;
@@ -100,7 +101,6 @@ struct bdev_iscsi_conn_req {
 	spdk_bdev_iscsi_create_cb		create_cb;
 	spdk_bdev_iscsi_create_cb		create_cb_arg;
 	TAILQ_ENTRY(bdev_iscsi_conn_req)	link;
-	bool					deleted;
 };
 
 static int
@@ -141,7 +141,7 @@ bdev_iscsi_lun_cleanup(struct bdev_iscsi_lun *lun)
 	TAILQ_REMOVE(&g_iscsi_lun_head, lun, link);
 	iscsi_destroy_context(lun->context);
 	iscsi_free_lun(lun);
-	if (TAILQ_EMPTY(&g_iscsi_lun_head)) {
+	if (TAILQ_EMPTY(&g_iscsi_lun_head) && g_finish_in_process) {
 		bdev_iscsi_finish_done();
 		spdk_bdev_module_finish_done();
 	}
@@ -164,6 +164,12 @@ static void
 bdev_iscsi_finish(void)
 {
 	struct bdev_iscsi_lun *lun, *tmp;
+
+	/*
+	 * Set this flag so that bdev_iscsi_lun_cleanup knows it needs to mark
+	 *  the module finish as done when the TAILQ is not empty.
+	 */
+	g_finish_in_process = true;
 
 	if (TAILQ_EMPTY(&g_iscsi_lun_head)) {
 		bdev_iscsi_finish_done();
@@ -337,7 +343,7 @@ bdev_iscsi_poll_lun(struct bdev_iscsi_lun *lun)
 		}
 	}
 
-	return 0;
+	return -1;
 }
 
 static int
@@ -537,7 +543,7 @@ complete_conn_req(struct bdev_iscsi_conn_req *req, struct spdk_bdev *bdev,
 {
 	TAILQ_REMOVE(&g_iscsi_conn_req, req, link);
 	req->create_cb(req->create_cb_arg, bdev, status);
-	req->deleted = true;
+	free(req);
 }
 
 static int
@@ -646,10 +652,12 @@ iscsi_bdev_conn_poll(void *arg)
 {
 	struct bdev_iscsi_conn_req *req, *tmp;
 	struct pollfd pfd;
+	struct iscsi_context *context;
 
 	TAILQ_FOREACH_SAFE(req, &g_iscsi_conn_req, link, tmp) {
-		pfd.fd = iscsi_get_fd(req->context);
-		pfd.events = iscsi_which_events(req->context);
+		context = req->context;
+		pfd.fd = iscsi_get_fd(context);
+		pfd.events = iscsi_which_events(context);
 		pfd.revents = 0;
 		if (poll(&pfd, 1, 0) < 0) {
 			SPDK_ERRLOG("poll failed\n");
@@ -657,17 +665,13 @@ iscsi_bdev_conn_poll(void *arg)
 		}
 
 		if (pfd.revents != 0) {
-			if (iscsi_service(req->context, pfd.revents) < 0) {
-				SPDK_ERRLOG("iscsi_service failed: %s\n", iscsi_get_error(req->context));
+			if (iscsi_service(context, pfd.revents) < 0) {
+				SPDK_ERRLOG("iscsi_service failed: %s\n", iscsi_get_error(context));
 			}
-		}
-
-		if (req->deleted) {
-			free(req);
 		}
 	}
 
-	return 0;
+	return -1;
 }
 
 int

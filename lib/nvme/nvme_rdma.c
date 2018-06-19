@@ -50,6 +50,7 @@
 #include "spdk/nvmf_spec.h"
 #include "spdk/string.h"
 #include "spdk/endian.h"
+#include "spdk/likely.h"
 
 #include "nvme_internal.h"
 
@@ -111,7 +112,8 @@ struct nvme_rdma_qpair {
 
 	struct spdk_nvme_rdma_mr_map		*mr_map;
 
-	STAILQ_HEAD(, spdk_nvme_rdma_req)	free_reqs;
+	TAILQ_HEAD(, spdk_nvme_rdma_req)	free_reqs;
+	TAILQ_HEAD(, spdk_nvme_rdma_req)	outstanding_reqs;
 };
 
 struct spdk_nvme_rdma_req {
@@ -123,7 +125,7 @@ struct spdk_nvme_rdma_req {
 
 	struct ibv_sge				send_sgl;
 
-	STAILQ_ENTRY(spdk_nvme_rdma_req)	link;
+	TAILQ_ENTRY(spdk_nvme_rdma_req)		link;
 };
 
 static const char *rdma_cm_event_str[] = {
@@ -169,9 +171,10 @@ nvme_rdma_req_get(struct nvme_rdma_qpair *rqpair)
 {
 	struct spdk_nvme_rdma_req *rdma_req;
 
-	rdma_req = STAILQ_FIRST(&rqpair->free_reqs);
+	rdma_req = TAILQ_FIRST(&rqpair->free_reqs);
 	if (rdma_req) {
-		STAILQ_REMOVE_HEAD(&rqpair->free_reqs, link);
+		TAILQ_REMOVE(&rqpair->free_reqs, rdma_req, link);
+		TAILQ_INSERT_TAIL(&rqpair->outstanding_reqs, rdma_req, link);
 	}
 
 	return rdma_req;
@@ -180,7 +183,8 @@ nvme_rdma_req_get(struct nvme_rdma_qpair *rqpair)
 static void
 nvme_rdma_req_put(struct nvme_rdma_qpair *rqpair, struct spdk_nvme_rdma_req *rdma_req)
 {
-	STAILQ_INSERT_HEAD(&rqpair->free_reqs, rdma_req, link);
+	TAILQ_REMOVE(&rqpair->outstanding_reqs, rdma_req, link);
+	TAILQ_INSERT_HEAD(&rqpair->free_reqs, rdma_req, link);
 }
 
 static void
@@ -400,7 +404,8 @@ nvme_rdma_alloc_reqs(struct nvme_rdma_qpair *rqpair)
 		goto fail;
 	}
 
-	STAILQ_INIT(&rqpair->free_reqs);
+	TAILQ_INIT(&rqpair->free_reqs);
+	TAILQ_INIT(&rqpair->outstanding_reqs);
 	for (i = 0; i < rqpair->num_entries; i++) {
 		struct spdk_nvme_rdma_req	*rdma_req;
 		struct spdk_nvme_cmd		*cmd;
@@ -422,7 +427,7 @@ nvme_rdma_alloc_reqs(struct nvme_rdma_qpair *rqpair)
 		rdma_req->send_wr.num_sge = 1;
 		rdma_req->send_wr.imm_data = 0;
 
-		STAILQ_INSERT_TAIL(&rqpair->free_reqs, rdma_req, link);
+		TAILQ_INSERT_TAIL(&rqpair->free_reqs, rdma_req, link);
 	}
 
 	return 0;
@@ -1527,6 +1532,45 @@ nvme_rdma_qpair_fail(struct spdk_nvme_qpair *qpair)
 	return 0;
 }
 
+static void
+nvme_rdma_qpair_check_timeout(struct spdk_nvme_qpair *qpair)
+{
+	uint64_t t02;
+	struct spdk_nvme_rdma_req *rdma_req, *tmp;
+	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(qpair);
+	struct spdk_nvme_ctrlr *ctrlr = qpair->ctrlr;
+	struct spdk_nvme_ctrlr_process *active_proc;
+
+	/* Don't check timeouts during controller initialization. */
+	if (ctrlr->state != NVME_CTRLR_STATE_READY) {
+		return;
+	}
+
+	if (nvme_qpair_is_admin_queue(qpair)) {
+		active_proc = spdk_nvme_ctrlr_get_current_process(ctrlr);
+	} else {
+		active_proc = qpair->active_proc;
+	}
+
+	/* Only check timeouts if the current process has a timeout callback. */
+	if (active_proc == NULL || active_proc->timeout_cb_fn == NULL) {
+		return;
+	}
+
+	t02 = spdk_get_ticks();
+	TAILQ_FOREACH_SAFE(rdma_req, &rqpair->outstanding_reqs, link, tmp) {
+		assert(rdma_req->req != NULL);
+
+		if (nvme_request_check_timeout(rdma_req->req, rdma_req->id, active_proc, t02)) {
+			/*
+			 * The requests are in order, so as soon as one has not timed out,
+			 * stop iterating.
+			 */
+			break;
+		}
+	}
+}
+
 #define MAX_COMPLETIONS_PER_POLL 128
 
 int
@@ -1594,6 +1638,10 @@ nvme_rdma_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 			}
 		}
 	} while (reaped < max_completions);
+
+	if (spdk_unlikely(rqpair->qpair.ctrlr->timeout_enabled)) {
+		nvme_rdma_qpair_check_timeout(qpair);
+	}
 
 	return reaped;
 }

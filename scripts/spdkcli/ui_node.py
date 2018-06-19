@@ -52,6 +52,9 @@ class UIBdevs(UINode):
         UIAIOBdev(self)
         UILvolBdev(self)
         UINvmeBdev(self)
+        UINullBdev(self)
+        UIErrorBdev(self)
+        UISplitBdev(self)
 
     def ui_command_delete(self, name):
         """
@@ -129,6 +132,43 @@ class UIBdev(UINode):
         """
         self.get_root().delete_bdev(name=name)
         self.get_root().refresh()
+        self.refresh()
+
+    def ui_command_get_bdev_iostat(self, name=None):
+        if name is None:
+            ret = self.get_root().get_bdevs_iostat()
+        else:
+            ret = self.get_root().get_bdevs_iostat(name=name)
+        self.shell.log.info(json.dumps(ret, indent=2))
+
+    def ui_command_split_bdev(self, base_bdev, split_count, split_size_mb=None):
+        """
+        Construct split block devices from a base bdev.
+
+        Arguments:
+        base_bdev - Name of bdev to split
+        split_count -  Number of split bdevs to create
+        split_size_mb- Size of each split volume in MiB (optional)
+        """
+
+        split_count = self.ui_eval_param(split_count, "number", None)
+        split_size_mb = self.ui_eval_param(split_size_mb, "number", None)
+
+        ret_name = self.get_root().split_bdev(base_bdev=base_bdev,
+                                              split_count=split_count,
+                                              split_size_mb=split_size_mb)
+        self.shell.log.info(ret_name)
+        self.parent.refresh()
+        self.refresh()
+
+    def ui_command_destruct_split_bdev(self, base_bdev):
+        """Destroy split block devices associated with base bdev.
+
+        Args:
+            base_bdev: name of previously split bdev
+        """
+        self.get_root().destruct_split_bdev(base_bdev=base_bdev)
+        self.parent.refresh()
         self.refresh()
 
     def summary(self):
@@ -242,6 +282,56 @@ class UINvmeBdev(UIBdev):
         self.shell.log.info(ret_name)
         self.get_root().refresh()
         self.refresh()
+
+
+class UINullBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "Null", parent)
+
+    def ui_command_create(self, name, size, block_size, uuid=None):
+        """
+        Construct a Null bdev.
+
+        Arguments:
+        name - Name to use for bdev.
+        size - Size in megabytes.
+        block_size - Integer, block size to use when constructing bdev.
+        uuid - Optional parameter. Custom UUID to use. If empty then random
+               will be generated.
+        """
+
+        size = self.ui_eval_param(size, "number", None)
+        block_size = self.ui_eval_param(block_size, "number", None)
+        num_blocks = size * 1024 * 1024 // block_size
+
+        ret_name = self.get_root().create_null_bdev(num_blocks=num_blocks,
+                                                    block_size=block_size,
+                                                    name=name, uuid=uuid)
+        self.shell.log.info(ret_name)
+        self.get_root().refresh()
+        self.refresh()
+
+
+class UIErrorBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "Error", parent)
+
+    def ui_command_create(self, base_name):
+        """
+        Construct a error injection bdev.
+
+        Arguments:
+        base_name - base bdev name on top of which error bdev will be created.
+        """
+
+        self.get_root().create_error_bdev(base_name=base_name)
+        self.get_root().refresh()
+        self.refresh()
+
+
+class UISplitBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "Split_Disk", parent)
 
 
 class UIBdevObj(UINode):

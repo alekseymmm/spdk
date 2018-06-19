@@ -886,7 +886,7 @@ int spdk_nvme_ctrlr_cmd_get_feature(struct spdk_nvme_ctrlr *ctrlr,
  * \param payload_size The size of payload buffer.
  * \param cb_fn Callback function to invoke when the feature has been retrieved.
  * \param cb_arg Argument to pass to the callback function.
- * \param ns_is The namespace identifier.
+ * \param ns_id The namespace identifier.
  *
  * \return 0 if successfully submitted, ENOMEM if resources could not be allocated
  * for this request
@@ -914,7 +914,7 @@ int spdk_nvme_ctrlr_cmd_get_feature_ns(struct spdk_nvme_ctrlr *ctrlr, uint8_t fe
  * \param payload_size The size of payload buffer.
  * \param cb_fn Callback function to invoke when the feature has been set.
  * \param cb_arg Argument to pass to the callback function.
- * \param ns_is The namespace identifier.
+ * \param ns_id The namespace identifier.
  *
  * \return 0 if successfully submitted, ENOMEM if resources could not be allocated
  * for this request.
@@ -1013,6 +1013,7 @@ int spdk_nvme_ctrlr_format(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
 /**
  * \brief Download a new firmware image.
  *
+ * \param ctrlr NVMe controller to perform firmware operation on.
  * \param payload The data buffer for the firmware image.
  * \param size The data size will be downloaded.
  * \param slot The slot that the firmware image will be committed to.
@@ -1461,7 +1462,7 @@ int spdk_nvme_ns_cmd_read_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpai
  *        deallocate, which is often referred to as TRIM or UNMAP.
  *
  * \param ns NVMe namespace to submit the DSM request
- * \param type A bit field constructed from \ref enum spdk_nvme_dsm_attribute.
+ * \param type A bit field constructed from \ref spdk_nvme_dsm_attribute.
  * \param qpair I/O queue pair to submit the request
  * \param ranges An array of \ref spdk_nvme_dsm_range elements describing
  *		 the LBAs to operate on.

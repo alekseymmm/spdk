@@ -460,9 +460,7 @@ virtqueue_req_flush(struct virtqueue *vq)
 	 * descriptor.
 	 */
 	avail_idx = (uint16_t)(vq->vq_avail_idx & (vq->vq_nentries - 1));
-	if (spdk_unlikely(vq->vq_ring.avail->ring[avail_idx] != vq->req_start)) {
-		vq->vq_ring.avail->ring[avail_idx] = vq->req_start;
-	}
+	vq->vq_ring.avail->ring[avail_idx] = vq->req_start;
 
 	vq->vq_avail_idx++;
 	vq->req_start = VQ_RING_DESC_CHAIN_END;
@@ -556,10 +554,7 @@ virtio_recv_pkts(struct virtqueue *vq, void **io, uint32_t *len, uint16_t nb_pkt
 		num = num - ((vq->vq_used_cons_idx + num) % DESC_PER_CACHELINE);
 	}
 
-	num = virtqueue_dequeue_burst_rx(vq, io, len, num);
-	SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_DEV, "used:%"PRIu16" dequeue:%"PRIu16"\n", nb_used, num);
-
-	return num;
+	return virtqueue_dequeue_burst_rx(vq, io, len, num);
 }
 
 int

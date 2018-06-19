@@ -49,6 +49,7 @@ struct bdevperf_task {
 	struct io_target		*target;
 	void				*buf;
 	uint64_t			offset_blocks;
+	enum spdk_bdev_io_type		io_type;
 	TAILQ_ENTRY(bdevperf_task)	link;
 };
 
@@ -354,26 +355,10 @@ bdevperf_verify_write_complete(struct spdk_bdev_io *bdev_io, bool success,
 static __thread unsigned int seed = 0;
 
 static void
-bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task)
+bdevperf_prep_task(struct bdevperf_task *task)
 {
-	struct spdk_bdev_desc	*desc;
-	struct spdk_io_channel	*ch;
-	uint64_t		offset_in_ios;
-	void			*rbuf;
-	int			rc;
-
-	desc = target->bdev_desc;
-	ch = target->ch;
-
-	if (!task) {
-		if (!TAILQ_EMPTY(&target->task_list)) {
-			task = TAILQ_FIRST(&target->task_list);
-			TAILQ_REMOVE(&target->task_list, task, link);
-		} else {
-			printf("Task allocation failed\n");
-			abort();
-		}
-	}
+	struct io_target *target = task->target;
+	uint64_t offset_in_ios;
 
 	if (g_is_random) {
 		offset_in_ios = rand_r(&seed) % target->size_in_ios;
@@ -389,57 +374,84 @@ bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task)
 		memset(task->buf, rand_r(&seed) % 256, g_io_size);
 		task->iov.iov_base = task->buf;
 		task->iov.iov_len = g_io_size;
-		rc = spdk_bdev_writev_blocks(desc, ch, &task->iov, 1, task->offset_blocks,
-					     target->io_size_blocks, bdevperf_verify_write_complete, task);
-		if (rc) {
-			printf("Failed to submit writev: %d\n", rc);
-			target->is_draining = true;
-			g_run_failed = true;
-			return;
-		}
+		task->io_type = SPDK_BDEV_IO_TYPE_WRITE;
 	} else if (g_flush) {
-		rc = spdk_bdev_flush_blocks(desc, ch, task->offset_blocks,
-					    target->io_size_blocks, bdevperf_complete, task);
-		if (rc) {
-			printf("Failed to submit flush: %d\n", rc);
-			target->is_draining = true;
-			g_run_failed = true;
-			return;
-		}
+		task->io_type = SPDK_BDEV_IO_TYPE_FLUSH;
 	} else if (g_unmap) {
-		rc = spdk_bdev_unmap_blocks(desc, ch, task->offset_blocks,
-					    target->io_size_blocks, bdevperf_complete, task);
-		if (rc) {
-			printf("Failed to submit unmap: %d\n", rc);
-			target->is_draining = true;
-			g_run_failed = true;
-			return;
-		}
+		task->io_type = SPDK_BDEV_IO_TYPE_UNMAP;
 	} else if ((g_rw_percentage == 100) ||
 		   (g_rw_percentage != 0 && ((rand_r(&seed) % 100) < g_rw_percentage))) {
-		rbuf = g_zcopy ? NULL : task->buf;
-		rc = spdk_bdev_read_blocks(desc, ch, rbuf, task->offset_blocks,
-					   target->io_size_blocks, bdevperf_complete, task);
-		if (rc) {
-			printf("Failed to submit read: %d\n", rc);
-			target->is_draining = true;
-			g_run_failed = true;
-			return;
-		}
+		task->io_type = SPDK_BDEV_IO_TYPE_READ;
 	} else {
 		task->iov.iov_base = task->buf;
 		task->iov.iov_len = g_io_size;
+		task->io_type = SPDK_BDEV_IO_TYPE_WRITE;
+	}
+}
+
+static void
+bdevperf_submit_task(struct bdevperf_task *task)
+{
+	struct io_target	*target = task->target;
+	struct spdk_bdev_desc	*desc;
+	struct spdk_io_channel	*ch;
+	spdk_bdev_io_completion_cb cb_fn;
+	void			*rbuf;
+	int			rc;
+
+	desc = target->bdev_desc;
+	ch = target->ch;
+
+	switch (task->io_type) {
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		cb_fn = (g_verify || g_reset) ? bdevperf_verify_write_complete : bdevperf_complete;
 		rc = spdk_bdev_writev_blocks(desc, ch, &task->iov, 1, task->offset_blocks,
-					     target->io_size_blocks, bdevperf_complete, task);
-		if (rc) {
-			printf("Failed to submit writev: %d\n", rc);
-			target->is_draining = true;
-			g_run_failed = true;
-			return;
-		}
+					     target->io_size_blocks, cb_fn, task);
+		break;
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		rc = spdk_bdev_flush_blocks(desc, ch, task->offset_blocks,
+					    target->io_size_blocks, bdevperf_complete, task);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		rc = spdk_bdev_unmap_blocks(desc, ch, task->offset_blocks,
+					    target->io_size_blocks, bdevperf_complete, task);
+		break;
+	case SPDK_BDEV_IO_TYPE_READ:
+		rbuf = g_zcopy ? NULL : task->buf;
+		rc = spdk_bdev_read_blocks(desc, ch, rbuf, task->offset_blocks,
+					   target->io_size_blocks, bdevperf_complete, task);
+		break;
+	default:
+		assert(false);
+		rc = -EINVAL;
+		break;
+	}
+
+	if (rc) {
+		printf("Failed to submit bdev_io: %d\n", rc);
+		target->is_draining = true;
+		g_run_failed = true;
+		return;
 	}
 
 	target->current_queue_depth++;
+}
+
+static void
+bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task)
+{
+	if (!task) {
+		if (!TAILQ_EMPTY(&target->task_list)) {
+			task = TAILQ_FIRST(&target->task_list);
+			TAILQ_REMOVE(&target->task_list, task, link);
+		} else {
+			printf("Task allocation failed\n");
+			abort();
+		}
+	}
+
+	bdevperf_prep_task(task);
+	bdevperf_submit_task(task);
 }
 
 static void
