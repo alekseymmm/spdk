@@ -111,6 +111,10 @@ struct rdx_raid {
 	TAILQ_ENTRY(vbdev_passthru)	link;
 };
 
+struct rdx_raid_dsc {
+
+};
+
 struct rdx_req {
 	uint64_t addr; //sectors
 	unsigned int len; //sectors
@@ -122,8 +126,9 @@ struct rdx_req {
 	enum rdx_req_type type;
 	void *priv;
 	struct rdx_raid_io_channel *ch;
-	struct rdx_blk_req *blk_teq;
+	struct rdx_blk_req *blk_req;
 	int ref_cnt;
+	uint64_t stripe_num;
 };
 
 struct rdx_blk_req {

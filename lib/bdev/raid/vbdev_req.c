@@ -18,7 +18,7 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
 		 req->addr, req->len);
 
-	if (success) {
+	if (!success) {
 		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
 		       req->bdev_io, success, req, dev->bdev_name);
 		//rdx_req_err_io(req, dev, bio_data_dir(bio));
@@ -27,6 +27,14 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 	rdx_req_put_ref(req);
 	//rdx_dev_put_ref(dev);
 	free(io_ctx);
+}
+
+void rdx_req_set_dsc(struct rdx_req *req, struct rdx_raid_dsc *raid_dsc)
+{
+	//req->raid_dsc = raid_dsc;
+	req->stripe_num = req->addr / 16;//raid_dsc->stripe_data_len;
+	//req->stt = &raid_dsc->stt[req->type];
+	//pr_debug("dsc=%p assigned for req=%p\n", raid_dsc, req);
 }
 
 struct rdx_req *rdx_req_create(struct rdx_raid *raid,
@@ -41,8 +49,7 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 		return NULL;
 	}
 
-	// may be it is better to pass raid as argument?
-	req->raid = (struct rdx_raid *)bdev_io->bdev->ctxt;
+	req->raid = raid;
 	req->bdev_io = bdev_io;
 	req->priv = priv;
 
@@ -77,12 +84,13 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 		//set_bit(RDX_REQ_FLAG_USER, &req->flags);
 		rdx_blk_req_get_ref(blk_req);
 		req->ch = blk_req->ch;
-		req->blk_teq = blk_req;
+		req->blk_req = blk_req;
 	} else {
 		rdx_req_get_ref(priv);
 	}
 
 	bdev_io->cb = rdx_bdev_io_end_io;
+
 	return req;
 }
 
@@ -100,7 +108,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	unsigned int slen, len;
 	unsigned int split_offset, buf_len;
 	uint64_t addr;
-	uint64_t stripe_num = 1;
+	uint64_t stripe_num = req->stripe_num;
 	unsigned int offset_in_stripe;
 	int strip_num, dev_num;
 	uint64_t bdev_offset;
@@ -136,6 +144,8 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	split_offset = req->split_offset * KERNEL_SECTOR_SIZE;
 	buf_len = slen * KERNEL_SECTOR_SIZE;
 	io_buf = bdev_io->u.bdev.iov.iov_base + req->buf_offset + split_offset;
+
+	rdx_req_get_ref(req);
 
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
 		spdk_bdev_read(dev->base_desc,
@@ -233,9 +243,10 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //				kmem_cache_free(rdx_req_cachep, req);
 				return;
 			}
+
 		}
 
-//		rdx_req_set_dsc(split_req, raid_dsc);
+		rdx_req_set_dsc(split_req, NULL);
 //
 //		rdx_req_submit(split_req);
 		llist_add(&split_req->thread_lnode, &split_req->ch->req_llist);
@@ -276,6 +287,8 @@ static void rdx_req_end_io(struct rdx_req *req)
 //		rdx_req_process(req);
 //	else
 //		rdx_thread_queue_work(req->thread_num, &req->thread_lnode);
+	//test
+	rdx_req_complete(req);
 }
 
 void rdx_req_put_ref(struct rdx_req *req)
@@ -297,7 +310,7 @@ int rdx_req_complete(struct rdx_req *req)
 	//int err = test_bit(RDX_REQ_FLAG_ERR, &req->flags);
 
 	if (1 /*test_bit(RDX_REQ_FLAG_USER, &req->flags*/) {
-		struct rdx_blk_req *blk_req = req->blk_teq;//req->priv;
+		struct rdx_blk_req *blk_req = req->blk_req;//req->priv;
 		if (err)
 			blk_req->err = -EIO;
 		rdx_blk_req_put_ref(blk_req);

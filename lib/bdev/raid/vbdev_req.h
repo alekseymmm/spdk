@@ -21,5 +21,9 @@ static inline void rdx_req_get_ref(struct rdx_req *req)
 }
 
 void rdx_req_put_ref(struct rdx_req *req);
+int rdx_req_complete(struct rdx_req *req);
+int rdx_req_destroy(struct rdx_req *req);
+
+void rdx_req_set_dsc(struct rdx_req *req, struct rdx_raid_dsc *raid_dsc);
 
 #endif /* LIB_BDEV_RAID_VBDEV_REQ_H_ */

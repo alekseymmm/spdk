@@ -41,6 +41,7 @@
 #include "spdk/bdev_module.h"
 
 static char *g_bdev_name = "Malloc0";
+static char *g_buff = NULL;
 static uint64_t g_block_offset = 0;
 static uint32_t g_blocks_cnt = 1;
 
@@ -92,12 +93,21 @@ static void
 read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct hello_context_t *hello_context = cb_arg;
-
+	uint64_t blk_size;
 	if (success) {
-		SPDK_NOTICELOG("Read string from bdev : %s\n", hello_context->buff);
+		//SPDK_NOTICELOG("Read string from bdev : %s\n", hello_context->buff);
+		blk_size = spdk_bdev_get_block_size(hello_context->bdev) *
+				hello_context->block_cnt;
+		if (memcmp(hello_context->buff, g_buff, blk_size)) {
+			SPDK_ERRLOG("read  write data mismatch.\n");
+		} else {
+			SPDK_NOTICELOG("Read data correct.\n");
+		}
 	} else {
 		SPDK_ERRLOG("bdev io read error\n");
 	}
+
+	free(g_buff);
 
 	/* Complete the bdev io and close the channel */
 	spdk_bdev_free_io(bdev_io);
@@ -136,6 +146,16 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 			hello_context->block_cnt;
 	offset_bytes = spdk_bdev_get_block_size(hello_context->bdev) *
 			hello_context->block_offset;
+	g_buff = calloc(1, blk_size);
+	if (!g_buff) {
+		SPDK_ERRLOG("Cannot allocate memory\n");
+		spdk_put_io_channel(hello_context->bdev_io_channel);
+		spdk_bdev_close(hello_context->bdev_desc);
+		spdk_app_stop(-1);
+		return;
+	}
+
+	memcpy(g_buff, hello_context->buff, blk_size);
 	memset(hello_context->buff, 0, blk_size);
 
 	SPDK_NOTICELOG("Reading io\n");

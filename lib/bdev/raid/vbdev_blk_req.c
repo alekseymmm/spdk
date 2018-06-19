@@ -24,7 +24,7 @@ void rdx_blk_submit(struct rdx_blk_req *blk_req)
 
 	rdx_req_split_per_stripe(req);
 
-	//rdx_blk_req_put_ref(blk_req);
+	rdx_blk_req_put_ref(blk_req);
 }
 
 
