@@ -10,16 +10,17 @@
 void rdx_dev_close(struct rdx_dev *dev);
 void rdx_dev_destroy(struct rdx_dev *dev);
 int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev);
-
+int test = 2;
 /* Called when the underlying base bdev goes away. */
 static void
-vbdev_raid_examine_hotremove_cb(void *ctx)
+vbdev_raid_base_bdev_hotremove_cb(void *ctx)
 {
-	//struct rdx_dev *dev = ctx;
-	//struct rdx_raid *raid = dev->raid;
+	struct rdx_dev *dev = ctx;
+	struct rdx_raid *raid = dev->raid;
 	/*
 	 *unregister dev in raid and do  spdk_bdev_unregister
 	 */
+	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 
 //	TAILQ_FOREACH_SAFE(pt_node, &g_pt_nodes, link, tmp) {
 //		if (bdev_find == pt_node->base_bdev) {
@@ -34,7 +35,7 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
 
-	rc = spdk_bdev_open(bdev, false, vbdev_raid_examine_hotremove_cb,
+	rc = spdk_bdev_open(bdev, true, vbdev_raid_base_bdev_hotremove_cb,
 			dev, &dev->base_desc);
 	if (rc) {
 		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);

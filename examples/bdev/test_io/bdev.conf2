@@ -2,4 +2,4 @@
 	AIO /dev/ram0 AIO_0
 
 [Passthru]
-  PT AIO_0 PT_0
+  PT AIO_0 PT_0 

@@ -30,7 +30,7 @@ static int vbdev_raid_init(void);
 //static int vbdev_raid_get_ctx_size(void);
 static void vbdev_raid_examine(struct spdk_bdev *bdev);
 static void vbdev_raid_init_complete(void);
-//static void vbdev_raid_finish(void);
+static void vbdev_raid_finish(void);
 
 struct spdk_bdev_module raid_if = {
 	.name = "raid",
@@ -39,7 +39,7 @@ struct spdk_bdev_module raid_if = {
 	.config_text = NULL,//vbdev_raid_get_spdk_running_config,
 	.get_ctx_size = NULL,//vbdev_raid_get_ctx_size,
 	.examine = vbdev_raid_examine,
-	.module_fini = NULL,//vbdev_raid_finish
+	.module_fini = vbdev_raid_finish,
 };
 
 SPDK_BDEV_MODULE_REGISTER(&raid_if);
@@ -130,6 +130,11 @@ static void vbdev_raid_init_complete(void)
 	if (g_raid) {
 		rdx_raid_register(g_raid);
 	}
+}
+
+static void vbdev_raid_finish(void)
+{
+	spdk_bdev_unregister(&g_raid->raid_bdev, NULL, NULL);
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID);

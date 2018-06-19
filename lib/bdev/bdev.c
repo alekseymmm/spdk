@@ -2980,6 +2980,7 @@ spdk_bdev_close(struct spdk_bdev_desc *desc)
 		}
 	}
 
+	//if (bdev->status == SPDK_BDEV_STATUS_REMOVING && TAILQ_EMPTY(&bdev->open_descs)) {
 	if (bdev->status == SPDK_BDEV_STATUS_REMOVING && TAILQ_EMPTY(&bdev->open_descs)) {
 		do_unregister = true;
 	}

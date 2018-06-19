@@ -25,6 +25,7 @@ static int rdx_raid_create_devices(struct rdx_raid *raid,
 static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io);
 static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx);
+static int vbdev_raid_destruct(void *ctx);
 
 static void vbdev_raid_write_json_config(struct spdk_bdev *bdev,
 					 struct spdk_json_write_ctx *w);
@@ -32,7 +33,7 @@ static void vbdev_raid_write_json_config(struct spdk_bdev *bdev,
 
 /* When we regsiter our bdev this is how we specify our entry points. */
 static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
-	.destruct		= NULL,//vbdev_passthru_destruct,
+	.destruct		= vbdev_raid_destruct,
 	.submit_request		= vbdev_raid_submit_request,
 	.io_type_supported	= NULL,//vbdev_passthru_io_type_supported,
 	.get_io_channel		= vbdev_raid_get_io_channel,
@@ -156,6 +157,7 @@ int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
 	}
 	SPDK_NOTICELOG("raid %s device=%s replaced on pos %d\n",
 			raid->name, bdev->name, dev_num);
+
 	return 0;
 }
 
@@ -241,8 +243,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	for (i = 0; i < raid->dev_cnt; i++) {
-		raid_ch->dev_io_channels[i] =
-			spdk_bdev_get_io_channel(raid->devices[i]->base_desc);
+		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(raid->devices[i]->base_desc);
 		if (!raid_ch->dev_io_channels[i]){
 			SPDK_ERRLOG("could not open io_channel for bdev%s\n",
 				spdk_bdev_get_name(raid->devices[i]->bdev));
@@ -270,6 +271,7 @@ raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 	for (i = 0; i < raid->dev_cnt; i++) {
 		spdk_put_io_channel(raid_ch->dev_io_channels[i]);
 	}
+	free(raid_ch->dev_io_channels);
 	spdk_poller_unregister(&raid_ch->poller);
 }
 
@@ -277,8 +279,10 @@ raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx)
 {
 	struct rdx_raid *raid = ctx;
+	struct spdk_io_channel *io_ch = NULL;
 
-	return spdk_get_io_channel(raid);
+	io_ch = spdk_get_io_channel(raid);;
+	return io_ch;
 }
 
 int rdx_raid_register(struct rdx_raid *raid)
@@ -316,13 +320,32 @@ int rdx_raid_register(struct rdx_raid *raid)
 	SPDK_NOTICELOG("vbdev raid registered with name: %s\n",
 			raid->raid_bdev.name);
 
-
 error:
 	free(base_bdevs);
 
 	return rc;
 }
 
+
+/* Called after we've unregistered following a hot remove callback.
+ * Our finish entry point will be called next.
+ */
+static int vbdev_raid_destruct(void *ctx)
+{
+	int i;
+	struct rdx_raid *raid = (struct rdx_raid *)ctx;
+
+	for (i = 0; i < raid->dev_cnt; i++) {
+		/* Unclaim the underlying bdev. */
+		spdk_bdev_module_release_bdev(raid->devices[i]->bdev);
+
+		/* Close the underlying bdev. */
+		spdk_bdev_close(raid->devices[i]->base_desc);
+	}
+	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+	printf("destruct\n");
+	return 0;
+}
 
 /* Called when SPDK wants to output the bdev specific methods. */
 static void
