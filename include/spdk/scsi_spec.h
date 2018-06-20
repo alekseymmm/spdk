@@ -232,6 +232,8 @@ enum spdk_sbc_opcode {
 	SPDK_SBC_VL_XPWRITE_32 = 0x0006,
 };
 
+#define SPDK_SBC_START_STOP_UNIT_START_BIT (1 << 0)
+
 enum spdk_mmc_opcode {
 	/* MMC6 */
 	SPDK_MMC_READ_DISC_STRUCTURE = 0xad,
@@ -495,7 +497,7 @@ struct spdk_scsi_unmap_bdesc {
 	uint32_t reserved;
 };
 
-#define SPDK_SCSI_UNMAP_LBPU  			1 << 7
+#define SPDK_SCSI_UNMAP_LBPU			1 << 7
 #define SPDK_SCSI_UNMAP_LBPWS			1 << 6
 #define SPDK_SCSI_UNMAP_LBPWS10			1 << 5
 

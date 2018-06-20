@@ -35,9 +35,8 @@
 
 #include "spdk_cunit.h"
 
-#include "task.c"
-#include "lun.c"
-#include "lun_db.c"
+#include "scsi/task.c"
+#include "scsi/lun.c"
 
 #include "spdk_internal/mock.h"
 
@@ -46,7 +45,7 @@ struct spdk_bdev {
 	int x;
 };
 
-SPDK_LOG_REGISTER_TRACE_FLAG("scsi", SPDK_TRACE_SCSI)
+SPDK_LOG_REGISTER_COMPONENT("scsi", SPDK_LOG_SCSI)
 
 struct spdk_scsi_globals g_spdk_scsi;
 
@@ -67,26 +66,9 @@ spdk_poller_unregister(struct spdk_poller **ppoller)
 {
 }
 
-struct spdk_event *
-spdk_event_allocate(uint32_t lcore, spdk_event_fn fn,
-		    void *arg1, void *arg2)
-{
-	return NULL;
-}
-
-/**
- * \brief Pass the given event to the associated lcore and call the function.
- */
 void
-spdk_event_call(struct spdk_event *event)
+spdk_thread_send_msg(const struct spdk_thread *thread, spdk_thread_fn fn, void *ctx)
 {
-
-}
-
-uint32_t
-spdk_env_get_current_core(void)
-{
-	return 0;
 }
 
 void spdk_trace_record(uint16_t tpoint_id, uint16_t poller_id, uint32_t size,
@@ -104,8 +86,6 @@ spdk_lun_ut_cpl_task(struct spdk_scsi_task *task)
 static void
 spdk_lun_ut_free_task(struct spdk_scsi_task *task)
 {
-	/* This should never get called since we never call spdk_scsi_task_put(). */
-	SPDK_CU_ASSERT_FATAL(0);
 }
 
 static void
@@ -113,8 +93,7 @@ ut_init_task(struct spdk_scsi_task *task)
 {
 	memset(task, 0, sizeof(*task));
 	spdk_scsi_task_construct(task, spdk_lun_ut_cpl_task,
-				 spdk_lun_ut_free_task,
-				 NULL);
+				 spdk_lun_ut_free_task);
 	g_task_count++;
 }
 
@@ -122,8 +101,9 @@ void *
 spdk_dma_malloc(size_t size, size_t align, uint64_t *phys_addr)
 {
 	void *buf = malloc(size);
-	if (phys_addr)
+	if (phys_addr) {
 		*phys_addr = (uint64_t)buf;
+	}
 	return buf;
 }
 
@@ -131,8 +111,9 @@ void *
 spdk_dma_zmalloc(size_t size, size_t align, uint64_t *phys_addr)
 {
 	void *buf = calloc(size, 1);
-	if (phys_addr)
+	if (phys_addr) {
 		*phys_addr = (uint64_t)buf;
+	}
 	return buf;
 }
 
@@ -142,11 +123,10 @@ spdk_dma_free(void *buf)
 	free(buf);
 }
 
-int
+void
 spdk_bdev_free_io(struct spdk_bdev_io *bdev_io)
 {
 	CU_ASSERT(0);
-	return -1;
 }
 
 int
@@ -180,25 +160,26 @@ void spdk_scsi_dev_delete_lun(struct spdk_scsi_dev *dev,
 }
 
 int
-spdk_bdev_scsi_reset(struct spdk_bdev *bdev, struct spdk_scsi_task *task)
+spdk_bdev_scsi_reset(struct spdk_scsi_task *task)
 {
 	return 0;
 }
 
 int
-spdk_bdev_scsi_execute(struct spdk_bdev *bdev, struct spdk_scsi_task *task)
+spdk_bdev_scsi_execute(struct spdk_scsi_task *task)
 {
-	if (g_lun_execute_fail)
+	if (g_lun_execute_fail) {
 		return -EINVAL;
-	else {
+	} else {
 		task->status = SPDK_SCSI_STATUS_GOOD;
 
-		if (g_lun_execute_status == SPDK_SCSI_TASK_PENDING)
+		if (g_lun_execute_status == SPDK_SCSI_TASK_PENDING) {
 			return g_lun_execute_status;
-		else if (g_lun_execute_status == SPDK_SCSI_TASK_COMPLETE)
+		} else if (g_lun_execute_status == SPDK_SCSI_TASK_COMPLETE) {
 			return g_lun_execute_status;
-		else
+		} else {
 			return 0;
+		}
 	}
 }
 
@@ -222,19 +203,18 @@ lun_construct(void)
 	struct spdk_scsi_lun		*lun;
 	struct spdk_bdev		bdev;
 
-	lun = spdk_scsi_lun_construct("lun0", &bdev, NULL, NULL);
+	lun = spdk_scsi_lun_construct(&bdev, NULL, NULL);
 
 	SPDK_CU_ASSERT_FATAL(lun != NULL);
-	if (lun != NULL) {
-		SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&lun->pending_tasks));
-	}
-
 	return lun;
 }
 
 static void
 lun_destruct(struct spdk_scsi_lun *lun)
 {
+	/* LUN will defer its removal if there are any unfinished tasks */
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&lun->tasks));
+
 	spdk_scsi_lun_destruct(lun);
 }
 
@@ -291,12 +271,7 @@ lun_task_mgmt_execute_abort_task_not_supported(void)
 	task.lun = lun;
 	task.cdb = cdb;
 
-	spdk_scsi_lun_append_task(lun, &task);
-
-	/* task should now be on the pending_task list */
-	CU_ASSERT(!TAILQ_EMPTY(&lun->pending_tasks));
-
-	spdk_scsi_lun_execute_tasks(lun);
+	spdk_scsi_lun_execute_task(lun, &task);
 
 	/* task should now be on the tasks list */
 	CU_ASSERT(!TAILQ_EMPTY(&lun->tasks));
@@ -307,11 +282,13 @@ lun_task_mgmt_execute_abort_task_not_supported(void)
 	CU_ASSERT_TRUE(rc < 0);
 	CU_ASSERT(mgmt_task.response == SPDK_SCSI_TASK_MGMT_RESP_REJECT_FUNC_NOT_SUPPORTED);
 
-	lun_destruct(lun);
-
 	/* task is still on the tasks list */
 	CU_ASSERT_EQUAL(g_task_count, 1);
-	g_task_count = 0;
+
+	spdk_scsi_lun_complete_task(lun, &task);
+	CU_ASSERT_EQUAL(g_task_count, 0);
+
+	lun_destruct(lun);
 }
 
 static void
@@ -357,12 +334,7 @@ lun_task_mgmt_execute_abort_task_all_not_supported(void)
 	task.lun = lun;
 	task.cdb = cdb;
 
-	spdk_scsi_lun_append_task(lun, &task);
-
-	/* task should now be on the pending_task list */
-	CU_ASSERT(!TAILQ_EMPTY(&lun->pending_tasks));
-
-	spdk_scsi_lun_execute_tasks(lun);
+	spdk_scsi_lun_execute_task(lun, &task);
 
 	/* task should now be on the tasks list */
 	CU_ASSERT(!TAILQ_EMPTY(&lun->tasks));
@@ -373,11 +345,14 @@ lun_task_mgmt_execute_abort_task_all_not_supported(void)
 	CU_ASSERT_TRUE(rc < 0);
 	CU_ASSERT(mgmt_task.response == SPDK_SCSI_TASK_MGMT_RESP_REJECT_FUNC_NOT_SUPPORTED);
 
-	lun_destruct(lun);
-
 	/* task is still on the tasks list */
 	CU_ASSERT_EQUAL(g_task_count, 1);
-	g_task_count = 0;
+
+	spdk_scsi_lun_complete_task(lun, &task);
+
+	CU_ASSERT_EQUAL(g_task_count, 0);
+
+	lun_destruct(lun);
 }
 
 static void
@@ -464,7 +439,7 @@ lun_append_task_null_lun_task_cdb_spc_inquiry(void)
 
 	CU_ASSERT_EQUAL(task.status, SPDK_SCSI_STATUS_GOOD);
 
-	spdk_scsi_task_free_data(&task);
+	spdk_scsi_task_put(&task);
 
 	/* spdk_scsi_task_process_null_lun() does not call cpl_fn */
 	CU_ASSERT_EQUAL(g_task_count, 1);
@@ -488,6 +463,8 @@ lun_append_task_null_lun_alloc_len_lt_4096(void)
 	spdk_scsi_task_process_null_lun(&task);
 
 	CU_ASSERT_EQUAL(task.status, SPDK_SCSI_STATUS_GOOD);
+
+	spdk_scsi_task_put(&task);
 
 	/* spdk_scsi_task_process_null_lun() does not call cpl_fn */
 	CU_ASSERT_EQUAL(g_task_count, 1);
@@ -531,26 +508,25 @@ lun_execute_scsi_task_pending(void)
 	g_lun_execute_fail = false;
 	g_lun_execute_status = SPDK_SCSI_TASK_PENDING;
 
-	spdk_scsi_lun_append_task(lun, &task);
-
-	/* task should now be on the pending_task list */
-	CU_ASSERT(!TAILQ_EMPTY(&lun->pending_tasks));
-
-	/* but the tasks list should still be empty since it has not been
+	/* the tasks list should still be empty since it has not been
 	   executed yet
 	 */
 	CU_ASSERT(TAILQ_EMPTY(&lun->tasks));
 
-	spdk_scsi_lun_execute_tasks(lun);
+	spdk_scsi_lun_execute_task(lun, &task);
 
 	/* Assert the task has been successfully added to the tasks queue */
 	CU_ASSERT(!TAILQ_EMPTY(&lun->tasks));
 
-	lun_destruct(lun);
-
 	/* task is still on the tasks list */
 	CU_ASSERT_EQUAL(g_task_count, 1);
-	g_task_count = 0;
+
+	/* Need to complete task so LUN might be removed right now */
+	spdk_scsi_lun_complete_task(lun, &task);
+
+	CU_ASSERT_EQUAL(g_task_count, 0);
+
+	lun_destruct(lun);
 }
 
 static void
@@ -569,17 +545,12 @@ lun_execute_scsi_task_complete(void)
 	g_lun_execute_fail = false;
 	g_lun_execute_status = SPDK_SCSI_TASK_COMPLETE;
 
-	spdk_scsi_lun_append_task(lun, &task);
-
-	/* task should now be on the pending_task list */
-	CU_ASSERT(!TAILQ_EMPTY(&lun->pending_tasks));
-
-	/* but the tasks list should still be empty since it has not been
+	/* the tasks list should still be empty since it has not been
 	   executed yet
 	 */
 	CU_ASSERT(TAILQ_EMPTY(&lun->tasks));
 
-	spdk_scsi_lun_execute_tasks(lun);
+	spdk_scsi_lun_execute_task(lun, &task);
 
 	/* Assert the task has not been added to the tasks queue */
 	CU_ASSERT(TAILQ_EMPTY(&lun->tasks));
@@ -593,13 +564,11 @@ static void
 lun_destruct_success(void)
 {
 	struct spdk_scsi_lun *lun;
-	int rc;
 
 	lun = lun_construct();
 
-	rc = spdk_scsi_lun_destruct(lun);
+	spdk_scsi_lun_destruct(lun);
 
-	CU_ASSERT_EQUAL(rc, 0);
 	CU_ASSERT_EQUAL(g_task_count, 0);
 }
 
@@ -608,7 +577,7 @@ lun_construct_null_ctx(void)
 {
 	struct spdk_scsi_lun		*lun;
 
-	lun = spdk_scsi_lun_construct("lun0", NULL, NULL, NULL);
+	lun = spdk_scsi_lun_construct(NULL, NULL, NULL);
 
 	/* lun should be NULL since we passed NULL for the ctx pointer. */
 	CU_ASSERT(lun == NULL);
@@ -625,55 +594,11 @@ lun_construct_success(void)
 	CU_ASSERT_EQUAL(g_task_count, 0);
 }
 
-static void
-lun_construct_same_same_twice(void)
-{
-	struct spdk_scsi_lun		*lun, *lun2;
-	struct spdk_bdev		bdev, bdev2;
-
-	lun = spdk_scsi_lun_construct("lun0", &bdev, NULL, NULL);
-
-	/* Successfully constructs and returns lun */
-	SPDK_CU_ASSERT_FATAL(lun != NULL);
-
-	lun2 = spdk_scsi_lun_construct("lun0", &bdev2, NULL, NULL);
-
-	/* Fails to construct the same lun on another bdev and returns NULL */
-	CU_ASSERT(lun2 == NULL);
-
-	lun_destruct(lun);
-
-	CU_ASSERT_EQUAL(g_task_count, 0);
-}
-
-static void
-lun_delete(void)
-{
-	struct spdk_scsi_lun *lun;
-	int rc;
-
-	lun = lun_construct();
-
-	rc = spdk_scsi_lun_delete(lun->name);
-	CU_ASSERT_EQUAL(rc, 0);
-
-	lun = lun_construct();
-
-	rc = spdk_scsi_lun_claim(lun);
-	CU_ASSERT_EQUAL(rc, 0);
-
-	rc = spdk_scsi_lun_delete(lun->name);
-	CU_ASSERT_EQUAL(rc, 0);
-
-	rc = spdk_scsi_lun_delete("test");
-	CU_ASSERT_EQUAL(rc, -1);
-}
-
 int
 main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
-	unsigned int 	num_failures;
+	unsigned int	num_failures;
 	int		rc;
 
 	if (CU_initialize_registry() != CUE_SUCCESS) {
@@ -716,8 +641,6 @@ main(int argc, char **argv)
 		|| CU_add_test(suite, "destruct task - success", lun_destruct_success) == NULL
 		|| CU_add_test(suite, "construct - null ctx", lun_construct_null_ctx) == NULL
 		|| CU_add_test(suite, "construct - success", lun_construct_success) == NULL
-		|| CU_add_test(suite, "construct - same lun twice", lun_construct_same_same_twice) == NULL
-		|| CU_add_test(suite, "lun_delete", lun_delete) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

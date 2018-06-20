@@ -70,7 +70,7 @@ struct ioat_chan_entry {
 };
 
 struct worker_thread {
-	struct ioat_chan_entry 	*ctx;
+	struct ioat_chan_entry	*ctx;
 	struct worker_thread	*next;
 	unsigned		core;
 };
@@ -385,7 +385,9 @@ init(void)
 	spdk_env_opts_init(&opts);
 	opts.name = "perf";
 	opts.core_mask = g_user_config.core_mask;
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		return -1;
+	}
 
 	return 0;
 }

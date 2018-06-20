@@ -34,9 +34,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/env.h"
-#include "nvmf_tgt.h"
 #include "spdk/event.h"
-#include "spdk/log.h"
 
 #define SPDK_NVMF_BUILD_ETC "/usr/local/etc/nvmf"
 #define SPDK_NVMF_DEFAULT_CONFIG SPDK_NVMF_BUILD_ETC "/nvmf.conf"
@@ -51,6 +49,15 @@ nvmf_parse_arg(int ch, char *arg)
 {
 }
 
+static void
+nvmf_tgt_started(void *arg1, void *arg2)
+{
+	if (getenv("MEMZONE_DUMP") != NULL) {
+		spdk_memzone_dump(stdout);
+		fflush(stdout);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -62,9 +69,14 @@ main(int argc, char **argv)
 	opts.name = "nvmf";
 	opts.config_file = SPDK_NVMF_DEFAULT_CONFIG;
 	opts.max_delay_us = 1000; /* 1 ms */
-	spdk_app_parse_args(argc, argv, &opts, "", nvmf_parse_arg, nvmf_usage);
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "",
+				      nvmf_parse_arg, nvmf_usage)) !=
+	    SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
 
-	rc = spdk_nvmf_tgt_start(&opts);
+	/* Blocks until the application is exiting */
+	rc = spdk_app_start(&opts, nvmf_tgt_started, NULL, NULL);
 
 	return rc;
 }

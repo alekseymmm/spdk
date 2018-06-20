@@ -41,7 +41,7 @@
 #include "spdk/queue.h"
 #include "spdk/bdev.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 
 struct bdev_aio_task {
 	struct iocb			iocb;
@@ -52,9 +52,12 @@ struct bdev_aio_task {
 struct bdev_aio_io_channel {
 	io_context_t		io_ctx;
 	struct spdk_poller	*poller;
+	uint64_t		io_inflight;
 };
 
 struct file_disk {
+	struct bdev_aio_task	*reset_task;
+	struct spdk_poller	*reset_retry_timer;
 	struct spdk_bdev	disk;
 	char			*filename;
 	int			fd;

@@ -40,7 +40,9 @@
 #include "spdk/nvme_intel.h"
 #include "spdk/nvmf_spec.h"
 #include "spdk/pci_ids.h"
+#include "spdk/string.h"
 #include "spdk/util.h"
+#include "spdk/uuid.h"
 
 #define MAX_DISCOVERY_LOG_ENTRIES	((uint64_t)1000)
 
@@ -56,6 +58,10 @@ static struct feature features[256];
 static struct spdk_nvme_error_information_entry error_page[256];
 
 static struct spdk_nvme_health_information_page health_page;
+
+static struct spdk_nvme_firmware_page firmware_page;
+
+static struct spdk_nvme_cmds_and_effect_log_page cmd_effects_log_page;
 
 static struct spdk_nvme_intel_smart_information_page intel_smart_page;
 
@@ -222,6 +228,31 @@ get_health_log_page(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 static int
+get_firmware_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_FIRMWARE_SLOT,
+					     SPDK_NVME_GLOBAL_NS_TAG, &firmware_page, sizeof(firmware_page), 0, get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+
+	return 0;
+}
+
+static int
+get_cmd_effects_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_COMMAND_EFFECTS_LOG,
+					     SPDK_NVME_GLOBAL_NS_TAG, &cmd_effects_log_page, sizeof(cmd_effects_log_page), 0,
+					     get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+
+	return 0;
+}
+
+static int
 get_intel_smart_log_page(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_INTEL_LOG_SMART, SPDK_NVME_GLOBAL_NS_TAG,
@@ -369,6 +400,20 @@ get_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 		printf("Get Log Page (SMART/health) failed\n");
 	}
 
+	if (get_firmware_log_page(ctrlr) == 0) {
+		outstanding_commands++;
+	} else {
+		printf("Get Log Page (Firmware Slot Information) failed\n");
+	}
+
+	if (cdata->lpa.celp) {
+		if (get_cmd_effects_log_page(ctrlr) == 0) {
+			outstanding_commands++;
+		} else {
+			printf("Get Log Page (Commands Supported and Effects) failed\n");
+		}
+	}
+
 	if (cdata->vid == SPDK_PCI_VID_INTEL) {
 		if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_LOG_SMART)) {
 			if (get_intel_smart_log_page(ctrlr) == 0) {
@@ -400,6 +445,16 @@ get_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 
 	while (outstanding_commands) {
 		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+	}
+}
+
+static void
+print_hex_be(const void *v, size_t size)
+{
+	const uint8_t *buf = v;
+
+	while (size--) {
+		printf("%02X", *buf++);
 	}
 }
 
@@ -440,12 +495,35 @@ print_uint_var_dec(uint8_t *array, unsigned int len)
 	printf("%lu", result);
 }
 
+/* Print ASCII string as defined by the NVMe spec */
+static void
+print_ascii_string(const void *buf, size_t size)
+{
+	const uint8_t *str = buf;
+
+	/* Trim trailing spaces */
+	while (size > 0 && str[size - 1] == ' ') {
+		size--;
+	}
+
+	while (size--) {
+		if (*str >= 0x20 && *str <= 0x7E) {
+			printf("%c", *str);
+		} else {
+			printf(".");
+		}
+		str++;
+	}
+}
+
 static void
 print_namespace(struct spdk_nvme_ns *ns)
 {
 	const struct spdk_nvme_ns_data		*nsdata;
+	const struct spdk_uuid			*uuid;
 	uint32_t				i;
 	uint32_t				flags;
+	char					uuid_str[SPDK_UUID_STRING_LEN];
 
 	nsdata = spdk_nvme_ns_get_data(ns);
 	flags  = spdk_nvme_ns_get_flags(ns);
@@ -498,6 +576,21 @@ print_namespace(struct spdk_nvme_ns *ns)
 	if (nsdata->noiob) {
 		printf("Optimal I/O Boundary:        %u blocks\n", nsdata->noiob);
 	}
+	if (!spdk_mem_all_zero(nsdata->nguid, sizeof(nsdata->nguid))) {
+		printf("NGUID:                       ");
+		print_hex_be(nsdata->nguid, sizeof(nsdata->nguid));
+		printf("\n");
+	}
+	if (!spdk_mem_all_zero(&nsdata->eui64, sizeof(nsdata->eui64))) {
+		printf("EUI64:                       ");
+		print_hex_be(&nsdata->eui64, sizeof(nsdata->eui64));
+		printf("\n");
+	}
+	uuid = spdk_nvme_ns_get_uuid(ns);
+	if (uuid) {
+		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), uuid);
+		printf("UUID:                        %s\n", uuid_str);
+	}
 	printf("Thin Provisioning:           %s\n",
 	       nsdata->nsfeat.thin_prov ? "Supported" : "Not Supported");
 	printf("Per-NS Atomic Units:         %s\n",
@@ -520,6 +613,104 @@ print_namespace(struct spdk_nvme_ns *ns)
 	printf("\n");
 }
 
+static const char *
+admin_opc_name(uint8_t opc)
+{
+	switch (opc) {
+	case SPDK_NVME_OPC_DELETE_IO_SQ:
+		return "Delete I/O Submission Queue";
+	case SPDK_NVME_OPC_CREATE_IO_SQ:
+		return "Create I/O Submission Queue";
+	case SPDK_NVME_OPC_GET_LOG_PAGE:
+		return "Get Log Page";
+	case SPDK_NVME_OPC_DELETE_IO_CQ:
+		return "Delete I/O Completion Queue";
+	case SPDK_NVME_OPC_CREATE_IO_CQ:
+		return "Create I/O Completion Queue";
+	case SPDK_NVME_OPC_IDENTIFY:
+		return "Identify";
+	case SPDK_NVME_OPC_ABORT:
+		return "Abort";
+	case SPDK_NVME_OPC_SET_FEATURES:
+		return "Set Features";
+	case SPDK_NVME_OPC_GET_FEATURES:
+		return "Get Features";
+	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
+		return "Asynchronous Event Request";
+	case SPDK_NVME_OPC_NS_MANAGEMENT:
+		return "Namespace Management";
+	case SPDK_NVME_OPC_FIRMWARE_COMMIT:
+		return "Firmware Commit";
+	case SPDK_NVME_OPC_FIRMWARE_IMAGE_DOWNLOAD:
+		return "Firmware Image Download";
+	case SPDK_NVME_OPC_DEVICE_SELF_TEST:
+		return "Device Self-test";
+	case SPDK_NVME_OPC_NS_ATTACHMENT:
+		return "Namespace Attachment";
+	case SPDK_NVME_OPC_KEEP_ALIVE:
+		return "Keep Alive";
+	case SPDK_NVME_OPC_DIRECTIVE_SEND:
+		return "Directive Send";
+	case SPDK_NVME_OPC_DIRECTIVE_RECEIVE:
+		return "Directive Receive";
+	case SPDK_NVME_OPC_VIRTUALIZATION_MANAGEMENT:
+		return "Virtualization Management";
+	case SPDK_NVME_OPC_NVME_MI_SEND:
+		return "NVMe-MI Send";
+	case SPDK_NVME_OPC_NVME_MI_RECEIVE:
+		return "NVMe-MI Receive";
+	case SPDK_NVME_OPC_DOORBELL_BUFFER_CONFIG:
+		return "Doorbell Buffer Config";
+	case SPDK_NVME_OPC_FORMAT_NVM:
+		return "Format NVM";
+	case SPDK_NVME_OPC_SECURITY_SEND:
+		return "Security Send";
+	case SPDK_NVME_OPC_SECURITY_RECEIVE:
+		return "Security Receive";
+	case SPDK_NVME_OPC_SANITIZE:
+		return "Sanitize";
+	default:
+		if (opc >= 0xC0) {
+			return "Vendor specific";
+		}
+		return "Unknown";
+	}
+}
+
+static const char *
+io_opc_name(uint8_t opc)
+{
+	switch (opc) {
+	case SPDK_NVME_OPC_FLUSH:
+		return "Flush";
+	case SPDK_NVME_OPC_WRITE:
+		return "Write";
+	case SPDK_NVME_OPC_READ:
+		return "Read";
+	case SPDK_NVME_OPC_WRITE_UNCORRECTABLE:
+		return "Write Uncorrectable";
+	case SPDK_NVME_OPC_COMPARE:
+		return "Compare";
+	case SPDK_NVME_OPC_WRITE_ZEROES:
+		return "Write Zeroes";
+	case SPDK_NVME_OPC_DATASET_MANAGEMENT:
+		return "Dataset Management";
+	case SPDK_NVME_OPC_RESERVATION_REGISTER:
+		return "Reservation Register";
+	case SPDK_NVME_OPC_RESERVATION_REPORT:
+		return "Reservation Report";
+	case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
+		return "Reservation Acquire";
+	case SPDK_NVME_OPC_RESERVATION_RELEASE:
+		return "Reservation Release";
+	default:
+		if (opc >= 0x80) {
+			return "Vendor specific";
+		}
+		return "Unknown";
+	}
+}
+
 static void
 print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport_id *trid)
 {
@@ -529,9 +720,10 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	uint8_t					str[512];
 	uint32_t				i;
 	struct spdk_nvme_error_information_entry *error_entry;
-	struct spdk_pci_addr 			pci_addr;
+	struct spdk_pci_addr			pci_addr;
 	struct spdk_pci_device			*pci_dev;
 	struct spdk_pci_id			pci_id;
+	uint32_t				nsid;
 
 	cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
 	vs = spdk_nvme_ctrlr_get_regs_vs(ctrlr);
@@ -550,7 +742,7 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 			return;
 		}
 
-		pci_dev = spdk_pci_get_device(&pci_addr);
+		pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 		if (!pci_dev) {
 			return;
 		}
@@ -573,12 +765,15 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	printf("================================\n");
 	printf("Vendor ID:                             %04x\n", cdata->vid);
 	printf("Subsystem Vendor ID:                   %04x\n", cdata->ssvid);
-	snprintf(str, sizeof(cdata->sn) + 1, "%s", cdata->sn);
-	printf("Serial Number:                         %s\n", str);
-	snprintf(str, sizeof(cdata->mn) + 1, "%s", cdata->mn);
-	printf("Model Number:                          %s\n", str);
-	snprintf(str, sizeof(cdata->fr) + 1, "%s", cdata->fr);
-	printf("Firmware Version:                      %s\n", str);
+	printf("Serial Number:                         ");
+	print_ascii_string(cdata->sn, sizeof(cdata->sn));
+	printf("\n");
+	printf("Model Number:                          ");
+	print_ascii_string(cdata->mn, sizeof(cdata->mn));
+	printf("\n");
+	printf("Firmware Version:                      ");
+	print_ascii_string(cdata->fr, sizeof(cdata->fr));
+	printf("\n");
 	printf("Recommended Arb Burst:                 %d\n", cdata->rab);
 	printf("IEEE OUI Identifier:                   %02x %02x %02x\n",
 	       cdata->ieee[0], cdata->ieee[1], cdata->ieee[2]);
@@ -587,10 +782,11 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	printf("  May be connected to multiple hosts:  %s\n", cdata->cmic.multi_host ? "Yes" : "No");
 	printf("  Associated with SR-IOV VF:           %s\n", cdata->cmic.sr_iov ? "Yes" : "No");
 	printf("Max Data Transfer Size:                ");
-	if (cdata->mdts == 0)
+	if (cdata->mdts == 0) {
 		printf("Unlimited\n");
-	else
+	} else {
 		printf("%" PRIu64 "\n", (uint64_t)1 << (12 + cap.bits.mpsmin + cdata->mdts));
+	}
 	if (features[SPDK_NVME_FEAT_ERROR_RECOVERY].valid) {
 		unsigned tler = features[SPDK_NVME_FEAT_ERROR_RECOVERY].result & 0xFFFF;
 		printf("Error Recovery Timeout:                ");
@@ -627,7 +823,9 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	       cap.bits.nssrs ? "Supported" : "Not Supported");
 	printf("Command Sets Supported\n");
 	printf("  NVM Command Set:                     %s\n",
-	       cap.bits.css_nvm ? "Supported" : "Not Supported");
+	       cap.bits.css & SPDK_NVME_CAP_CSS_NVM ? "Supported" : "Not Supported");
+	printf("Boot Partition:                        %s\n",
+	       cap.bits.bps ? "Supported" : "Not Supported");
 	printf("Memory Page Size Minimum:              %" PRIu64 " bytes\n",
 	       (uint64_t)1 << (12 + cap.bits.mpsmin));
 	printf("Memory Page Size Maximum:              %" PRIu64 " bytes\n",
@@ -665,15 +863,17 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	printf("Abort Command Limit:                   %d\n", cdata->acl + 1);
 	printf("Async Event Request Limit:             %d\n", cdata->aerl + 1);
 	printf("Number of Firmware Slots:              ");
-	if (cdata->oacs.firmware != 0)
+	if (cdata->oacs.firmware != 0) {
 		printf("%d\n", cdata->frmw.num_slots);
-	else
+	} else {
 		printf("N/A\n");
+	}
 	printf("Firmware Slot 1 Read-Only:             ");
-	if (cdata->oacs.firmware != 0)
+	if (cdata->oacs.firmware != 0) {
 		printf("%s\n", cdata->frmw.slot1_ro ? "Yes" : "No");
-	else
+	} else {
 		printf("N/A\n");
+	}
 	if (cdata->fwug == 0x00) {
 		printf("Firmware Update Granularity:           No Information Provided\n");
 	} else if (cdata->fwug == 0xFF) {
@@ -744,7 +944,69 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	       cdata->sgls.metadata_address ? "Supported" : "Not Supported");
 	printf("  SGL Offset:                %s\n",
 	       cdata->sgls.sgl_offset ? "Supported" : "Not Supported");
+	printf("  Transport SGL Data Block:  %s\n",
+	       cdata->sgls.transport_sgl ? "Supported" : "Not Supported");
 	printf("\n");
+
+	printf("Firmware Slot Information\n");
+	printf("=========================\n");
+	if (g_hex_dump) {
+		hex_dump(&firmware_page, sizeof(firmware_page));
+		printf("\n");
+	}
+	printf("Active slot:                 %u\n", firmware_page.afi.active_slot);
+	if (firmware_page.afi.next_reset_slot) {
+		printf("Next controller reset slot:  %u\n", firmware_page.afi.next_reset_slot);
+	}
+	for (i = 0; i < 7; i++) {
+		if (!spdk_mem_all_zero(firmware_page.revision[i], sizeof(firmware_page.revision[i]))) {
+			printf("Slot %u Firmware Revision:    ", i + 1);
+			print_ascii_string(firmware_page.revision[i], sizeof(firmware_page.revision[i]));
+			printf("\n");
+		}
+	}
+	printf("\n");
+
+	if (cdata->lpa.celp) {
+		printf("Commands Supported and Effects\n");
+		printf("==============================\n");
+
+		if (g_hex_dump) {
+			hex_dump(&cmd_effects_log_page, sizeof(cmd_effects_log_page));
+			printf("\n");
+		}
+
+		printf("Admin Commands\n");
+		printf("--------------\n");
+		for (i = 0; i < SPDK_COUNTOF(cmd_effects_log_page.admin_cmds_supported); i++) {
+			struct spdk_nvme_cmds_and_effect_entry *cmd = &cmd_effects_log_page.admin_cmds_supported[i];
+			if (cmd->csupp) {
+				printf("%30s (%02Xh): Supported %s%s%s%s%s\n",
+				       admin_opc_name(i), i,
+				       cmd->lbcc ? "LBA-Change " : "",
+				       cmd->ncc ? "NS-Cap-Change " : "",
+				       cmd->nic ? "NS-Inventory-Change " : "",
+				       cmd->ccc ? "Ctrlr-Cap-Change " : "",
+				       cmd->cse == 0 ? "" : cmd->cse == 1 ? "Per-NS-Exclusive" : cmd->cse == 2 ? "All-NS-Exclusive" : "");
+			}
+		}
+
+		printf("I/O Commands\n");
+		printf("------------\n");
+		for (i = 0; i < SPDK_COUNTOF(cmd_effects_log_page.io_cmds_supported); i++) {
+			struct spdk_nvme_cmds_and_effect_entry *cmd = &cmd_effects_log_page.io_cmds_supported[i];
+			if (cmd->csupp) {
+				printf("%30s (%02Xh): Supported %s%s%s%s%s\n",
+				       io_opc_name(i), i,
+				       cmd->lbcc ? "LBA-Change " : "",
+				       cmd->ncc ? "NS-Cap-Change " : "",
+				       cmd->nic ? "NS-Inventory-Change " : "",
+				       cmd->ccc ? "Ctrlr-Cap-Change " : "",
+				       cmd->cse == 0 ? "" : cmd->cse == 1 ? "Per-NS-Exclusive" : cmd->cse == 2 ? "All-NS-Exclusive" : "");
+			}
+		}
+		printf("\n");
+	}
 
 	printf("Error Log\n");
 	printf("=========\n");
@@ -843,12 +1105,12 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		       health_page.critical_warning.bits.read_only ? "Yes" : "No");
 		printf("  Volatile Memory Backup:    %s\n",
 		       health_page.critical_warning.bits.volatile_memory_backup ? "WARNING" : "OK");
-		printf("Current Temperature:         %u Kelvin (%u Celsius)\n",
+		printf("Current Temperature:         %u Kelvin (%d Celsius)\n",
 		       health_page.temperature,
-		       health_page.temperature - 273);
-		printf("Temperature Threshold:       %u Kelvin (%u Celsius)\n",
+		       (int)health_page.temperature - 273);
+		printf("Temperature Threshold:       %u Kelvin (%d Celsius)\n",
 		       features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].result,
-		       features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].result - 273);
+		       (int)features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].result - 273);
 		printf("Available Spare:             %u%%\n", health_page.available_spare);
 		printf("Available Spare Threshold:   %u%%\n", health_page.available_spare_threshold);
 		printf("Life Percentage Used:        %u%%\n", health_page.percentage_used);
@@ -886,9 +1148,9 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		printf("Critical Temperature Time:   %u minutes\n", health_page.critical_temp_time);
 		for (i = 0; i < 8; i++) {
 			if (health_page.temp_sensor[i] != 0) {
-				printf("Temperature Sensor %d:        %u Kelvin (%u Celsius)\n",
+				printf("Temperature Sensor %d:        %u Kelvin (%d Celsius)\n",
 				       i + 1, health_page.temp_sensor[i],
-				       health_page.temp_sensor[i] - 273);
+				       (int)health_page.temp_sensor[i] - 273);
 			}
 		}
 		printf("\n");
@@ -909,13 +1171,13 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		printf("==================================\n");
 		printf("Minimum Thermal Management Temperature:  ");
 		if (cdata->mntmt) {
-			printf("%u Kelvin (%u Celsius)\n", cdata->mntmt, cdata->mntmt - 273);
+			printf("%u Kelvin (%d Celsius)\n", cdata->mntmt, (int)cdata->mntmt - 273);
 		} else {
 			printf("Not Reported\n");
 		}
 		printf("Maximum Thermal Managment Temperature:   ");
 		if (cdata->mxtmt) {
-			printf("%u Kelvin (%u Celsius)\n", cdata->mxtmt, cdata->mxtmt - 273);
+			printf("%u Kelvin (%d Celsius)\n", cdata->mxtmt, (int)cdata->mxtmt - 273);
 		} else {
 			printf("Not Reported\n");
 		}
@@ -949,7 +1211,7 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 				printf("Wear Leveling Count:\n");
 				printf("  Normalized Value : %d\n",
 				       intel_smart_page.attributes[i].normalized_value);
-				printf("  Current Raw Value: \n");
+				printf("  Current Raw Value:\n");
 				printf("  Min: ");
 				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[0], 2);
 				printf("\n");
@@ -1005,7 +1267,7 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 				printf("Thermal Throttle Status:\n");
 				printf("  Normalized Value : %d\n",
 				       intel_smart_page.attributes[i].normalized_value);
-				printf("  Current Raw Value: \n");
+				printf("  Current Raw Value:\n");
 				printf("  Percentage: %d%%\n", intel_smart_page.attributes[i].raw_value[0]);
 				printf("  Throttling Event Count: ");
 				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[1], 4);
@@ -1076,8 +1338,9 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		printf("\n");
 	}
 
-	for (i = 1; i <= spdk_nvme_ctrlr_get_num_ns(ctrlr); i++) {
-		print_namespace(spdk_nvme_ctrlr_get_ns(ctrlr, i));
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
+	     nsid != 0; nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		print_namespace(spdk_nvme_ctrlr_get_ns(ctrlr, nsid));
 	}
 
 	if (g_discovery_page) {
@@ -1281,7 +1544,10 @@ int main(int argc, char **argv)
 	if (g_trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
 		opts.no_pci = true;
 	}
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
 
 	/* A specific trid is required. */
 	if (strlen(g_trid.traddr) != 0) {

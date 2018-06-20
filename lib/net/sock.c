@@ -34,307 +34,340 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/log.h"
-#include "spdk/net.h"
+#include "spdk/sock.h"
+#include "spdk_internal/sock.h"
+#include "spdk/queue.h"
 
-#define MAX_TMPBUF 1024
-#define PORTNUMLEN 32
-
-static int get_addr_str(struct sockaddr *sa, char *host, size_t hlen)
-{
-	const char *result = NULL;
-
-	if (sa == NULL || host == NULL)
-		return -1;
-
-	switch (sa->sa_family) {
-	case AF_INET:
-		result = inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr),
-				   host, hlen);
-		break;
-	case AF_INET6:
-		result = inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr),
-				   host, hlen);
-		break;
-	default:
-		break;
-	}
-
-	if (result != NULL)
-		return 0;
-	else
-		return -1;
-}
+static STAILQ_HEAD(, spdk_net_impl) g_net_impls = STAILQ_HEAD_INITIALIZER(g_net_impls);
 
 int
-spdk_sock_getaddr(int sock, char *saddr, int slen, char *caddr, int clen)
+spdk_sock_getaddr(struct spdk_sock *sock, char *saddr, int slen, char *caddr, int clen)
 {
-	struct sockaddr_storage sa;
-	socklen_t salen;
-	int rc;
-
-	memset(&sa, 0, sizeof sa);
-	salen = sizeof sa;
-	rc = getsockname(sock, (struct sockaddr *) &sa, &salen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getsockname() failed (errno=%d)\n", errno);
-		return -1;
-	}
-
-	switch (sa.ss_family) {
-	case AF_UNIX:
-		/* Acceptable connection types that don't have IPs */
-		return 0;
-	case AF_INET:
-	case AF_INET6:
-		/* Code below will get IP addresses */
-		break;
-	default:
-		/* Unsupported socket family */
-		return -1;
-	}
-
-	rc = get_addr_str((struct sockaddr *)&sa, saddr, slen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getnameinfo() failed (errno=%d)\n", errno);
-		return -1;
-	}
-
-	memset(&sa, 0, sizeof sa);
-	salen = sizeof sa;
-	rc = getpeername(sock, (struct sockaddr *) &sa, &salen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getpeername() failed (errno=%d)\n", errno);
-		return -1;
-	}
-
-	rc = get_addr_str((struct sockaddr *)&sa, caddr, clen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getnameinfo() failed (errno=%d)\n", errno);
-		return -1;
-	}
-
-	return 0;
+	return sock->net_impl->getaddr(sock, saddr, slen, caddr, clen);
 }
 
-enum spdk_sock_create_type {
-	SPDK_SOCK_CREATE_LISTEN,
-	SPDK_SOCK_CREATE_CONNECT,
-};
-
-static int
-spdk_sock_create(const char *ip, int port, enum spdk_sock_create_type type)
-{
-	char buf[MAX_TMPBUF];
-	char portnum[PORTNUMLEN];
-	char *p;
-	struct addrinfo hints, *res, *res0;
-	int sock, flag;
-	int val = 1;
-	int rc;
-
-	if (ip == NULL)
-		return -1;
-	if (ip[0] == '[') {
-		snprintf(buf, sizeof(buf), "%s", ip + 1);
-		p = strchr(buf, ']');
-		if (p != NULL)
-			*p = '\0';
-		ip = (const char *) &buf[0];
-	}
-
-	snprintf(portnum, sizeof portnum, "%d", port);
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = PF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_NUMERICSERV;
-	hints.ai_flags |= AI_PASSIVE;
-	hints.ai_flags |= AI_NUMERICHOST;
-	rc = getaddrinfo(ip, portnum, &hints, &res0);
-	if (rc != 0) {
-		SPDK_ERRLOG("getaddrinfo() failed (errno=%d)\n", errno);
-		return -1;
-	}
-
-	/* try listen */
-	sock = -1;
-	for (res = res0; res != NULL; res = res->ai_next) {
-retry:
-		sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-		if (sock < 0) {
-			/* error */
-			continue;
-		}
-		rc = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &val, sizeof val);
-		if (rc != 0) {
-			close(sock);
-			/* error */
-			continue;
-		}
-		rc = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sizeof val);
-		if (rc != 0) {
-			close(sock);
-			/* error */
-			continue;
-		}
-
-		if (type == SPDK_SOCK_CREATE_LISTEN) {
-			rc = bind(sock, res->ai_addr, res->ai_addrlen);
-			if (rc != 0) {
-				SPDK_ERRLOG("bind() failed, errno = %d\n", errno);
-				switch (errno) {
-				case EINTR:
-					/* interrupted? */
-					close(sock);
-					goto retry;
-				case EADDRNOTAVAIL:
-					SPDK_ERRLOG("IP address %s not available. "
-						    "Verify IP address in config file "
-						    "and make sure setup script is "
-						    "run before starting spdk app.\n", ip);
-				/* FALLTHROUGH */
-				default:
-					/* try next family */
-					close(sock);
-					sock = -1;
-					continue;
-				}
-			}
-			/* bind OK */
-			rc = listen(sock, 512);
-			if (rc != 0) {
-				SPDK_ERRLOG("listen() failed, errno = %d\n", errno);
-				close(sock);
-				sock = -1;
-				break;
-			}
-		} else if (type == SPDK_SOCK_CREATE_CONNECT) {
-			rc = connect(sock, res->ai_addr, res->ai_addrlen);
-			if (rc != 0) {
-				SPDK_ERRLOG("connect() failed, errno = %d\n", errno);
-				/* try next family */
-				close(sock);
-				sock = -1;
-				continue;
-			}
-		}
-
-		flag = fcntl(sock, F_GETFL);
-		if (fcntl(sock, F_SETFL, flag | O_NONBLOCK) < 0) {
-			SPDK_ERRLOG("fcntl can't set nonblocking mode for socket, fd: %d (%d)\n", sock, errno);
-			close(sock);
-			sock = -1;
-			break;
-		}
-		break;
-	}
-	freeaddrinfo(res0);
-
-	if (sock < 0) {
-		return -1;
-	}
-	return sock;
-}
-
-int
-spdk_sock_listen(const char *ip, int port)
-{
-	return spdk_sock_create(ip, port, SPDK_SOCK_CREATE_LISTEN);
-}
-
-int
+struct spdk_sock *
 spdk_sock_connect(const char *ip, int port)
 {
-	return spdk_sock_create(ip, port, SPDK_SOCK_CREATE_CONNECT);
+	struct spdk_net_impl *impl = NULL;
+	struct spdk_sock *sock;
+
+	STAILQ_FOREACH_FROM(impl, &g_net_impls, link) {
+		sock = impl->connect(ip, port);
+		if (sock != NULL) {
+			sock->net_impl = impl;
+			return sock;
+		}
+	}
+
+	return NULL;
+}
+
+struct spdk_sock *
+spdk_sock_listen(const char *ip, int port)
+{
+	struct spdk_net_impl *impl = NULL;
+	struct spdk_sock *sock;
+
+	STAILQ_FOREACH_FROM(impl, &g_net_impls, link) {
+		sock = impl->listen(ip, port);
+		if (sock != NULL) {
+			sock->net_impl = impl;
+			return sock;
+		}
+	}
+
+	return NULL;
+}
+
+struct spdk_sock *
+spdk_sock_accept(struct spdk_sock *sock)
+{
+	struct spdk_sock *new_sock;
+
+	new_sock = sock->net_impl->accept(sock);
+	if (new_sock != NULL) {
+		new_sock->net_impl = sock->net_impl;
+	}
+
+	return new_sock;
 }
 
 int
-spdk_sock_accept(int sock)
+spdk_sock_close(struct spdk_sock **sock)
 {
-	struct sockaddr_storage		sa;
-	socklen_t			salen;
-
-	memset(&sa, 0, sizeof(sa));
-	salen = sizeof(sa);
-	return accept(sock, (struct sockaddr *)&sa, &salen);
-}
-
-int
-spdk_sock_close(int sock)
-{
-	return close(sock);
-}
-
-ssize_t
-spdk_sock_recv(int sock, void *buf, size_t len)
-{
-	return recv(sock, buf, len, MSG_DONTWAIT);
-}
-
-ssize_t
-spdk_sock_writev(int sock, struct iovec *iov, int iovcnt)
-{
-	return writev(sock, iov, iovcnt);
-}
-
-int
-spdk_sock_set_recvlowat(int s, int nbytes)
-{
-	int val;
 	int rc;
 
-	val = nbytes;
-	rc = setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &val, sizeof val);
-	if (rc != 0)
+	if (*sock == NULL) {
+		errno = EBADF;
 		return -1;
+	}
+
+	if ((*sock)->cb_fn != NULL) {
+		/* This sock is still part of a sock_group. */
+		errno = EBUSY;
+		return -1;
+	}
+
+	rc = (*sock)->net_impl->close(*sock);
+	if (rc == 0) {
+		free(*sock);
+		*sock = NULL;
+	}
+
+	return rc;
+}
+
+ssize_t
+spdk_sock_recv(struct spdk_sock *sock, void *buf, size_t len)
+{
+	if (sock == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+
+	return sock->net_impl->recv(sock, buf, len);
+}
+
+ssize_t
+spdk_sock_writev(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
+{
+	if (sock == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+
+	return sock->net_impl->writev(sock, iov, iovcnt);
+}
+
+
+int
+spdk_sock_set_recvlowat(struct spdk_sock *sock, int nbytes)
+{
+	return sock->net_impl->set_recvlowat(sock, nbytes);
+}
+
+int
+spdk_sock_set_recvbuf(struct spdk_sock *sock, int sz)
+{
+	return sock->net_impl->set_recvbuf(sock, sz);
+}
+
+int
+spdk_sock_set_sendbuf(struct spdk_sock *sock, int sz)
+{
+	return sock->net_impl->set_sendbuf(sock, sz);
+}
+
+bool
+spdk_sock_is_ipv6(struct spdk_sock *sock)
+{
+	return sock->net_impl->is_ipv6(sock);
+}
+
+bool
+spdk_sock_is_ipv4(struct spdk_sock *sock)
+{
+	return sock->net_impl->is_ipv4(sock);
+}
+
+struct spdk_sock_group *
+spdk_sock_group_create(void)
+{
+	struct spdk_net_impl *impl = NULL;
+	struct spdk_sock_group *group;
+	struct spdk_sock_group_impl *group_impl;
+
+	group = calloc(1, sizeof(*group));
+	if (group == NULL) {
+		return NULL;
+	}
+
+	STAILQ_INIT(&group->group_impls);
+
+	STAILQ_FOREACH_FROM(impl, &g_net_impls, link) {
+		group_impl = impl->group_impl_create();
+		if (group_impl != NULL) {
+			STAILQ_INSERT_TAIL(&group->group_impls, group_impl, link);
+			TAILQ_INIT(&group_impl->socks);
+			group_impl->net_impl = impl;
+		}
+	}
+
+	return group;
+}
+
+int
+spdk_sock_group_add_sock(struct spdk_sock_group *group, struct spdk_sock *sock,
+			 spdk_sock_cb cb_fn, void *cb_arg)
+{
+	struct spdk_sock_group_impl *group_impl = NULL;
+	int rc;
+
+	if (cb_fn == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (sock->cb_fn != NULL) {
+		/*
+		 * This sock is already part of a sock_group.  Currently we don't
+		 *  support this.
+		 */
+		errno = EBUSY;
+		return -1;
+	}
+
+	STAILQ_FOREACH_FROM(group_impl, &group->group_impls, link) {
+		if (sock->net_impl == group_impl->net_impl) {
+			break;
+		}
+	}
+
+	if (group_impl == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	rc = group_impl->net_impl->group_impl_add_sock(group_impl, sock);
+	if (rc == 0) {
+		TAILQ_INSERT_TAIL(&group_impl->socks, sock, link);
+		sock->cb_fn = cb_fn;
+		sock->cb_arg = cb_arg;
+	}
+
+	return rc;
+}
+
+int
+spdk_sock_group_remove_sock(struct spdk_sock_group *group, struct spdk_sock *sock)
+{
+	struct spdk_sock_group_impl *group_impl = NULL;
+	int rc;
+
+	STAILQ_FOREACH_FROM(group_impl, &group->group_impls, link) {
+		if (sock->net_impl == group_impl->net_impl) {
+			break;
+		}
+	}
+
+	if (group_impl == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	rc = group_impl->net_impl->group_impl_remove_sock(group_impl, sock);
+	if (rc == 0) {
+		TAILQ_REMOVE(&group_impl->socks, sock, link);
+		sock->cb_fn = NULL;
+		sock->cb_arg = NULL;
+	}
+
+	return rc;
+}
+
+int
+spdk_sock_group_poll(struct spdk_sock_group *group)
+{
+	return spdk_sock_group_poll_count(group, MAX_EVENTS_PER_POLL);
+}
+
+static int
+spdk_sock_group_impl_poll_count(struct spdk_sock_group_impl *group_impl,
+				struct spdk_sock_group *group,
+				int max_events)
+{
+	struct spdk_sock *socks[MAX_EVENTS_PER_POLL];
+	int num_events, i;
+
+	if (TAILQ_EMPTY(&group_impl->socks)) {
+		return 0;
+	}
+
+	num_events = group_impl->net_impl->group_impl_poll(group_impl, max_events, socks);
+	if (num_events == -1) {
+		return -1;
+	}
+
+	for (i = 0; i < num_events; i++) {
+		struct spdk_sock *sock = socks[i];
+
+		assert(sock->cb_fn != NULL);
+		sock->cb_fn(sock->cb_arg, group, sock);
+	}
 	return 0;
 }
 
 int
-spdk_sock_set_recvbuf(int sock, int sz)
+spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events)
 {
-	return setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
-			  &sz, sizeof(sz));
+	struct spdk_sock_group_impl *group_impl = NULL;
+	int rc, final_rc = 0;
+
+	if (max_events < 1) {
+		errno = -EINVAL;
+		return -1;
+	}
+
+	/*
+	 * Only poll for up to 32 events at a time - if more events are pending,
+	 *  the next call to this function will reap them.
+	 */
+	if (max_events > MAX_EVENTS_PER_POLL) {
+		max_events = MAX_EVENTS_PER_POLL;
+	}
+
+	STAILQ_FOREACH_FROM(group_impl, &group->group_impls, link) {
+		rc = spdk_sock_group_impl_poll_count(group_impl, group, max_events);
+		if (rc != 0) {
+			final_rc = rc;
+			SPDK_ERRLOG("group_impl_poll_count for net(%s) failed\n",
+				    group_impl->net_impl->name);
+		}
+	}
+
+	return final_rc;
 }
 
 int
-spdk_sock_set_sendbuf(int sock, int sz)
+spdk_sock_group_close(struct spdk_sock_group **group)
 {
-	return setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
-			  &sz, sizeof(sz));
-}
-
-bool
-spdk_sock_is_ipv6(int sock)
-{
-	struct sockaddr_storage sa;
-	socklen_t salen;
+	struct spdk_sock_group_impl *group_impl = NULL, *tmp;
 	int rc;
 
-	memset(&sa, 0, sizeof sa);
-	salen = sizeof sa;
-	rc = getsockname(sock, (struct sockaddr *) &sa, &salen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getsockname() failed (errno=%d)\n", errno);
-		return false;
+	if (*group == NULL) {
+		errno = EBADF;
+		return -1;
 	}
 
-	return (sa.ss_family == AF_INET6);
+	STAILQ_FOREACH_SAFE(group_impl, &(*group)->group_impls, link, tmp) {
+		if (!TAILQ_EMPTY(&group_impl->socks)) {
+			errno = EBUSY;
+			return -1;
+		}
+	}
+
+	STAILQ_FOREACH_SAFE(group_impl, &(*group)->group_impls, link, tmp) {
+		rc = group_impl->net_impl->group_impl_close(group_impl);
+		if (rc != 0) {
+			SPDK_ERRLOG("group_impl_close for net(%s) failed\n",
+				    group_impl->net_impl->name);
+		}
+		free(group_impl);
+	}
+
+	free(*group);
+	*group = NULL;
+
+	return 0;
 }
 
-bool
-spdk_sock_is_ipv4(int sock)
+void
+spdk_net_impl_register(struct spdk_net_impl *impl)
 {
-	struct sockaddr_storage sa;
-	socklen_t salen;
-	int rc;
-
-	memset(&sa, 0, sizeof sa);
-	salen = sizeof sa;
-	rc = getsockname(sock, (struct sockaddr *) &sa, &salen);
-	if (rc != 0) {
-		SPDK_ERRLOG("getsockname() failed (errno=%d)\n", errno);
-		return false;
+	if (!strcmp("posix", impl->name)) {
+		STAILQ_INSERT_TAIL(&g_net_impls, impl, link);
+	} else {
+		STAILQ_INSERT_HEAD(&g_net_impls, impl, link);
 	}
-
-	return (sa.ss_family == AF_INET);
 }

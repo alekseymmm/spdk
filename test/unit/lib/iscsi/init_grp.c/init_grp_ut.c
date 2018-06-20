@@ -32,11 +32,13 @@
  */
 #include "spdk/stdinc.h"
 
+#include "spdk_cunit.h"
 #include "CUnit/Basic.h"
 
 #include "iscsi/init_grp.c"
+#include "unit/lib/json_mock.c"
 
-SPDK_LOG_REGISTER_TRACE_FLAG("iscsi", SPDK_TRACE_ISCSI)
+SPDK_LOG_REGISTER_COMPONENT("iscsi", SPDK_LOG_ISCSI)
 
 struct spdk_iscsi_globals g_spdk_iscsi;
 
@@ -72,10 +74,10 @@ create_from_config_file_cases(void)
 			break;
 		}
 
-		rc = spdk_iscsi_init_grp_create_from_configfile(sp);
+		rc = spdk_iscsi_parse_init_grp(sp);
 		CU_ASSERT(rc == 0);
 
-		spdk_iscsi_init_grp_array_destroy();
+		spdk_iscsi_init_grps_destroy();
 
 		section_index++;
 	}
@@ -89,10 +91,10 @@ create_from_config_file_cases(void)
 			break;
 		}
 
-		rc = spdk_iscsi_init_grp_create_from_configfile(sp);
+		rc = spdk_iscsi_parse_init_grp(sp);
 		CU_ASSERT(rc != 0);
 
-		spdk_iscsi_init_grp_array_destroy();
+		spdk_iscsi_init_grps_destroy();
 
 		section_index++;
 	}
@@ -115,17 +117,20 @@ create_initiator_group_success_case(void)
 static void
 find_initiator_group_success_case(void)
 {
-	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_init_grp *ig, *tmp;
+	int rc;
 
 	ig = spdk_iscsi_init_grp_create(1);
 	CU_ASSERT(ig != NULL);
 
-	spdk_iscsi_init_grp_register(ig);
+	rc = spdk_iscsi_init_grp_register(ig);
+	CU_ASSERT(rc == 0);
 
 	ig = spdk_iscsi_init_grp_find_by_tag(1);
 	CU_ASSERT(ig != NULL);
 
-	spdk_initiator_group_unregister(ig);
+	tmp = spdk_iscsi_init_grp_unregister(1);
+	CU_ASSERT(ig == tmp);
 	spdk_iscsi_init_grp_destroy(ig);
 
 	ig = spdk_iscsi_init_grp_find_by_tag(1);
@@ -133,22 +138,25 @@ find_initiator_group_success_case(void)
 }
 
 static void
-create_initiator_group_fail_case(void)
+register_initiator_group_twice_case(void)
 {
-	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_init_grp *ig, *tmp;
+	int rc;
 
 	ig = spdk_iscsi_init_grp_create(1);
 	CU_ASSERT(ig != NULL);
 
-	spdk_iscsi_init_grp_register(ig);
+	rc = spdk_iscsi_init_grp_register(ig);
+	CU_ASSERT(rc == 0);
 
-	ig = spdk_iscsi_init_grp_create(1);
-	CU_ASSERT(ig == NULL);
+	rc = spdk_iscsi_init_grp_register(ig);
+	CU_ASSERT(rc != 0);
 
 	ig = spdk_iscsi_init_grp_find_by_tag(1);
 	CU_ASSERT(ig != NULL);
 
-	spdk_initiator_group_unregister(ig);
+	tmp = spdk_iscsi_init_grp_unregister(1);
+	CU_ASSERT(tmp == ig);
 	spdk_iscsi_init_grp_destroy(ig);
 
 	ig = spdk_iscsi_init_grp_find_by_tag(1);
@@ -158,6 +166,7 @@ create_initiator_group_fail_case(void)
 static void
 add_initiator_name_success_case(void)
 {
+
 	int rc;
 	struct spdk_iscsi_init_grp *ig;
 	struct spdk_iscsi_initiator_name *iname;
@@ -377,6 +386,249 @@ delete_all_netmasks_success_case(void)
 	spdk_iscsi_init_grp_destroy(ig);
 }
 
+static void
+initiator_name_overwrite_all_to_any_case(void)
+{
+	int rc;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_name *iname;
+	char *all = "ALL";
+	char *any = "ANY";
+	char *all_not = "!ALL";
+	char *any_not = "!ANY";
+
+	ig = spdk_iscsi_init_grp_create(1);
+	CU_ASSERT(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_initiator(ig, all);
+	CU_ASSERT(rc == 0);
+
+	iname = spdk_iscsi_init_grp_find_initiator(ig, all);
+	CU_ASSERT(iname == NULL);
+
+	iname = spdk_iscsi_init_grp_find_initiator(ig, any);
+	CU_ASSERT(iname != NULL);
+
+	rc = spdk_iscsi_init_grp_delete_initiator(ig, any);
+	CU_ASSERT(rc == 0);
+
+	rc = spdk_iscsi_init_grp_add_initiator(ig, all_not);
+	CU_ASSERT(rc == 0);
+
+	iname = spdk_iscsi_init_grp_find_initiator(ig, all_not);
+	CU_ASSERT(iname == NULL);
+
+	iname = spdk_iscsi_init_grp_find_initiator(ig, any_not);
+	CU_ASSERT(iname != NULL);
+
+	rc = spdk_iscsi_init_grp_delete_initiator(ig, any_not);
+	CU_ASSERT(rc == 0);
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+netmask_overwrite_all_to_any_case(void)
+{
+	int rc;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_netmask *imask;
+	char *all = "ALL";
+	char *any = "ANY";
+
+	ig = spdk_iscsi_init_grp_create(1);
+	CU_ASSERT(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_netmask(ig, all);
+	CU_ASSERT(rc == 0);
+
+	imask = spdk_iscsi_init_grp_find_netmask(ig, all);
+	CU_ASSERT(imask == NULL);
+
+	imask = spdk_iscsi_init_grp_find_netmask(ig, any);
+	CU_ASSERT(imask != NULL);
+
+	rc = spdk_iscsi_init_grp_delete_netmask(ig, any);
+	CU_ASSERT(rc == 0);
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+add_delete_initiator_names_case(void)
+{
+	int rc, i;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_name *iname;
+	char *names[3] = {"iqn.2018-02.spdk.io:0001", "iqn.2018-02.spdk.io:0002", "iqn.2018-02.spdk.io:0003"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_initiators(ig, 3, names);
+	CU_ASSERT(rc == 0);
+
+	for (i = 0; i < 3; i++) {
+		iname = spdk_iscsi_init_grp_find_initiator(ig, names[i]);
+		CU_ASSERT(iname != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_initiators(ig, 3, names);
+	CU_ASSERT(rc == 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->initiator_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+add_duplicated_initiator_names_case(void)
+{
+	int rc;
+	struct spdk_iscsi_init_grp *ig;
+	char *names[3] = {"iqn.2018-02.spdk.io:0001", "iqn.2018-02.spdk.io:0002", "iqn.2018-02.spdk.io:0001"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_initiators(ig, 3, names);
+	CU_ASSERT(rc != 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->initiator_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+delete_nonexisting_initiator_names_case(void)
+{
+	int rc, i;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_name *iname;
+	char *names1[3] = {"iqn.2018-02.spdk.io:0001", "iqn.2018-02.spdk.io:0002", "iqn.2018-02.spdk.io:0003"};
+	char *names2[3] = {"iqn.2018-02.spdk.io:0001", "iqn.2018-02.spdk.io:0002", "iqn.2018-02.spdk.io:0004"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_initiators(ig, 3, names1);
+	CU_ASSERT(rc == 0);
+
+	for (i = 0; i < 3; i++) {
+		iname = spdk_iscsi_init_grp_find_initiator(ig, names1[i]);
+		CU_ASSERT(iname != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_initiators(ig, 3, names2);
+	CU_ASSERT(rc != 0);
+
+	for (i = 0; i < 3; i++) {
+		iname = spdk_iscsi_init_grp_find_initiator(ig, names1[i]);
+		CU_ASSERT(iname != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_initiators(ig, 3, names1);
+	CU_ASSERT(rc == 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->initiator_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+add_delete_netmasks_case(void)
+{
+	int rc, i;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_netmask *netmask;
+	char *netmasks[3] = {"192.168.2.0", "192.168.2.1", "192.168.2.2"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_netmasks(ig, 3, netmasks);
+	CU_ASSERT(rc == 0);
+
+	for (i = 0; i < 3; i++) {
+		netmask = spdk_iscsi_init_grp_find_netmask(ig, netmasks[i]);
+		CU_ASSERT(netmask != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_netmasks(ig, 3, netmasks);
+	CU_ASSERT(rc == 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->netmask_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+add_duplicated_netmasks_case(void)
+{
+	int rc;
+	struct spdk_iscsi_init_grp *ig;
+	char *netmasks[3] = {"192.168.2.0", "192.168.2.1", "192.168.2.0"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_netmasks(ig, 3, netmasks);
+	CU_ASSERT(rc != 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->netmask_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+static void
+delete_nonexisting_netmasks_case(void)
+{
+	int rc, i;
+	struct spdk_iscsi_init_grp *ig;
+	struct spdk_iscsi_initiator_netmask *netmask;
+	char *netmasks1[3] = {"192.168.2.0", "192.168.2.1", "192.168.2.2"};
+	char *netmasks2[3] = {"192.168.2.0", "192.168.2.1", "192.168.2.3"};
+
+	ig = spdk_iscsi_init_grp_create(1);
+	SPDK_CU_ASSERT_FATAL(ig != NULL);
+
+	rc = spdk_iscsi_init_grp_add_netmasks(ig, 3, netmasks1);
+	CU_ASSERT(rc == 0);
+
+	for (i = 0; i < 3; i++) {
+		netmask = spdk_iscsi_init_grp_find_netmask(ig, netmasks1[i]);
+		CU_ASSERT(netmask != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_netmasks(ig, 3, netmasks2);
+	CU_ASSERT(rc != 0);
+
+	for (i = 0; i < 3; i++) {
+		netmask = spdk_iscsi_init_grp_find_netmask(ig, netmasks1[i]);
+		CU_ASSERT(netmask != NULL);
+	}
+
+	rc = spdk_iscsi_init_grp_delete_netmasks(ig, 3, netmasks1);
+	CU_ASSERT(rc == 0);
+
+	if (ig != NULL) {
+		CU_ASSERT(TAILQ_EMPTY(&ig->netmask_head));
+	}
+
+	spdk_iscsi_init_grp_destroy(ig);
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -407,8 +659,8 @@ main(int argc, char **argv)
 			       create_initiator_group_success_case) == NULL
 		|| CU_add_test(suite, "find initiator group success case",
 			       find_initiator_group_success_case) == NULL
-		|| CU_add_test(suite, "create initiator group fail case",
-			       create_initiator_group_fail_case) == NULL
+		|| CU_add_test(suite, "register initiator group twice case",
+			       register_initiator_group_twice_case) == NULL
 		|| CU_add_test(suite, "add initiator name success case",
 			       add_initiator_name_success_case) == NULL
 		|| CU_add_test(suite, "add initiator name fail case",
@@ -421,7 +673,22 @@ main(int argc, char **argv)
 			       add_netmask_fail_case) == NULL
 		|| CU_add_test(suite, "delete all initiator netmasks success case",
 			       delete_all_netmasks_success_case) == NULL
-
+		|| CU_add_test(suite, "overwrite all to any for name case",
+			       initiator_name_overwrite_all_to_any_case) == NULL
+		|| CU_add_test(suite, "overwrite all to any for netmask case",
+			       netmask_overwrite_all_to_any_case) == NULL
+		|| CU_add_test(suite, "add/delete initiator names case",
+			       add_delete_initiator_names_case) == NULL
+		|| CU_add_test(suite, "add duplicated initiator names case",
+			       add_duplicated_initiator_names_case) == NULL
+		|| CU_add_test(suite, "delete nonexisting initiator names case",
+			       delete_nonexisting_initiator_names_case) == NULL
+		|| CU_add_test(suite, "add/delete netmasks case",
+			       add_delete_netmasks_case) == NULL
+		|| CU_add_test(suite, "add duplicated netmasks case",
+			       add_duplicated_netmasks_case) == NULL
+		|| CU_add_test(suite, "delete nonexisting netmasks case",
+			       delete_nonexisting_netmasks_case) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

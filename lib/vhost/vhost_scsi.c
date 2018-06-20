@@ -36,7 +36,7 @@
 #include <linux/virtio_scsi.h>
 
 #include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/scsi.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/conf.h"
@@ -94,6 +94,9 @@ struct spdk_vhost_scsi_task {
 	struct spdk_vhost_scsi_dev *svdev;
 	struct spdk_scsi_dev *scsi_dev;
 
+	/** Number of bytes that were written. */
+	uint32_t used_len;
+
 	int req_idx;
 
 	/* If set, the task is currently used for I/O processing. */
@@ -104,15 +107,20 @@ struct spdk_vhost_scsi_task {
 
 static int spdk_vhost_scsi_start(struct spdk_vhost_dev *, void *);
 static int spdk_vhost_scsi_stop(struct spdk_vhost_dev *, void *);
-static void spdk_vhost_scsi_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+static void spdk_vhost_scsi_dump_info_json(struct spdk_vhost_dev *vdev,
+		struct spdk_json_write_ctx *w);
+static void spdk_vhost_scsi_write_config_json(struct spdk_vhost_dev *vdev,
+		struct spdk_json_write_ctx *w);
+static int spdk_vhost_scsi_dev_remove(struct spdk_vhost_dev *vdev);
 
 const struct spdk_vhost_dev_backend spdk_vhost_scsi_device_backend = {
 	.virtio_features = SPDK_VHOST_SCSI_FEATURES,
 	.disabled_features = SPDK_VHOST_SCSI_DISABLED_FEATURES,
 	.start_device =  spdk_vhost_scsi_start,
 	.stop_device = spdk_vhost_scsi_stop,
-	.dump_config_json = spdk_vhost_scsi_config_json,
-	.vhost_remove_controller = spdk_vhost_scsi_dev_remove,
+	.dump_info_json = spdk_vhost_scsi_dump_info_json,
+	.write_config_json = spdk_vhost_scsi_write_config_json,
+	.remove_device = spdk_vhost_scsi_dev_remove,
 };
 
 static void
@@ -144,13 +152,14 @@ process_removed_devs(struct spdk_vhost_scsi_dev *svdev)
 
 		if (dev && state->removed && !spdk_scsi_dev_has_pending_tasks(dev)) {
 			spdk_scsi_dev_free_io_channels(dev);
-			spdk_scsi_dev_destruct(dev);
 			svdev->scsi_dev[i] = NULL;
+			spdk_scsi_dev_destruct(dev);
 			if (state->remove_cb) {
 				state->remove_cb(&svdev->vdev, state->remove_ctx);
 				state->remove_cb = NULL;
 			}
-			SPDK_NOTICELOG("%s: hot-detached device 'Dev %u'.\n", svdev->vdev.name, i);
+			SPDK_INFOLOG(SPDK_LOG_VHOST, "%s: hot-detached device 'Dev %u'.\n",
+				     svdev->vdev.name, i);
 		}
 	}
 }
@@ -182,7 +191,7 @@ eventq_enqueue(struct spdk_vhost_scsi_dev *svdev, unsigned scsi_dev_num, uint32_
 		goto out;
 	}
 
-	desc_ev = spdk_vhost_gpa_to_vva(&svdev->vdev, desc->addr);
+	desc_ev = spdk_vhost_gpa_to_vva(&svdev->vdev, desc->addr, sizeof(*desc_ev));
 	if (desc_ev == NULL) {
 		SPDK_ERRLOG("Controller %s: Eventq descriptor at index %"PRIu16" points to unmapped guest memory address %p.\n",
 			    svdev->vdev.name, req, (void *)(uintptr_t)desc->addr);
@@ -212,8 +221,8 @@ static void
 submit_completion(struct spdk_vhost_scsi_task *task)
 {
 	spdk_vhost_vq_used_ring_enqueue(&task->svdev->vdev, task->vq, task->req_idx,
-					task->scsi.data_transferred);
-	SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "Finished task (%p) req_idx=%d\n", task, task->req_idx);
+					task->used_len);
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "Finished task (%p) req_idx=%d\n", task, task->req_idx);
 
 	spdk_vhost_scsi_task_put(task);
 }
@@ -240,7 +249,8 @@ spdk_vhost_scsi_task_cpl(struct spdk_scsi_task *scsi_task)
 		memcpy(task->resp->sense, task->scsi.sense_data, task->scsi.sense_data_len);
 		task->resp->sense_len = task->scsi.sense_data_len;
 	}
-	task->resp->resid = task->scsi.transfer_len - task->scsi.data_transferred;
+	assert(task->scsi.transfer_len == task->scsi.length);
+	task->resp->resid = task->scsi.length - task->scsi.data_transferred;
 
 	submit_completion(task);
 }
@@ -262,10 +272,11 @@ mgmt_task_submit(struct spdk_vhost_scsi_task *task, enum spdk_scsi_task_func fun
 static void
 invalid_request(struct spdk_vhost_scsi_task *task)
 {
-	spdk_vhost_vq_used_ring_enqueue(&task->svdev->vdev, task->vq, task->req_idx, 0);
+	spdk_vhost_vq_used_ring_enqueue(&task->svdev->vdev, task->vq, task->req_idx,
+					task->used_len);
 	spdk_vhost_scsi_task_put(task);
 
-	SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "Invalid request (status=%" PRIu8")\n",
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "Invalid request (status=%" PRIu8")\n",
 		      task->resp ? task->resp->response : -1);
 }
 
@@ -275,11 +286,12 @@ spdk_vhost_scsi_task_init_target(struct spdk_vhost_scsi_task *task, const __u8 *
 	struct spdk_scsi_dev *dev;
 	uint16_t lun_id = (((uint16_t)lun[2] << 8) | lun[3]) & 0x3FFF;
 
-	SPDK_TRACEDUMP(SPDK_TRACE_VHOST_SCSI_QUEUE, "LUN", lun, 8);
+	SPDK_TRACEDUMP(SPDK_LOG_VHOST_SCSI_QUEUE, "LUN", lun, 8);
 
 	/* First byte must be 1 and second is target */
-	if (lun[0] != 1 || lun[1] >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS)
+	if (lun[0] != 1 || lun[1] >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
 		return -1;
+	}
 
 	dev = task->svdev->scsi_dev[lun[1]];
 	task->scsi_dev = dev;
@@ -302,11 +314,10 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
 	struct vring_desc *desc, *desc_table;
 	struct virtio_scsi_ctrl_tmf_req *ctrl_req;
 	struct virtio_scsi_ctrl_an_resp *an_resp;
-	uint32_t desc_table_size;
+	uint32_t desc_table_size, used_len = 0;
 	int rc;
 
-	spdk_scsi_task_construct(&task->scsi, spdk_vhost_scsi_task_mgmt_cpl, spdk_vhost_scsi_task_free_cb,
-				 NULL);
+	spdk_scsi_task_construct(&task->scsi, spdk_vhost_scsi_task_mgmt_cpl, spdk_vhost_scsi_task_free_cb);
 	rc = spdk_vhost_vq_get_desc(vdev, task->vq, task->req_idx, &desc, &desc_table, &desc_table_size);
 	if (spdk_unlikely(rc != 0)) {
 		SPDK_ERRLOG("%s: Invalid controlq descriptor at index %d.\n",
@@ -314,13 +325,18 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
 		goto out;
 	}
 
-	ctrl_req = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+	ctrl_req = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(*ctrl_req));
+	if (ctrl_req == NULL) {
+		SPDK_ERRLOG("%s: Invalid task management request at index %d.\n",
+			    vdev->name, task->req_idx);
+		goto out;
+	}
 
-	SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_QUEUE,
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_QUEUE,
 		      "Processing controlq descriptor: desc %d/%p, desc_addr %p, len %d, flags %d, last_used_idx %d; kickfd %d; size %d\n",
 		      task->req_idx, desc, (void *)desc->addr, desc->len, desc->flags, task->vq->vring.last_used_idx,
 		      task->vq->vring.kickfd, task->vq->vring.size);
-	SPDK_TRACEDUMP(SPDK_TRACE_VHOST_SCSI_QUEUE, "Request descriptor", (uint8_t *)ctrl_req,
+	SPDK_TRACEDUMP(SPDK_LOG_VHOST_SCSI_QUEUE, "Request descriptor", (uint8_t *)ctrl_req,
 		       desc->len);
 
 	spdk_vhost_scsi_task_init_target(task, ctrl_req->lun);
@@ -335,7 +351,7 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
 	/* Process the TMF request */
 	switch (ctrl_req->type) {
 	case VIRTIO_SCSI_T_TMF:
-		task->tmf_resp = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+		task->tmf_resp = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(*task->tmf_resp));
 		if (spdk_unlikely(desc->len < sizeof(struct virtio_scsi_ctrl_tmf_resp) || task->tmf_resp == NULL)) {
 			SPDK_ERRLOG("%s: TMF response descriptor at index %d points to invalid guest memory region\n",
 				    vdev->name, task->req_idx);
@@ -351,20 +367,20 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
 		switch (ctrl_req->subtype) {
 		case VIRTIO_SCSI_T_TMF_LOGICAL_UNIT_RESET:
 			/* Handle LUN reset */
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_QUEUE, "LUN reset\n");
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_QUEUE, "LUN reset\n");
 
 			mgmt_task_submit(task, SPDK_SCSI_TASK_FUNC_LUN_RESET);
 			return;
 		default:
 			task->tmf_resp->response = VIRTIO_SCSI_S_ABORTED;
 			/* Unsupported command */
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_QUEUE, "Unsupported TMF command %x\n", ctrl_req->subtype);
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_QUEUE, "Unsupported TMF command %x\n", ctrl_req->subtype);
 			break;
 		}
 		break;
 	case VIRTIO_SCSI_T_AN_QUERY:
 	case VIRTIO_SCSI_T_AN_SUBSCRIBE: {
-		an_resp = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+		an_resp = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(*an_resp));
 		if (spdk_unlikely(desc->len < sizeof(struct virtio_scsi_ctrl_an_resp) || an_resp == NULL)) {
 			SPDK_WARNLOG("%s: Asynchronous response descriptor points to invalid guest memory region\n",
 				     vdev->name);
@@ -375,12 +391,13 @@ process_ctrl_request(struct spdk_vhost_scsi_task *task)
 		break;
 	}
 	default:
-		SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_QUEUE, "Unsupported control command %x\n", ctrl_req->type);
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_QUEUE, "Unsupported control command %x\n", ctrl_req->type);
 		break;
 	}
 
+	used_len = sizeof(struct virtio_scsi_ctrl_tmf_resp);
 out:
-	spdk_vhost_vq_used_ring_enqueue(vdev, task->vq, task->req_idx, 0);
+	spdk_vhost_vq_used_ring_enqueue(vdev, task->vq, task->req_idx, used_len);
 	spdk_vhost_scsi_task_put(task);
 }
 
@@ -397,11 +414,11 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 	struct spdk_vhost_dev *vdev = &task->svdev->vdev;
 	struct vring_desc *desc, *desc_table;
 	struct iovec *iovs = task->iovs;
-	uint16_t iovcnt = 0, iovcnt_max = SPDK_VHOST_IOVS_MAX;
+	uint16_t iovcnt = 0;
 	uint32_t desc_table_len, len = 0;
 	int rc;
 
-	spdk_scsi_task_construct(&task->scsi, spdk_vhost_scsi_task_cpl, spdk_vhost_scsi_task_free_cb, NULL);
+	spdk_scsi_task_construct(&task->scsi, spdk_vhost_scsi_task_cpl, spdk_vhost_scsi_task_free_cb);
 
 	rc = spdk_vhost_vq_get_desc(vdev, task->vq, task->req_idx, &desc, &desc_table, &desc_table_len);
 	/* First descriptor must be readable */
@@ -412,7 +429,7 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 		goto invalid_task;
 	}
 
-	*req = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+	*req = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(**req));
 	if (spdk_unlikely(*req == NULL)) {
 		SPDK_WARNLOG("%s: Request descriptor at index %d points to invalid guest memory region\n",
 			     vdev->name, task->req_idx);
@@ -434,7 +451,7 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 		/*
 		 * FROM_DEV (READ): [RD_req][WR_resp][WR_buf0]...[WR_bufN]
 		 */
-		task->resp = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+		task->resp = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(*task->resp));
 		if (spdk_unlikely(desc->len < sizeof(struct virtio_scsi_cmd_resp) || task->resp == NULL)) {
 			SPDK_WARNLOG("%s: Response descriptor at index %d points to invalid guest memory region\n",
 				     vdev->name, task->req_idx);
@@ -451,9 +468,10 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 			/*
 			 * TEST UNIT READY command and some others might not contain any payload and this is not an error.
 			 */
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_DATA,
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_DATA,
 				      "No payload descriptors for FROM DEV command req_idx=%"PRIu16".\n", task->req_idx);
-			SPDK_TRACEDUMP(SPDK_TRACE_VHOST_SCSI_DATA, "CDB=", (*req)->cdb, VIRTIO_SCSI_CDB_SIZE);
+			SPDK_TRACEDUMP(SPDK_LOG_VHOST_SCSI_DATA, "CDB=", (*req)->cdb, VIRTIO_SCSI_CDB_SIZE);
+			task->used_len = sizeof(struct virtio_scsi_cmd_resp);
 			task->scsi.iovcnt = 1;
 			task->scsi.iovs[0].iov_len = 0;
 			task->scsi.length = 0;
@@ -462,7 +480,7 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 		}
 
 		/* All remaining descriptors are data. */
-		while (desc && iovcnt < iovcnt_max) {
+		while (desc) {
 			if (spdk_unlikely(!spdk_vhost_vring_desc_is_wr(desc))) {
 				SPDK_WARNLOG("FROM DEV cmd: descriptor nr %" PRIu16" in payload chain is read only.\n", iovcnt);
 				goto invalid_task;
@@ -480,15 +498,17 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 				goto invalid_task;
 			}
 		}
+
+		task->used_len = sizeof(struct virtio_scsi_cmd_resp) + len;
 	} else {
-		SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_DATA, "TO DEV");
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_DATA, "TO DEV");
 		/*
 		 * TO_DEV (WRITE):[RD_req][RD_buf0]...[RD_bufN][WR_resp]
 		 * No need to check descriptor WR flag as this is done while setting scsi.dxfer_dir.
 		 */
 
 		/* Process descriptors up to response. */
-		while (!spdk_vhost_vring_desc_is_wr(desc) && iovcnt < iovcnt_max) {
+		while (!spdk_vhost_vring_desc_is_wr(desc)) {
 			if (spdk_unlikely(spdk_vhost_vring_desc_to_iov(vdev, iovs, &iovcnt, desc))) {
 				goto invalid_task;
 			}
@@ -501,18 +521,14 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 			}
 		}
 
-		task->resp = spdk_vhost_gpa_to_vva(vdev, desc->addr);
+		task->resp = spdk_vhost_gpa_to_vva(vdev, desc->addr, sizeof(*task->resp));
 		if (spdk_unlikely(desc->len < sizeof(struct virtio_scsi_cmd_resp) || task->resp == NULL)) {
 			SPDK_WARNLOG("%s: Response descriptor at index %d points to invalid guest memory region\n",
 				     vdev->name, task->req_idx);
 			goto invalid_task;
 		}
-	}
 
-	if (iovcnt == iovcnt_max) {
-		SPDK_WARNLOG("Too many IO vectors in chain!\n");
-		task->resp->response = VIRTIO_SCSI_S_ABORTED;
-		goto invalid_task;
+		task->used_len = sizeof(struct virtio_scsi_cmd_resp);
 	}
 
 	task->scsi.iovcnt = iovcnt;
@@ -521,7 +537,7 @@ task_data_setup(struct spdk_vhost_scsi_task *task,
 	return 0;
 
 invalid_task:
-	SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI_DATA, "%s: Invalid task at index %"PRIu16".\n",
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI_DATA, "%s: Invalid task at index %"PRIu16".\n",
 		      vdev->name, task->req_idx);
 	return -1;
 }
@@ -544,7 +560,7 @@ process_request(struct spdk_vhost_scsi_task *task)
 	}
 
 	task->scsi.cdb = req->cdb;
-	SPDK_TRACEDUMP(SPDK_TRACE_VHOST_SCSI_DATA, "request CDB", req->cdb, VIRTIO_SCSI_CDB_SIZE);
+	SPDK_TRACEDUMP(SPDK_LOG_VHOST_SCSI_DATA, "request CDB", req->cdb, VIRTIO_SCSI_CDB_SIZE);
 
 	if (spdk_unlikely(task->scsi.lun == NULL)) {
 		spdk_scsi_task_process_null_lun(&task->scsi);
@@ -599,7 +615,7 @@ process_requestq(struct spdk_vhost_scsi_dev *svdev, struct spdk_vhost_virtqueue 
 	assert(reqs_cnt <= 32);
 
 	for (i = 0; i < reqs_cnt; i++) {
-		SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "====== Starting processing request idx %"PRIu16"======\n",
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Starting processing request idx %"PRIu16"======\n",
 			      reqs[i]);
 
 		if (spdk_unlikely(reqs[i] >= vq->vring.size)) {
@@ -621,24 +637,25 @@ process_requestq(struct spdk_vhost_scsi_dev *svdev, struct spdk_vhost_virtqueue 
 		memset(&task->scsi, 0, sizeof(task->scsi));
 		task->resp = NULL;
 		task->used = true;
+		task->used_len = 0;
 		result = process_request(task);
 		if (likely(result == 0)) {
 			task_submit(task);
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "====== Task %p req_idx %d submitted ======\n", task,
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d submitted ======\n", task,
 				      task->req_idx);
 		} else if (result > 0) {
 			spdk_vhost_scsi_task_cpl(&task->scsi);
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "====== Task %p req_idx %d finished early ======\n", task,
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d finished early ======\n", task,
 				      task->req_idx);
 		} else {
 			invalid_request(task);
-			SPDK_DEBUGLOG(SPDK_TRACE_VHOST_SCSI, "====== Task %p req_idx %d failed ======\n", task,
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d failed ======\n", task,
 				      task->req_idx);
 		}
 	}
 }
 
-static void
+static int
 vdev_mgmt_worker(void *arg)
 {
 	struct spdk_vhost_scsi_dev *svdev = arg;
@@ -648,19 +665,23 @@ vdev_mgmt_worker(void *arg)
 
 	process_controlq(svdev, &svdev->vdev.virtqueue[VIRTIO_SCSI_CONTROLQ]);
 	spdk_vhost_vq_used_signal(&svdev->vdev, &svdev->vdev.virtqueue[VIRTIO_SCSI_CONTROLQ]);
+
+	return -1;
 }
 
-static void
+static int
 vdev_worker(void *arg)
 {
 	struct spdk_vhost_scsi_dev *svdev = arg;
 	uint32_t q_idx;
 
-	for (q_idx = VIRTIO_SCSI_REQUESTQ; q_idx < svdev->vdev.num_queues; q_idx++) {
+	for (q_idx = VIRTIO_SCSI_REQUESTQ; q_idx < svdev->vdev.max_queues; q_idx++) {
 		process_requestq(svdev, &svdev->vdev.virtqueue[q_idx]);
 	}
 
 	spdk_vhost_dev_used_signal(&svdev->vdev);
+
+	return -1;
 }
 
 static struct spdk_vhost_scsi_dev *
@@ -670,13 +691,12 @@ to_scsi_dev(struct spdk_vhost_dev *ctrlr)
 		return NULL;
 	}
 
-	if (ctrlr->type != SPDK_VHOST_DEV_T_SCSI) {
-		SPDK_ERRLOG("Controller %s: expected SCSI controller (%d) but got %d\n",
-			    ctrlr->name, SPDK_VHOST_DEV_T_SCSI, ctrlr->type);
+	if (ctrlr->backend != &spdk_vhost_scsi_device_backend) {
+		SPDK_ERRLOG("%s: not a vhost-scsi device.\n", ctrlr->name);
 		return NULL;
 	}
 
-	return (struct spdk_vhost_scsi_dev *)ctrlr;
+	return SPDK_CONTAINEROF(ctrlr, struct spdk_vhost_scsi_dev, vdev);
 }
 
 int
@@ -691,8 +711,8 @@ spdk_vhost_scsi_dev_construct(const char *name, const char *cpumask)
 	}
 
 	spdk_vhost_lock();
-	rc = spdk_vhost_dev_construct(&svdev->vdev, name, cpumask, SPDK_VHOST_DEV_T_SCSI,
-				      &spdk_vhost_scsi_device_backend);
+	rc = spdk_vhost_dev_register(&svdev->vdev, name, cpumask,
+				     &spdk_vhost_scsi_device_backend);
 
 	if (rc) {
 		spdk_dma_free(svdev);
@@ -702,7 +722,7 @@ spdk_vhost_scsi_dev_construct(const char *name, const char *cpumask)
 	return rc;
 }
 
-int
+static int
 spdk_vhost_scsi_dev_remove(struct spdk_vhost_dev *vdev)
 {
 	struct spdk_vhost_scsi_dev *svdev = to_scsi_dev(vdev);
@@ -714,12 +734,20 @@ spdk_vhost_scsi_dev_remove(struct spdk_vhost_dev *vdev)
 
 	for (i = 0; i < SPDK_VHOST_SCSI_CTRLR_MAX_DEVS; ++i) {
 		if (svdev->scsi_dev[i]) {
-			SPDK_ERRLOG("Trying to remove non-empty controller: %s.\n", vdev->name);
-			return -EBUSY;
+			if (vdev->registered) {
+				SPDK_ERRLOG("Trying to remove non-empty controller: %s.\n", vdev->name);
+				return -EBUSY;
+			}
+
+			rc = spdk_vhost_scsi_dev_remove_tgt(vdev, i, NULL, NULL);
+			if (rc != 0) {
+				SPDK_ERRLOG("%s: failed to force-remove target %d\n", vdev->name, i);
+				return rc;
+			}
 		}
 	}
 
-	rc = spdk_vhost_dev_remove(vdev);
+	rc = spdk_vhost_dev_unregister(vdev);
 	if (rc != 0) {
 		return rc;
 	}
@@ -729,7 +757,7 @@ spdk_vhost_scsi_dev_remove(struct spdk_vhost_dev *vdev)
 }
 
 struct spdk_scsi_dev *
-spdk_vhost_scsi_dev_get_dev(struct spdk_vhost_dev *vdev, uint8_t num)
+spdk_vhost_scsi_dev_get_tgt(struct spdk_vhost_dev *vdev, uint8_t num)
 {
 	struct spdk_vhost_scsi_dev *svdev;
 
@@ -748,7 +776,8 @@ spdk_vhost_scsi_lun_hotremove(const struct spdk_scsi_lun *lun, void *arg)
 
 	assert(lun != NULL);
 	assert(svdev != NULL);
-	if (!spdk_vhost_dev_has_feature(&svdev->vdev, VIRTIO_SCSI_F_HOTPLUG)) {
+	if (svdev->vdev.lcore != -1 &&
+	    !spdk_vhost_dev_has_feature(&svdev->vdev, VIRTIO_SCSI_F_HOTPLUG)) {
 		SPDK_WARNLOG("%s: hotremove is not enabled for this controller.\n", svdev->vdev.name);
 		return;
 	}
@@ -761,42 +790,37 @@ spdk_vhost_scsi_lun_hotremove(const struct spdk_scsi_lun *lun, void *arg)
 	}
 
 	if (scsi_dev_num == SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
-		SPDK_ERRLOG("Dev %s is not a part of vhost scsi controller '%s'.\n",
-			    spdk_scsi_dev_get_name(scsi_dev),
-			    svdev->vdev.name);
+		/* The entire device has been already removed. */
 		return;
 	}
 
 	/* remove entire device */
-	spdk_vhost_scsi_dev_remove_dev(&svdev->vdev, scsi_dev_num, NULL, NULL);
+	spdk_vhost_scsi_dev_remove_tgt(&svdev->vdev, scsi_dev_num, NULL, NULL);
 }
 
 int
-spdk_vhost_scsi_dev_add_dev(struct spdk_vhost_dev *vdev, unsigned scsi_dev_num,
-			    const char *lun_name)
+spdk_vhost_scsi_dev_add_tgt(struct spdk_vhost_dev *vdev, unsigned scsi_tgt_num,
+			    const char *bdev_name)
 {
 	struct spdk_vhost_scsi_dev *svdev;
-	char dev_name[SPDK_SCSI_DEV_MAX_NAME];
+	char target_name[SPDK_SCSI_DEV_MAX_NAME];
 	int lun_id_list[1];
-	char *lun_names_list[1];
+	const char *bdev_names_list[1];
 
 	svdev = to_scsi_dev(vdev);
 	if (svdev == NULL) {
 		return -EINVAL;
 	}
 
-	if (scsi_dev_num >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
-		SPDK_ERRLOG("Controller %d device number too big (max %d)\n", scsi_dev_num,
+	if (scsi_tgt_num >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
+		SPDK_ERRLOG("Controller %d target number too big (max %d)\n", scsi_tgt_num,
 			    SPDK_VHOST_SCSI_CTRLR_MAX_DEVS);
 		return -EINVAL;
 	}
 
-	if (lun_name == NULL) {
-		SPDK_ERRLOG("No lun name specified \n");
+	if (bdev_name == NULL) {
+		SPDK_ERRLOG("No lun name specified\n");
 		return -EINVAL;
-	} else if (strlen(lun_name) >= SPDK_SCSI_DEV_MAX_NAME) {
-		SPDK_ERRLOG("LUN name '%s' too long (max %d).\n", lun_name, SPDK_SCSI_DEV_MAX_NAME - 1);
-		return -1;
 	}
 
 	if (vdev->lcore != -1 && !spdk_vhost_dev_has_feature(vdev, VIRTIO_SCSI_F_HOTPLUG)) {
@@ -804,41 +828,42 @@ spdk_vhost_scsi_dev_add_dev(struct spdk_vhost_dev *vdev, unsigned scsi_dev_num,
 		return -ENOTSUP;
 	}
 
-	if (svdev->scsi_dev[scsi_dev_num] != NULL) {
-		SPDK_ERRLOG("Controller %s dev %u already occupied\n", vdev->name, scsi_dev_num);
+	if (svdev->scsi_dev[scsi_tgt_num] != NULL) {
+		SPDK_ERRLOG("Controller %s target %u already occupied\n", vdev->name, scsi_tgt_num);
 		return -EEXIST;
 	}
 
 	/*
-	 * At this stage only one LUN per device
+	 * At this stage only one LUN per target
 	 */
-	snprintf(dev_name, sizeof(dev_name), "Dev %u", scsi_dev_num);
+	snprintf(target_name, sizeof(target_name), "Target %u", scsi_tgt_num);
 	lun_id_list[0] = 0;
-	lun_names_list[0] = (char *)lun_name;
+	bdev_names_list[0] = (char *)bdev_name;
 
-	svdev->scsi_dev_state[scsi_dev_num].removed = false;
-	svdev->scsi_dev[scsi_dev_num] = spdk_scsi_dev_construct(dev_name, lun_names_list, lun_id_list, 1,
+	svdev->scsi_dev_state[scsi_tgt_num].removed = false;
+	svdev->scsi_dev[scsi_tgt_num] = spdk_scsi_dev_construct(target_name, bdev_names_list, lun_id_list,
+					1,
 					SPDK_SPC_PROTOCOL_IDENTIFIER_SAS, spdk_vhost_scsi_lun_hotremove, svdev);
 
-	if (svdev->scsi_dev[scsi_dev_num] == NULL) {
-		SPDK_ERRLOG("Couldn't create spdk SCSI device '%s' using lun device '%s' in controller: %s\n",
-			    dev_name, lun_name, vdev->name);
+	if (svdev->scsi_dev[scsi_tgt_num] == NULL) {
+		SPDK_ERRLOG("Couldn't create spdk SCSI target '%s' using bdev '%s' in controller: %s\n",
+			    target_name, bdev_name, vdev->name);
 		return -EINVAL;
 	}
-	spdk_scsi_dev_add_port(svdev->scsi_dev[scsi_dev_num], 0, "vhost");
+	spdk_scsi_dev_add_port(svdev->scsi_dev[scsi_tgt_num], 0, "vhost");
 
 	if (vdev->lcore != -1) {
-		spdk_scsi_dev_allocate_io_channels(svdev->scsi_dev[scsi_dev_num]);
-		eventq_enqueue(svdev, scsi_dev_num, VIRTIO_SCSI_T_TRANSPORT_RESET, VIRTIO_SCSI_EVT_RESET_RESCAN);
+		spdk_scsi_dev_allocate_io_channels(svdev->scsi_dev[scsi_tgt_num]);
+		eventq_enqueue(svdev, scsi_tgt_num, VIRTIO_SCSI_T_TRANSPORT_RESET, VIRTIO_SCSI_EVT_RESET_RESCAN);
 	}
 
-	SPDK_NOTICELOG("Controller %s: defined device '%s' using lun '%s'\n",
-		       vdev->name, dev_name, lun_name);
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Controller %s: defined target '%s' using bdev '%s'\n",
+		     vdev->name, target_name, bdev_name);
 	return 0;
 }
 
 int
-spdk_vhost_scsi_dev_remove_dev(struct spdk_vhost_dev *vdev, unsigned scsi_dev_num,
+spdk_vhost_scsi_dev_remove_tgt(struct spdk_vhost_dev *vdev, unsigned scsi_tgt_num,
 			       spdk_vhost_event_fn cb_fn, void *cb_arg)
 {
 	struct spdk_vhost_scsi_dev *svdev;
@@ -846,8 +871,8 @@ spdk_vhost_scsi_dev_remove_dev(struct spdk_vhost_dev *vdev, unsigned scsi_dev_nu
 	struct spdk_scsi_dev_vhost_state *scsi_dev_state;
 	int rc = 0;
 
-	if (scsi_dev_num >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
-		SPDK_ERRLOG("%s: invalid device number %d\n", vdev->name, scsi_dev_num);
+	if (scsi_tgt_num >= SPDK_VHOST_SCSI_CTRLR_MAX_DEVS) {
+		SPDK_ERRLOG("%s: invalid target number %d\n", vdev->name, scsi_tgt_num);
 		return -EINVAL;
 	}
 
@@ -856,42 +881,43 @@ spdk_vhost_scsi_dev_remove_dev(struct spdk_vhost_dev *vdev, unsigned scsi_dev_nu
 		return -ENODEV;
 	}
 
-	scsi_dev = svdev->scsi_dev[scsi_dev_num];
+	scsi_dev = svdev->scsi_dev[scsi_tgt_num];
 	if (scsi_dev == NULL) {
-		SPDK_ERRLOG("Controller %s dev %u is not occupied\n", vdev->name, scsi_dev_num);
+		SPDK_ERRLOG("Controller %s target %u is not occupied\n", vdev->name, scsi_tgt_num);
 		return -ENODEV;
 	}
 
 	if (svdev->vdev.lcore == -1) {
 		/* controller is not in use, remove dev and exit */
+		svdev->scsi_dev[scsi_tgt_num] = NULL;
 		spdk_scsi_dev_destruct(scsi_dev);
-		svdev->scsi_dev[scsi_dev_num] = NULL;
 		if (cb_fn) {
 			rc = cb_fn(vdev, cb_arg);
 		}
-		SPDK_NOTICELOG("%s: removed device 'Dev %u'\n", vdev->name, scsi_dev_num);
+		SPDK_INFOLOG(SPDK_LOG_VHOST, "%s: removed target 'Target %u'\n",
+			     vdev->name, scsi_tgt_num);
 		return rc;
 	}
 
 	if (!spdk_vhost_dev_has_feature(vdev, VIRTIO_SCSI_F_HOTPLUG)) {
-		SPDK_WARNLOG("%s: 'Dev %u' is in use and hot-detach is not enabled for this controller.\n",
-			     svdev->vdev.name, scsi_dev_num);
+		SPDK_WARNLOG("%s: 'Target %u' is in use and hot-detach is not enabled for this controller.\n",
+			     svdev->vdev.name, scsi_tgt_num);
 		return -ENOTSUP;
 	}
 
-	scsi_dev_state = &svdev->scsi_dev_state[scsi_dev_num];
+	scsi_dev_state = &svdev->scsi_dev_state[scsi_tgt_num];
 	if (scsi_dev_state->removed) {
-		SPDK_WARNLOG("%s: 'Dev %u' has been already marked to hotremove.\n", svdev->vdev.name,
-			     scsi_dev_num);
+		SPDK_WARNLOG("%s: 'Target %u' has been already marked to hotremove.\n", svdev->vdev.name,
+			     scsi_tgt_num);
 		return -EBUSY;
 	}
 
 	scsi_dev_state->remove_cb = cb_fn;
 	scsi_dev_state->remove_ctx = cb_arg;
 	scsi_dev_state->removed = true;
-	eventq_enqueue(svdev, scsi_dev_num, VIRTIO_SCSI_T_TRANSPORT_RESET, VIRTIO_SCSI_EVT_RESET_REMOVED);
+	eventq_enqueue(svdev, scsi_tgt_num, VIRTIO_SCSI_T_TRANSPORT_RESET, VIRTIO_SCSI_EVT_RESET_REMOVED);
 
-	SPDK_NOTICELOG("%s: queued 'Dev %u' for hot-detach.\n", vdev->name, scsi_dev_num);
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "%s: queued 'Target %u' for hot-detach.\n", vdev->name, scsi_tgt_num);
 	return 0;
 }
 
@@ -902,9 +928,10 @@ spdk_vhost_scsi_controller_construct(void)
 	struct spdk_vhost_dev *vdev;
 	int i, dev_num;
 	unsigned ctrlr_num = 0;
-	char *lun_name, *dev_num_str;
+	char *bdev_name, *tgt_num_str;
 	char *cpumask;
 	char *name;
+	char *tgt = NULL;
 
 	while (sp != NULL) {
 		if (!spdk_conf_section_match_prefix(sp, "VhostScsi")) {
@@ -928,30 +955,35 @@ spdk_vhost_scsi_controller_construct(void)
 		vdev = spdk_vhost_dev_find(name);
 		assert(vdev);
 
-		for (i = 0; spdk_conf_section_get_nval(sp, "Dev", i) != NULL; i++) {
-			dev_num_str = spdk_conf_section_get_nmval(sp, "Dev", i, 0);
-			if (dev_num_str == NULL) {
-				SPDK_ERRLOG("%s: Invalid or missing Dev number\n", name);
+		for (i = 0; ; i++) {
+
+			tgt = spdk_conf_section_get_nval(sp, "Target", i);
+			if (tgt == NULL) {
+				break;
+			}
+
+			tgt_num_str = spdk_conf_section_get_nmval(sp, "Target", i, 0);
+			if (tgt_num_str == NULL) {
+				SPDK_ERRLOG("%s: Invalid or missing target number\n", name);
 				return -1;
 			}
 
-			dev_num = (int)strtol(dev_num_str, NULL, 10);
-			lun_name = spdk_conf_section_get_nmval(sp, "Dev", i, 1);
-			if (lun_name == NULL) {
-				SPDK_ERRLOG("%s: Invalid or missing LUN name for dev %d\n", name, dev_num);
+			dev_num = (int)strtol(tgt_num_str, NULL, 10);
+			bdev_name = spdk_conf_section_get_nmval(sp, "Target", i, 1);
+			if (bdev_name == NULL) {
+				SPDK_ERRLOG("%s: Invalid or missing bdev name for target %d\n", name, dev_num);
 				return -1;
-			} else if (spdk_conf_section_get_nmval(sp, "Dev", i, 2)) {
+			} else if (spdk_conf_section_get_nmval(sp, "Target", i, 2)) {
 				SPDK_ERRLOG("%s: Only one LUN per vhost SCSI device supported\n", name);
 				return -1;
 			}
 
-			if (spdk_vhost_scsi_dev_add_dev(vdev, dev_num, lun_name) < 0) {
+			if (spdk_vhost_scsi_dev_add_tgt(vdev, dev_num, bdev_name) < 0) {
 				return -1;
 			}
 		}
 
 		sp = spdk_conf_next_section(sp);
-
 	}
 
 	return 0;
@@ -963,7 +995,7 @@ free_task_pool(struct spdk_vhost_scsi_dev *svdev)
 	struct spdk_vhost_virtqueue *vq;
 	uint16_t i;
 
-	for (i = 0; i < svdev->vdev.num_queues; i++) {
+	for (i = 0; i < svdev->vdev.max_queues; i++) {
 		vq = &svdev->vdev.virtqueue[i];
 		if (vq->tasks == NULL) {
 			continue;
@@ -983,8 +1015,12 @@ alloc_task_pool(struct spdk_vhost_scsi_dev *svdev)
 	uint16_t i;
 	uint32_t j;
 
-	for (i = 0; i < svdev->vdev.num_queues; i++) {
+	for (i = 0; i < svdev->vdev.max_queues; i++) {
 		vq = &svdev->vdev.virtqueue[i];
+		if (vq->vring.desc == NULL) {
+			continue;
+		}
+
 		task_cnt = vq->vring.size;
 		if (task_cnt > SPDK_VHOST_MAX_VQ_SIZE) {
 			/* sanity check */
@@ -1031,6 +1067,15 @@ spdk_vhost_scsi_start(struct spdk_vhost_dev *vdev, void *event_ctx)
 		goto out;
 	}
 
+	/* validate all I/O queues are in a contiguous index range */
+	for (i = VIRTIO_SCSI_REQUESTQ; i < vdev->max_queues; i++) {
+		if (vdev->virtqueue[i].vring.desc == NULL) {
+			SPDK_ERRLOG("%s: queue %"PRIu32" is empty\n", vdev->name, i);
+			rc = -1;
+			goto out;
+		}
+	}
+
 	rc = alloc_task_pool(svdev);
 	if (rc != 0) {
 		SPDK_ERRLOG("%s: failed to alloc task pool.\n", vdev->name);
@@ -1043,13 +1088,15 @@ spdk_vhost_scsi_start(struct spdk_vhost_dev *vdev, void *event_ctx)
 		}
 		spdk_scsi_dev_allocate_io_channels(svdev->scsi_dev[i]);
 	}
-	SPDK_NOTICELOG("Started poller for vhost controller %s on lcore %d\n", vdev->name, vdev->lcore);
-
-	spdk_vhost_dev_mem_register(vdev);
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Started poller for vhost controller %s on lcore %d\n",
+		     vdev->name, vdev->lcore);
 
 	svdev->requestq_poller = spdk_poller_register(vdev_worker, svdev, 0);
-	svdev->mgmt_poller = spdk_poller_register(vdev_mgmt_worker, svdev,
-			     MGMT_POLL_PERIOD_US);
+	if (vdev->virtqueue[VIRTIO_SCSI_CONTROLQ].vring.desc &&
+	    vdev->virtqueue[VIRTIO_SCSI_EVENTQ].vring.desc) {
+		svdev->mgmt_poller = spdk_poller_register(vdev_mgmt_worker, svdev,
+				     MGMT_POLL_PERIOD_US);
+	}
 out:
 	spdk_vhost_dev_backend_event_done(event_ctx, rc);
 	return rc;
@@ -1061,7 +1108,7 @@ struct spdk_vhost_dev_destroy_ctx {
 	void *event_ctx;
 };
 
-static void
+static int
 destroy_device_poller_cb(void *arg)
 {
 	struct spdk_vhost_dev_destroy_ctx *ctx = arg;
@@ -1069,11 +1116,11 @@ destroy_device_poller_cb(void *arg)
 	uint32_t i;
 
 	if (svdev->vdev.task_cnt > 0) {
-		return;
+		return -1;
 	}
 
 
-	for (i = 0; i < svdev->vdev.num_queues; i++) {
+	for (i = 0; i < svdev->vdev.max_queues; i++) {
 		spdk_vhost_vq_used_signal(&svdev->vdev, &svdev->vdev.virtqueue[i]);
 	}
 
@@ -1084,14 +1131,15 @@ destroy_device_poller_cb(void *arg)
 		spdk_scsi_dev_free_io_channels(svdev->scsi_dev[i]);
 	}
 
-	SPDK_NOTICELOG("Stopping poller for vhost controller %s\n", svdev->vdev.name);
-	spdk_vhost_dev_mem_unregister(&svdev->vdev);
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Stopping poller for vhost controller %s\n", svdev->vdev.name);
 
 	free_task_pool(svdev);
 
 	spdk_poller_unregister(&ctx->poller);
 	spdk_vhost_dev_backend_event_done(ctx->event_ctx, 0);
 	spdk_dma_free(ctx);
+
+	return -1;
 }
 
 static int
@@ -1128,7 +1176,7 @@ err:
 }
 
 static void
-spdk_vhost_scsi_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
+spdk_vhost_scsi_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
 	struct spdk_scsi_dev *sdev;
 	struct spdk_scsi_lun *lun;
@@ -1137,12 +1185,14 @@ spdk_vhost_scsi_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_
 
 	assert(vdev != NULL);
 	spdk_json_write_name(w, "scsi");
-	spdk_json_write_object_begin(w);
+	spdk_json_write_array_begin(w);
 	for (dev_idx = 0; dev_idx < SPDK_VHOST_SCSI_CTRLR_MAX_DEVS; dev_idx++) {
-		sdev = spdk_vhost_scsi_dev_get_dev(vdev, dev_idx);
+		sdev = spdk_vhost_scsi_dev_get_tgt(vdev, dev_idx);
 		if (!sdev) {
 			continue;
 		}
+
+		spdk_json_write_object_begin(w);
 
 		spdk_json_write_name(w, "scsi_dev_num");
 		spdk_json_write_uint32(w, dev_idx);
@@ -1150,7 +1200,7 @@ spdk_vhost_scsi_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_
 		spdk_json_write_name(w, "id");
 		spdk_json_write_int32(w, spdk_scsi_dev_get_id(sdev));
 
-		spdk_json_write_name(w, "device_name");
+		spdk_json_write_name(w, "target_name");
 		spdk_json_write_string(w, spdk_scsi_dev_get_name(sdev));
 
 		spdk_json_write_name(w, "luns");
@@ -1167,18 +1217,62 @@ spdk_vhost_scsi_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_
 			spdk_json_write_name(w, "id");
 			spdk_json_write_int32(w, spdk_scsi_lun_get_id(lun));
 
-			spdk_json_write_name(w, "name");
-			spdk_json_write_string(w, spdk_scsi_lun_get_name(lun));
+			spdk_json_write_name(w, "bdev_name");
+			spdk_json_write_string(w, spdk_scsi_lun_get_bdev_name(lun));
 
 			spdk_json_write_object_end(w);
 		}
 
 		spdk_json_write_array_end(w);
+		spdk_json_write_object_end(w);
 	}
 
-	spdk_json_write_object_end(w);
+	spdk_json_write_array_end(w);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_scsi", SPDK_TRACE_VHOST_SCSI)
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_scsi_queue", SPDK_TRACE_VHOST_SCSI_QUEUE)
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_scsi_data", SPDK_TRACE_VHOST_SCSI_DATA)
+static void
+spdk_vhost_scsi_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
+{
+	struct spdk_vhost_scsi_dev *svdev;
+	struct spdk_scsi_lun *lun;
+	uint32_t i;
+
+	svdev = to_scsi_dev(vdev);
+	if (!svdev) {
+		return;
+	}
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "construct_vhost_scsi_controller");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "ctrlr", vdev->name);
+	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(vdev->cpumask));
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+
+	for (i = 0; i < SPDK_COUNTOF(svdev->scsi_dev); i++) {
+		if (svdev->scsi_dev[i] == NULL || svdev->scsi_dev_state[i].removed) {
+			continue;
+		}
+
+		lun = spdk_scsi_dev_get_lun(svdev->scsi_dev[i], 0);
+
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "method", "add_vhost_scsi_lun");
+
+		spdk_json_write_named_object_begin(w, "params");
+		spdk_json_write_named_string(w, "ctrlr", vdev->name);
+		spdk_json_write_named_uint32(w, "scsi_target_num", i);
+
+		spdk_json_write_named_string(w, "bdev_name", spdk_scsi_lun_get_bdev_name(lun));
+		spdk_json_write_object_end(w);
+
+		spdk_json_write_object_end(w);
+	}
+}
+
+SPDK_LOG_REGISTER_COMPONENT("vhost_scsi", SPDK_LOG_VHOST_SCSI)
+SPDK_LOG_REGISTER_COMPONENT("vhost_scsi_queue", SPDK_LOG_VHOST_SCSI_QUEUE)
+SPDK_LOG_REGISTER_COMPONENT("vhost_scsi_data", SPDK_LOG_VHOST_SCSI_DATA)

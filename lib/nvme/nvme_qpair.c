@@ -37,7 +37,7 @@ static void nvme_qpair_fail(struct spdk_nvme_qpair *qpair);
 
 struct nvme_string {
 	uint16_t	value;
-	const char 	*str;
+	const char	*str;
 };
 
 static const struct nvme_string admin_opcode[] = {
@@ -347,10 +347,7 @@ nvme_qpair_manual_complete_request(struct spdk_nvme_qpair *qpair,
 		nvme_qpair_print_completion(qpair, &cpl);
 	}
 
-	if (req->cb_fn) {
-		req->cb_fn(req->cb_arg, &cpl);
-	}
-
+	nvme_complete_request(req, &cpl);
 	nvme_free_request(req);
 }
 
@@ -415,6 +412,12 @@ nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 	return 0;
 }
 
+void
+nvme_qpair_deinit(struct spdk_nvme_qpair *qpair)
+{
+	spdk_dma_free(qpair->req_buf);
+}
+
 int
 nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
 {
@@ -436,8 +439,9 @@ nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *re
 		TAILQ_FOREACH_SAFE(child_req, &req->children, child_tailq, tmp) {
 			if (!child_req_failed) {
 				rc = nvme_qpair_submit_request(qpair, child_req);
-				if (rc != 0)
+				if (rc != 0) {
 					child_req_failed = true;
+				}
 			} else { /* free remaining child_reqs since one child_req fails */
 				nvme_request_remove_child(req, child_req);
 				nvme_free_request(child_req);

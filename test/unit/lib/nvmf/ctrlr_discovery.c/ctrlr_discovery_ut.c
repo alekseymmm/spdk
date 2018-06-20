@@ -35,9 +35,28 @@
 
 #include "spdk_cunit.h"
 
-#include "ctrlr_discovery.c"
+#include "nvmf/ctrlr_discovery.c"
+#include "nvmf/subsystem.c"
 
-SPDK_LOG_REGISTER_TRACE_FLAG("nvmf", SPDK_TRACE_NVMF)
+SPDK_LOG_REGISTER_COMPONENT("nvmf", SPDK_LOG_NVMF)
+
+uint32_t
+spdk_env_get_current_core(void)
+{
+	return 0;
+}
+
+struct spdk_event *
+spdk_event_allocate(uint32_t core, spdk_event_fn fn, void *arg1, void *arg2)
+{
+	return NULL;
+}
+
+void
+spdk_event_call(struct spdk_event *event)
+{
+
+}
 
 int
 spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t remove_cb,
@@ -46,10 +65,21 @@ spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t remove_
 	return 0;
 }
 
+void
+spdk_bdev_close(struct spdk_bdev_desc *desc)
+{
+}
+
 const char *
 spdk_bdev_get_name(const struct spdk_bdev *bdev)
 {
 	return "test";
+}
+
+const struct spdk_uuid *
+spdk_bdev_get_uuid(const struct spdk_bdev *bdev)
+{
+	return &bdev->uuid;
 }
 
 int
@@ -78,6 +108,12 @@ spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
 		return &g_transport;
 	}
 
+	return NULL;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
+{
 	return NULL;
 }
 
@@ -118,8 +154,20 @@ spdk_nvme_transport_id_compare(const struct spdk_nvme_transport_id *trid1,
 }
 
 void
+spdk_nvmf_ctrlr_ns_changed(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid)
+{
+}
+
+void
 spdk_nvmf_ctrlr_destruct(struct spdk_nvmf_ctrlr *ctrlr)
 {
+}
+
+int
+spdk_nvmf_poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
+				      struct spdk_nvmf_subsystem *subsystem)
+{
+	return 0;
 }
 
 int
@@ -137,29 +185,17 @@ spdk_nvmf_poll_group_remove_subsystem(struct spdk_nvmf_poll_group *group,
 }
 
 int
-spdk_nvmf_subsystem_bdev_attach(struct spdk_nvmf_subsystem *subsystem)
+spdk_nvmf_poll_group_pause_subsystem(struct spdk_nvmf_poll_group *group,
+				     struct spdk_nvmf_subsystem *subsystem)
 {
-	return -1;
+	return 0;
 }
 
-void
-spdk_nvmf_subsystem_bdev_detach(struct spdk_nvmf_subsystem *subsystem)
+int
+spdk_nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
+				      struct spdk_nvmf_subsystem *subsystem)
 {
-}
-
-static bool
-all_zero(const void *buf, size_t size)
-{
-	const uint8_t *b = buf;
-
-	while (size--) {
-		if (*b != 0) {
-			return false;
-		}
-		b++;
-	}
-
-	return true;
+	return 0;
 }
 
 static void
@@ -172,8 +208,12 @@ test_discovery_log(void)
 	struct spdk_nvmf_discovery_log_page_entry *entry;
 	struct spdk_nvme_transport_id trid = {};
 
+	tgt.opts.max_subsystems = 1024;
+	tgt.subsystems = calloc(tgt.opts.max_subsystems, sizeof(struct spdk_nvmf_subsystem *));
+	SPDK_CU_ASSERT_FATAL(tgt.subsystems != NULL);
+
 	/* Add one subsystem and verify that the discovery log contains it */
-	subsystem = spdk_nvmf_create_subsystem(&tgt, "nqn.2016-06.io.spdk:subsystem1",
+	subsystem = spdk_nvmf_subsystem_create(&tgt, "nqn.2016-06.io.spdk:subsystem1",
 					       SPDK_NVMF_SUBTYPE_NVME, 0);
 	SPDK_CU_ASSERT_FATAL(subsystem != NULL);
 
@@ -212,8 +252,8 @@ test_discovery_log(void)
 	CU_ASSERT(disc_log->genctr != 0);
 	CU_ASSERT(disc_log->numrec == 1);
 	CU_ASSERT(disc_log->entries[0].trtype == 42);
-	CU_ASSERT(all_zero(buffer + sizeof(*disc_log) + sizeof(disc_log->entries[0]),
-			   sizeof(buffer) - (sizeof(*disc_log) + sizeof(disc_log->entries[0]))));
+	CU_ASSERT(spdk_mem_all_zero(buffer + sizeof(*disc_log) + sizeof(disc_log->entries[0]),
+				    sizeof(buffer) - (sizeof(*disc_log) + sizeof(disc_log->entries[0]))));
 
 	/* Get just the first entry, no header */
 	memset(buffer, 0xCC, sizeof(buffer));
@@ -222,7 +262,7 @@ test_discovery_log(void)
 					 offsetof(struct spdk_nvmf_discovery_log_page, entries[0]),
 					 sizeof(*entry));
 	CU_ASSERT(entry->trtype == 42);
-	spdk_nvmf_delete_subsystem(subsystem);
+	spdk_nvmf_subsystem_destroy(subsystem);
 	free(tgt.subsystems);
 	free(tgt.discovery_log_page);
 }

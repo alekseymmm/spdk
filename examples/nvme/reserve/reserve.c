@@ -42,8 +42,8 @@
 
 struct dev {
 	struct spdk_pci_addr			pci_addr;
-	struct spdk_nvme_ctrlr 			*ctrlr;
-	char 					name[100];
+	struct spdk_nvme_ctrlr			*ctrlr;
+	char					name[100];
 };
 
 static struct dev devs[MAX_DEVS];
@@ -129,7 +129,7 @@ reservation_ns_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 
 static int
 reservation_ns_register(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
-			uint16_t ns_id)
+			uint32_t ns_id)
 {
 	int ret;
 	struct spdk_nvme_reservation_register_data rr_data;
@@ -157,14 +157,15 @@ reservation_ns_register(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *q
 		spdk_nvme_qpair_process_completions(qpair, 100);
 	}
 
-	if (reserve_command_result)
+	if (reserve_command_result) {
 		fprintf(stderr, "Reservation Register Failed\n");
+	}
 
 	return 0;
 }
 
 static int
-reservation_ns_report(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint16_t ns_id)
+reservation_ns_report(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint32_t ns_id)
 {
 	int ret, i;
 	uint8_t *payload;
@@ -221,7 +222,7 @@ reservation_ns_report(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpa
 }
 
 static int
-reservation_ns_acquire(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint16_t ns_id)
+reservation_ns_acquire(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint32_t ns_id)
 {
 	int ret;
 	struct spdk_nvme_reservation_acquire_data cdata;
@@ -249,14 +250,15 @@ reservation_ns_acquire(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qp
 		spdk_nvme_qpair_process_completions(qpair, 100);
 	}
 
-	if (reserve_command_result)
+	if (reserve_command_result) {
 		fprintf(stderr, "Reservation Acquire Failed\n");
+	}
 
 	return 0;
 }
 
 static int
-reservation_ns_release(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint16_t ns_id)
+reservation_ns_release(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair, uint32_t ns_id)
 {
 	int ret;
 	struct spdk_nvme_reservation_key_data cdata;
@@ -283,8 +285,9 @@ reservation_ns_release(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qp
 		spdk_nvme_qpair_process_completions(qpair, 100);
 	}
 
-	if (reserve_command_result)
+	if (reserve_command_result) {
 		fprintf(stderr, "Reservation Release Failed\n");
+	}
 
 	return 0;
 }
@@ -305,8 +308,9 @@ reserve_controller(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
 	printf("Reservations:                %s\n",
 	       cdata->oncs.reservations ? "Supported" : "Not Supported");
 
-	if (!cdata->oncs.reservations)
+	if (!cdata->oncs.reservations) {
 		return;
+	}
 
 	get_host_identifier(ctrlr);
 
@@ -355,7 +359,10 @@ int main(int argc, char **argv)
 	opts.name = "reserve";
 	opts.core_mask = "0x1";
 	opts.shm_id = 0;
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
 
 	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");

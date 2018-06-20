@@ -33,7 +33,6 @@
 
 #include "spdk/stdinc.h"
 
-#include "spdk/log.h"
 #include "spdk/conf.h"
 #include "spdk/event.h"
 
@@ -41,10 +40,8 @@
 
 
 #define SPDK_VHOST_DEFAULT_CONFIG "/usr/local/etc/spdk/vhost.conf"
-#define SPDK_VHOST_DEFAULT_ENABLE_COREDUMP true
 #define SPDK_VHOST_DEFAULT_MEM_SIZE 1024
 
-static const char *g_socket_path = NULL;
 static const char *g_pid_path = NULL;
 
 static void
@@ -86,9 +83,14 @@ vhost_parse_arg(int ch, char *arg)
 		g_pid_path = arg;
 		break;
 	case 'S':
-		g_socket_path = arg;
+		spdk_vhost_set_socket_path(arg);
 		break;
 	}
+}
+
+static void
+vhost_started(void *arg1, void *arg2)
+{
 }
 
 int
@@ -99,16 +101,18 @@ main(int argc, char *argv[])
 
 	vhost_app_opts_init(&opts);
 
-	spdk_app_parse_args(argc, argv, &opts, "f:S:", vhost_parse_arg, vhost_usage);
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "f:S:",
+				      vhost_parse_arg, vhost_usage)) !=
+	    SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
 
 	if (g_pid_path) {
 		save_pid(g_pid_path);
 	}
 
-	opts.shutdown_cb = spdk_vhost_shutdown_cb;
-
 	/* Blocks until the application is exiting */
-	rc = spdk_app_start(&opts, spdk_vhost_startup, (void *)g_socket_path, NULL);
+	rc = spdk_app_start(&opts, vhost_started, NULL, NULL);
 
 	spdk_app_fini();
 

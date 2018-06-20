@@ -35,7 +35,7 @@
 
 #include "spdk/conf.h"
 #include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/log.h"
 #include "spdk/rpc.h"
 
@@ -45,33 +45,17 @@
 
 static struct spdk_poller *g_rpc_poller = NULL;
 
-static const char *
-rpc_get_listen_addr(void)
-{
-	struct spdk_conf_section *sp;
-
-	sp = spdk_conf_find_section(NULL, "Rpc");
-	if (sp == NULL) {
-		return NULL;
-	}
-
-	return spdk_conf_section_get_val(sp, "Listen");
-}
-
-static void
+static int
 spdk_rpc_subsystem_poll(void *arg)
 {
 	spdk_rpc_accept();
+	return -1;
 }
 
 void
 spdk_rpc_initialize(const char *listen_addr)
 {
 	int rc;
-
-	if (rpc_get_listen_addr() != NULL) {
-		listen_addr = rpc_get_listen_addr();
-	}
 
 	if (listen_addr == NULL) {
 		return;
@@ -84,6 +68,8 @@ spdk_rpc_initialize(const char *listen_addr)
 		return;
 	}
 
+	spdk_rpc_set_state(SPDK_RPC_STARTUP);
+
 	/* Register a poller to periodically check for RPCs */
 	g_rpc_poller = spdk_poller_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
 }
@@ -93,15 +79,4 @@ spdk_rpc_finish(void)
 {
 	spdk_rpc_close();
 	spdk_poller_unregister(&g_rpc_poller);
-}
-
-void
-spdk_rpc_config_text(FILE *fp)
-{
-	fprintf(fp,
-		"\n"
-		"[Rpc]\n"
-		"  # Listen address for the RPC service.\n"
-		"  # May be an IP address or an absolute path to a Unix socket.\n"
-		"  Listen %s\n", rpc_get_listen_addr());
 }

@@ -45,6 +45,7 @@ spdk_pci_device_init(struct rte_pci_driver *driver,
 		     struct rte_pci_device *device)
 {
 	struct spdk_pci_enum_ctx *ctx = (struct spdk_pci_enum_ctx *)driver;
+	int rc;
 
 	if (!ctx->cb_fn) {
 #if RTE_VERSION >= RTE_VERSION_NUM(17, 05, 0, 4)
@@ -66,12 +67,19 @@ spdk_pci_device_init(struct rte_pci_driver *driver,
 		usleep(500 * 1000);
 	}
 
-	return ctx->cb_fn(ctx->cb_arg, (struct spdk_pci_device *)device);
+	rc = ctx->cb_fn(ctx->cb_arg, (struct spdk_pci_device *)device);
+	if (rc != 0) {
+		return rc;
+	}
+
+	spdk_vtophys_pci_device_added(device);
+	return 0;
 }
 
 int
 spdk_pci_device_fini(struct rte_pci_device *device)
 {
+	spdk_vtophys_pci_device_removed(device);
 	return 0;
 }
 
@@ -197,38 +205,6 @@ spdk_pci_enumerate(struct spdk_pci_enum_ctx *ctx,
 	pthread_mutex_unlock(&ctx->mtx);
 
 	return 0;
-}
-
-struct spdk_pci_device *
-spdk_pci_get_device(struct spdk_pci_addr *pci_addr)
-{
-	struct rte_pci_device	*dev;
-	struct rte_pci_addr	addr;
-	int			rc;
-
-	addr.domain = pci_addr->domain;
-	addr.bus = pci_addr->bus;
-	addr.devid = pci_addr->dev;
-	addr.function = pci_addr->func;
-
-#if RTE_VERSION >= RTE_VERSION_NUM(17, 05, 0, 2)
-	FOREACH_DEVICE_ON_PCIBUS(dev) {
-#else
-	TAILQ_FOREACH(dev, &pci_device_list, next) {
-#endif
-		rc = rte_eal_compare_pci_addr(&dev->addr, &addr);
-		if (rc < 0) {
-			continue;
-		}
-
-		if (rc == 0) {
-			return (struct spdk_pci_device *)dev;
-		} else {
-			break;
-		}
-	}
-
-	return NULL;
 }
 
 int
@@ -390,12 +366,14 @@ spdk_pci_device_get_serial_number(struct spdk_pci_device *dev, char *sn, size_t 
 	uint32_t pos, header = 0;
 	uint32_t i, buf[2];
 
-	if (len < 17)
+	if (len < 17) {
 		return -1;
+	}
 
 	err = spdk_pci_device_cfg_read32(dev, &header, PCI_CFG_SIZE);
-	if (err || !header)
+	if (err || !header) {
 		return -1;
+	}
 
 	pos = PCI_CFG_SIZE;
 	while (1) {
@@ -405,8 +383,9 @@ spdk_pci_device_get_serial_number(struct spdk_pci_device *dev, char *sn, size_t 
 				pos += 4;
 				for (i = 0; i < 2; i++) {
 					err = spdk_pci_device_cfg_read32(dev, &buf[i], pos + 4 * i);
-					if (err)
+					if (err) {
 						return -1;
+					}
 				}
 				snprintf(sn, len, "%08x%08x", buf[1], buf[0]);
 				return 0;
@@ -414,11 +393,13 @@ spdk_pci_device_get_serial_number(struct spdk_pci_device *dev, char *sn, size_t 
 		}
 		pos = (header >> 20) & 0xffc;
 		/* 0 if no other items exist */
-		if (pos < PCI_CFG_SIZE)
+		if (pos < PCI_CFG_SIZE) {
 			return -1;
+		}
 		err = spdk_pci_device_cfg_read32(dev, &header, pos);
-		if (err)
+		if (err) {
 			return -1;
+		}
 	}
 	return -1;
 }
@@ -465,7 +446,7 @@ int
 spdk_pci_device_claim(const struct spdk_pci_addr *pci_addr)
 {
 	int dev_fd;
-	char shm_name[64];
+	char dev_name[64];
 	int pid;
 	void *dev_map;
 	struct flock pcidev_lock = {
@@ -475,25 +456,26 @@ spdk_pci_device_claim(const struct spdk_pci_addr *pci_addr)
 		.l_len = 0,
 	};
 
-	snprintf(shm_name, sizeof(shm_name), "%04x:%02x:%02x.%x", pci_addr->domain, pci_addr->bus,
+	snprintf(dev_name, sizeof(dev_name), "/tmp/spdk_pci_lock_%04x:%02x:%02x.%x", pci_addr->domain,
+		 pci_addr->bus,
 		 pci_addr->dev, pci_addr->func);
 
-	dev_fd = shm_open(shm_name, O_RDWR | O_CREAT, 0600);
+	dev_fd = open(dev_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
 	if (dev_fd == -1) {
-		fprintf(stderr, "could not shm_open %s\n", shm_name);
+		fprintf(stderr, "could not open %s\n", dev_name);
 		return -1;
 	}
 
 	if (ftruncate(dev_fd, sizeof(int)) != 0) {
-		fprintf(stderr, "could not truncate shm %s\n", shm_name);
+		fprintf(stderr, "could not truncate %s\n", dev_name);
 		close(dev_fd);
 		return -1;
 	}
 
 	dev_map = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
 		       MAP_SHARED, dev_fd, 0);
-	if (dev_map == NULL) {
-		fprintf(stderr, "could not mmap shm %s\n", shm_name);
+	if (dev_map == MAP_FAILED) {
+		fprintf(stderr, "could not mmap dev %s (%d)\n", dev_name, errno);
 		close(dev_fd);
 		return -1;
 	}
@@ -501,7 +483,7 @@ spdk_pci_device_claim(const struct spdk_pci_addr *pci_addr)
 	if (fcntl(dev_fd, F_SETLK, &pcidev_lock) != 0) {
 		pid = *(int *)dev_map;
 		fprintf(stderr, "Cannot create lock on device %s, probably"
-			" process %d has claimed it\n", shm_name, pid);
+			" process %d has claimed it\n", dev_name, pid);
 		munmap(dev_map, sizeof(int));
 		close(dev_fd);
 		return -1;

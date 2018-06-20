@@ -92,7 +92,6 @@ spdk_rpc_construct_error_bdev(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_construct_error_bdev req = {};
 	struct spdk_json_write_ctx *w;
-	struct spdk_bdev *base_bdev;
 
 	if (spdk_json_decode_object(params, rpc_construct_error_bdev_decoders,
 				    SPDK_COUNTOF(rpc_construct_error_bdev_decoders),
@@ -101,13 +100,7 @@ spdk_rpc_construct_error_bdev(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
-	base_bdev = spdk_bdev_get_by_name(req.base_name);
-	if (!base_bdev) {
-		SPDK_ERRLOG("Could not find ErrorInjection bdev %s\n", req.base_name);
-		goto invalid;
-	}
-
-	if (spdk_vbdev_error_create(base_bdev)) {
+	if (spdk_vbdev_error_create(req.base_name)) {
 		SPDK_ERRLOG("Could not create ErrorInjection bdev %s\n", req.base_name);
 		goto invalid;
 	}
@@ -129,7 +122,7 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_construct_error_bdev(&req);
 }
-SPDK_RPC_REGISTER("construct_error_bdev", spdk_rpc_construct_error_bdev)
+SPDK_RPC_REGISTER("construct_error_bdev", spdk_rpc_construct_error_bdev, SPDK_RPC_RUNTIME)
 
 struct rpc_error_information {
 	char *name;
@@ -200,4 +193,4 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_error_information(&req);
 }
-SPDK_RPC_REGISTER("bdev_inject_error", spdk_rpc_bdev_inject_error)
+SPDK_RPC_REGISTER("bdev_inject_error", spdk_rpc_bdev_inject_error, SPDK_RPC_RUNTIME)

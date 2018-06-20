@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 rootdir=$(readlink -f $(dirname $0))
-source "$rootdir/scripts/autotest_common.sh"
+source "$rootdir/test/common/autotest_common.sh"
 source "$rootdir/test/nvmf/common.sh"
 
 set -xe
@@ -16,13 +16,19 @@ if [ $(uname -s) = Linux ]; then
 	echo "core" > /proc/sys/kernel/core_pattern
 fi
 
-trap "process_core; $rootdir/scripts/setup.sh reset; exit 1" SIGINT SIGTERM EXIT
+trap "process_core; autotest_cleanup; exit 1" SIGINT SIGTERM EXIT
 
 timing_enter autotest
+
+create_test_list
 
 src=$(readlink -f $(dirname $0))
 out=$PWD
 cd $src
+
+./scripts/setup.sh status
+
+freebsd_update_contigmem_mod
 
 if hash lcov; then
 	# setup output dir for unittest.sh
@@ -36,6 +42,8 @@ if hash lcov; then
 		--rc geninfo_all_blocks=1
 		"
 	export LCOV="lcov $LCOV_OPTS --no-external"
+	# Print lcov version to log
+	$LCOV -v
 	# zero out coverage data
 	$LCOV -q -c -i -t "Baseline" -d $src -o cov_base.info
 fi
@@ -71,44 +79,42 @@ timing_enter nvmf_setup
 rdma_device_init
 timing_exit nvmf_setup
 
-timing_enter rbd_setup
-rbd_setup
-timing_exit rbd_setup
-
 #####################
 # Unit Tests
 #####################
 
 if [ $SPDK_TEST_UNITTEST -eq 1 ]; then
 	timing_enter unittest
-	run_test ./unittest.sh
+	run_test ./test/unit/unittest.sh
+	report_test_completion "unittest"
 	timing_exit unittest
 fi
 
 timing_enter lib
 
 if [ $SPDK_TEST_BLOCKDEV -eq 1 ]; then
-	run_test test/lib/bdev/blockdev.sh
+	run_test test/bdev/blockdev.sh
 fi
 
 if [ $SPDK_TEST_EVENT -eq 1 ]; then
-	run_test test/lib/event/event.sh
+	run_test test/event/event.sh
 fi
 
 if [ $SPDK_TEST_NVME -eq 1 ]; then
-	run_test test/lib/nvme/nvme.sh
+	run_test test/nvme/nvme.sh
+	run_test test/nvme/spdk_nvme_cli.sh
 	# Only test hotplug without ASAN enabled. Since if it is
 	# enabled, it catches SEGV earlier than our handler which
 	# breaks the hotplug logic
 	if [ $SPDK_RUN_ASAN -eq 0 ]; then
-		run_test test/lib/nvme/hotplug.sh intel
+		run_test test/nvme/hotplug.sh intel
 	fi
 fi
 
-run_test test/lib/env/env.sh
+run_test test/env/env.sh
 
 if [ $SPDK_TEST_IOAT -eq 1 ]; then
-	run_test test/lib/ioat/ioat.sh
+	run_test test/ioat/ioat.sh
 fi
 
 timing_exit lib
@@ -119,6 +125,7 @@ fi
 
 if [ $SPDK_TEST_BLOBFS -eq 1 ]; then
 	run_test ./test/blobfs/rocksdb/rocksdb.sh
+	run_test ./test/blobstore/blobstore.sh
 fi
 
 if [ $SPDK_TEST_NVMF -eq 1 ]; then
@@ -139,6 +146,30 @@ if [ $SPDK_TEST_VHOST -eq 1 ]; then
 		timing_enter integrity
 		run_test ./test/vhost/spdk_vhost.sh --integrity
 		timing_exit integrity
+
+		timing_enter fs_integrity_scsi
+		run_test ./test/vhost/spdk_vhost.sh --fs-integrity-scsi
+		timing_exit fs_integrity_scsi
+
+		timing_enter fs_integrity_blk
+		run_test ./test/vhost/spdk_vhost.sh --fs-integrity-blk
+		timing_exit fs_integrity_blk
+
+		timing_enter integrity_lvol_scsi_nightly
+		run_test ./test/vhost/spdk_vhost.sh --integrity-lvol-scsi-nightly
+		timing_exit integrity_lvol_scsi_nightly
+
+		timing_enter integrity_lvol_blk_nightly
+		run_test ./test/vhost/spdk_vhost.sh --integrity-lvol-blk-nightly
+		timing_exit integrity_lvol_blk_nightly
+
+		timing_enter vhost_migration
+		run_test ./test/vhost/spdk_vhost.sh --migration
+		timing_exit vhost_migration
+
+		# timing_enter readonly
+		# run_test ./test/vhost/spdk_vhost.sh --readonly
+		# timing_exit readonly
 	fi
 
 	timing_enter integrity_lvol_scsi
@@ -154,26 +185,26 @@ fi
 
 if [ $SPDK_TEST_LVOL -eq 1 ]; then
 	timing_enter lvol
-	test_cases="1,50,51,52,53,100,101,102,250,251,252,253,255,"
-	test_cases+="300,301,450,451,452,550,600,601,650,651,700"
+	test_cases="1,50,51,52,53,100,101,102,150,200,201,250,251,252,253,254,255,"
+	test_cases+="300,301,450,451,452,550,600,601,650,651,652,654,655,"
+	test_cases+="700,701,750,751,752,753,754,755,756,757,"
+	test_cases+="800,801,802,803,804,10000"
 	run_test ./test/lvol/lvol.sh --test-cases=$test_cases
+	report_test_completion "lvol"
 	timing_exit lvol
 fi
 
 if [ $SPDK_TEST_VHOST_INIT -eq 1 ]; then
 	run_test ./test/vhost/initiator/blockdev.sh
+	report_test_completion "vhost_initiator"
 fi
 
-if [ $SPDK_TEST_NVML -eq 1 ]; then
-	run_test ./test/pmem/pmem.sh
+if [ $SPDK_TEST_PMDK -eq 1 ]; then
+	run_test ./test/pmem/pmem.sh -x
 fi
 
 timing_enter cleanup
-rbd_cleanup
-./scripts/setup.sh reset
-if [ $SPDK_BUILD_IOAT_KMOD -eq 1 ]; then
-	./scripts/build_kmod.sh clean
-fi
+autotest_cleanup
 timing_exit cleanup
 
 timing_exit autotest

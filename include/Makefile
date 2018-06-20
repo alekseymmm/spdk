@@ -41,8 +41,10 @@ $(DESTDIR)$(includedir)%.h:
 	$(INSTALL_HEADER)
 
 all:
+	@:
 
 clean:
+	@:
 
 install: $(INSTALLED_HEADERS)
 

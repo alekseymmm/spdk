@@ -1,4 +1,7 @@
 [Global]
 
 [Ioat]
-  Disable Yes
+  Enable No
+
+[Nvme]
+  HotplugEnable Yes

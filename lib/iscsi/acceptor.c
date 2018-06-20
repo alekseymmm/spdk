@@ -35,10 +35,9 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/env.h"
-#include "spdk/event.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/log.h"
-#include "spdk/net.h"
+#include "spdk/sock.h"
 #include "spdk/string.h"
 #include "iscsi/acceptor.h"
 #include "iscsi/conn.h"
@@ -46,35 +45,37 @@
 
 #define ACCEPT_TIMEOUT_US 1000 /* 1ms */
 
-static void
+static int
 spdk_iscsi_portal_accept(void *arg)
 {
 	struct spdk_iscsi_portal	*portal = arg;
-	int				rc, sock;
-	char				buf[64];
+	struct spdk_sock		*sock;
+	int				rc;
+	int				count = 0;
 
-	if (portal->sock < 0) {
-		return;
+	if (portal->sock == NULL) {
+		return -1;
 	}
 
 	while (1) {
-		rc = spdk_sock_accept(portal->sock);
-		if (rc >= 0) {
-			sock = rc;
+		sock = spdk_sock_accept(portal->sock);
+		if (sock != NULL) {
 			rc = spdk_iscsi_conn_construct(portal, sock);
 			if (rc < 0) {
-				close(sock);
+				spdk_sock_close(&sock);
 				SPDK_ERRLOG("spdk_iscsi_connection_construct() failed\n");
 				break;
 			}
+			count++;
 		} else {
 			if (errno != EAGAIN && errno != EWOULDBLOCK) {
-				spdk_strerror_r(errno, buf, sizeof(buf));
-				SPDK_ERRLOG("accept error(%d): %s\n", errno, buf);
+				SPDK_ERRLOG("accept error(%d): %s\n", errno, spdk_strerror(errno));
 			}
 			break;
 		}
 	}
+
+	return count;
 }
 
 void

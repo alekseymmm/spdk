@@ -33,11 +33,19 @@
 
 #include "spdk_cunit.h"
 
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
+#include "unit/lib/json_mock.c"
 
-#include "pmem/bdev_pmem.c"
+#include "bdev/pmem/bdev_pmem.c"
 
-static struct spdk_bdev_module_if *g_bdev_pmem_module;
+DEFINE_STUB(spdk_conf_find_section, struct spdk_conf_section *,
+	    (struct spdk_conf *cp, const char *name), NULL);
+DEFINE_STUB(spdk_conf_section_get_nval, char *,
+	    (struct spdk_conf_section *sp, const char *key, int idx), NULL);
+DEFINE_STUB(spdk_conf_section_get_nmval, char *,
+	    (struct spdk_conf_section *sp, const char *key, int idx1, int idx2), NULL);
+
+static struct spdk_bdev_module *g_bdev_pmem_module;
 static int g_bdev_module_cnt;
 
 struct pmemblk {
@@ -49,6 +57,8 @@ struct pmemblk {
 
 	uint8_t *buffer;
 };
+
+static const char *g_bdev_name = "pmem0";
 
 /* PMEMblkpool is a typedef of struct pmemblk */
 static PMEMblkpool g_pool_ok = {
@@ -88,10 +98,11 @@ static struct spdk_bdev *g_bdev;
 static const char *g_check_version_msg;
 static bool g_pmemblk_open_allow_open = true;
 
-DEFINE_STUB(spdk_json_write_object_begin, int, (struct spdk_json_write_ctx *w), 0);
-DEFINE_STUB(spdk_json_write_object_end, int, (struct spdk_json_write_ctx *w), 0);
-DEFINE_STUB(spdk_json_write_string, int, (struct spdk_json_write_ctx *w, const char *val), 0);
-DEFINE_STUB(spdk_json_write_name, int, (struct spdk_json_write_ctx *w, const char *name), 0);
+static void
+_pmem_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
+{
+	fn(ctx);
+}
 
 static PMEMblkpool *
 find_pmemblk_pool(const char *path)
@@ -278,6 +289,13 @@ spdk_bdev_module_finish_done(void)
 {
 }
 
+int
+spdk_bdev_notify_blockcnt_change(struct spdk_bdev *bdev, uint64_t size)
+{
+	bdev->blockcnt = size;
+	return 0;
+}
+
 static void
 ut_bdev_pmem_destruct(struct spdk_bdev *bdev)
 {
@@ -287,7 +305,7 @@ ut_bdev_pmem_destruct(struct spdk_bdev *bdev)
 }
 
 void
-spdk_bdev_module_list_add(struct spdk_bdev_module_if *bdev_module)
+spdk_bdev_module_list_add(struct spdk_bdev_module *bdev_module)
 {
 	g_bdev_pmem_module = bdev_module;
 	g_bdev_module_cnt++;
@@ -350,6 +368,9 @@ ut_pmem_blk_clean(void)
 
 	/* Unload module to free IO channel */
 	g_bdev_pmem_module->module_fini();
+
+	spdk_free_thread();
+
 	return 0;
 }
 
@@ -357,6 +378,8 @@ static int
 ut_pmem_blk_init(void)
 {
 	errno = 0;
+
+	spdk_allocate_thread(_pmem_send_msg, NULL, NULL, NULL, NULL);
 
 	g_pool_ok.buffer = calloc(g_pool_ok.nblock, g_pool_ok.bsize);
 	if (g_pool_ok.buffer == NULL) {
@@ -429,8 +452,14 @@ ut_pmem_open_close(void)
 	CU_ASSERT_EQUAL(pools_cnt, g_opened_pools);
 	CU_ASSERT_NOT_EQUAL(rc, 0);
 
-	/* Open good  pool */
+	/* Open pool with NULL name */
 	rc = spdk_create_pmem_disk(g_pool_ok.name, NULL, &bdev);
+	CU_ASSERT_PTR_NULL(bdev);
+	CU_ASSERT_EQUAL(pools_cnt, g_opened_pools);
+	CU_ASSERT_NOT_EQUAL(rc, 0);
+
+	/* Open good pool */
+	rc = spdk_create_pmem_disk(g_pool_ok.name, g_bdev_name, &bdev);
 	SPDK_CU_ASSERT_FATAL(bdev != NULL);
 	CU_ASSERT_TRUE(g_pool_ok.is_open);
 	CU_ASSERT_EQUAL(pools_cnt + 1, g_opened_pools);
@@ -461,7 +490,7 @@ ut_pmem_write_read(void)
 		{ 0, 4 * g_pool_ok.bsize },
 	};
 
-	rc = spdk_create_pmem_disk(g_pool_ok.name, NULL, &bdev);
+	rc = spdk_create_pmem_disk(g_pool_ok.name, g_bdev_name, &bdev);
 	CU_ASSERT_EQUAL(rc, 0);
 
 	SPDK_CU_ASSERT_FATAL(g_pool_ok.nblock > 40);
@@ -635,7 +664,7 @@ ut_pmem_reset(void)
 	struct spdk_bdev *bdev;
 	int rc;
 
-	rc = spdk_create_pmem_disk(g_pool_ok.name, NULL, &bdev);
+	rc = spdk_create_pmem_disk(g_pool_ok.name, g_bdev_name, &bdev);
 	CU_ASSERT_EQUAL(rc, 0);
 	SPDK_CU_ASSERT_FATAL(bdev != NULL);
 
@@ -655,7 +684,7 @@ ut_pmem_unmap_write_zero(int16_t io_type)
 	int rc;
 
 	CU_ASSERT(io_type == SPDK_BDEV_IO_TYPE_UNMAP || io_type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES);
-	rc = spdk_create_pmem_disk(g_pool_ok.name, NULL, &bdev);
+	rc = spdk_create_pmem_disk(g_pool_ok.name, g_bdev_name, &bdev);
 	CU_ASSERT_EQUAL(rc, 0);
 	SPDK_CU_ASSERT_FATAL(bdev != NULL);
 	SPDK_CU_ASSERT_FATAL(g_pool_ok.nblock > 40);

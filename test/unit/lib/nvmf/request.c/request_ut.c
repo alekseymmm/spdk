@@ -35,9 +35,9 @@
 
 #include "spdk_cunit.h"
 
-#include "request.c"
+#include "nvmf/request.c"
 
-SPDK_LOG_REGISTER_TRACE_FLAG("nvmf", SPDK_TRACE_NVMF)
+SPDK_LOG_REGISTER_COMPONENT("nvmf", SPDK_LOG_NVMF)
 
 void spdk_trace_record(uint16_t tpoint_id, uint16_t poller_id, uint32_t size,
 		       uint64_t object_id, uint64_t arg1)
@@ -113,7 +113,7 @@ struct spdk_nvme_ns *spdk_nvme_ctrlr_get_ns(struct spdk_nvme_ctrlr *ctrlr, uint3
 }
 
 void
-spdk_nvmf_ctrlr_disconnect(struct spdk_nvmf_qpair *qpair)
+spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
 {
 }
 

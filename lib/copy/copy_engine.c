@@ -38,7 +38,7 @@
 #include "spdk/env.h"
 #include "spdk/event.h"
 #include "spdk/log.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 
 static size_t g_max_copy_module_size = 0;
 
@@ -283,6 +283,18 @@ spdk_copy_engine_finish(spdk_copy_fini_cb cb_fn, void *cb_arg)
 	g_fini_cb_arg = cb_arg;
 
 	spdk_copy_engine_module_finish();
+}
+
+void
+spdk_copy_engine_config_text(FILE *fp)
+{
+	struct spdk_copy_module_if *copy_engine_module;
+
+	TAILQ_FOREACH(copy_engine_module, &spdk_copy_module_list, tailq) {
+		if (copy_engine_module->config_text) {
+			copy_engine_module->config_text(fp);
+		}
+	}
 }
 
 SPDK_COPY_MODULE_REGISTER(copy_engine_mem_init, NULL, NULL, copy_engine_mem_get_ctx_size)

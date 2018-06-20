@@ -65,7 +65,7 @@
 
 #define SPDK_VHOST_SCSI_CTRLR_MAX_DEVS 8
 
-#define SPDK_VHOST_IOVS_MAX 128
+#define SPDK_VHOST_IOVS_MAX 129
 
 /*
  * Rate at which stats are checked for interrupt coalescing.
@@ -90,14 +90,8 @@
 	(1ULL << VIRTIO_RING_F_EVENT_IDX) | \
 	(1ULL << VIRTIO_RING_F_INDIRECT_DESC))
 
-#define SPDK_VHOST_DISABLED_FEATURES ((1ULL << VHOST_F_LOG_ALL) | \
-	(1ULL << VIRTIO_RING_F_EVENT_IDX) | \
-	(1ULL << VIRTIO_RING_F_INDIRECT_DESC))
-
-enum spdk_vhost_dev_type {
-	SPDK_VHOST_DEV_T_SCSI,//!< SPDK_VHOST_DEV_T_SCSI
-	SPDK_VHOST_DEV_T_BLK, //!< SPDK_VHOST_DEV_T_BLK
-};
+#define SPDK_VHOST_DISABLED_FEATURES ((1ULL << VIRTIO_RING_F_EVENT_IDX) | \
+	(1ULL << VIRTIO_F_NOTIFY_ON_EMPTY))
 
 struct spdk_vhost_virtqueue {
 	struct rte_vhost_vring vring;
@@ -130,8 +124,13 @@ struct spdk_vhost_dev_backend {
 	spdk_vhost_event_fn start_device;
 	spdk_vhost_event_fn stop_device;
 
-	void (*dump_config_json)(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
-	int (*vhost_remove_controller)(struct spdk_vhost_dev *vdev);
+	int (*vhost_get_config)(struct spdk_vhost_dev *vdev, uint8_t *config, uint32_t len);
+	int (*vhost_set_config)(struct spdk_vhost_dev *vdev, uint8_t *config,
+				uint32_t offset, uint32_t size, uint32_t flags);
+
+	void (*dump_info_json)(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+	void (*write_config_json)(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+	int (*remove_device)(struct spdk_vhost_dev *vdev);
 };
 
 struct spdk_vhost_dev {
@@ -139,13 +138,23 @@ struct spdk_vhost_dev {
 	char *name;
 	char *path;
 
+	/* Unique device ID. */
+	unsigned id;
+
+	/* rte_vhost device ID. */
 	int vid;
 	int task_cnt;
 	int32_t lcore;
-	uint64_t cpumask;
+	struct spdk_cpuset *cpumask;
+	bool registered;
 
-	enum spdk_vhost_dev_type type;
 	const struct spdk_vhost_dev_backend *backend;
+
+	/* Saved orginal values used to setup coalescing to avoid integer
+	 * rounding issues during save/load config.
+	 */
+	uint32_t coalescing_delay_us;
+	uint32_t coalescing_iops_threshold;
 
 	uint32_t coalescing_delay_time_base;
 
@@ -158,22 +167,21 @@ struct spdk_vhost_dev {
 	/* Interval used for event coalescing checking. */
 	uint64_t stats_check_interval;
 
-	uint16_t num_queues;
+	uint16_t max_queues;
 
 	uint64_t negotiated_features;
 
 	struct spdk_vhost_virtqueue virtqueue[SPDK_VHOST_MAX_VQUEUES];
+
+	TAILQ_ENTRY(spdk_vhost_dev) tailq;
 };
 
 struct spdk_vhost_dev *spdk_vhost_dev_find(const char *ctrlr_name);
-void spdk_vhost_dev_mem_register(struct spdk_vhost_dev *vdev);
-void spdk_vhost_dev_mem_unregister(struct spdk_vhost_dev *vdev);
 
-void *spdk_vhost_gpa_to_vva(struct spdk_vhost_dev *vdev, uint64_t addr);
+void *spdk_vhost_gpa_to_vva(struct spdk_vhost_dev *vdev, uint64_t addr, uint64_t len);
 
 uint16_t spdk_vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *vq, uint16_t *reqs,
 				      uint16_t reqs_len);
-bool spdk_vhost_vq_should_notify(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq);
 
 /**
  * Get a virtio descriptor at given index in given virtqueue.
@@ -234,18 +242,31 @@ bool spdk_vhost_vring_desc_is_wr(struct vring_desc *cur_desc);
 
 int spdk_vhost_vring_desc_to_iov(struct spdk_vhost_dev *vdev, struct iovec *iov,
 				 uint16_t *iov_index, const struct vring_desc *desc);
-bool spdk_vhost_dev_has_feature(struct spdk_vhost_dev *vdev, unsigned feature_id);
 
-int spdk_vhost_dev_construct(struct spdk_vhost_dev *vdev, const char *name, const char *mask_str,
-			     enum spdk_vhost_dev_type type, const struct spdk_vhost_dev_backend *backend);
-int spdk_vhost_dev_remove(struct spdk_vhost_dev *vdev);
+static inline bool __attribute__((always_inline))
+spdk_vhost_dev_has_feature(struct spdk_vhost_dev *vdev, unsigned feature_id)
+{
+	return vdev->negotiated_features & (1ULL << feature_id);
+}
+
+int spdk_vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *mask_str,
+			    const struct spdk_vhost_dev_backend *backend);
+int spdk_vhost_dev_unregister(struct spdk_vhost_dev *vdev);
 
 int spdk_vhost_scsi_controller_construct(void);
 int spdk_vhost_blk_controller_construct(void);
-void spdk_vhost_dump_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+void spdk_vhost_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
 void spdk_vhost_dev_backend_event_done(void *event_ctx, int response);
 void spdk_vhost_lock(void);
 void spdk_vhost_unlock(void);
 int spdk_remove_vhost_controller(struct spdk_vhost_dev *vdev);
+int spdk_vhost_nvme_admin_passthrough(int vid, void *cmd, void *cqe, void *buf);
+int spdk_vhost_nvme_set_cq_call(int vid, uint16_t qid, int fd);
+int spdk_vhost_nvme_get_cap(int vid, uint64_t *cap);
+int spdk_vhost_nvme_controller_construct(void);
+int spdk_vhost_nvme_dev_construct(const char *name, const char *cpumask, uint32_t io_queues);
+int spdk_vhost_nvme_dev_remove(struct spdk_vhost_dev *vdev);
+int spdk_vhost_nvme_dev_add_ns(struct spdk_vhost_dev *vdev,
+			       const char *bdev_name);
 
 #endif /* SPDK_VHOST_INTERNAL_H */

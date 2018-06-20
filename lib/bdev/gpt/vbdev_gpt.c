@@ -41,15 +41,24 @@
 #include "spdk/conf.h"
 #include "spdk/endian.h"
 #include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/rpc.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
-SPDK_DECLARE_BDEV_MODULE(gpt);
+static int vbdev_gpt_init(void);
+static void vbdev_gpt_examine(struct spdk_bdev *bdev);
+
+static struct spdk_bdev_module gpt_if = {
+	.name = "gpt",
+	.module_init = vbdev_gpt_init,
+	.examine = vbdev_gpt_examine,
+
+};
+SPDK_BDEV_MODULE_REGISTER(&gpt_if)
 
 /* Base block device gpt context */
 struct gpt_base {
@@ -91,12 +100,12 @@ spdk_gpt_base_bdev_hotremove_cb(void *_base_bdev)
 
 static int vbdev_gpt_destruct(void *ctx);
 static void vbdev_gpt_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io);
-static int vbdev_gpt_dump_config_json(void *ctx, struct spdk_json_write_ctx *w);
+static int vbdev_gpt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w);
 
 static struct spdk_bdev_fn_table vbdev_gpt_fn_table = {
 	.destruct		= vbdev_gpt_destruct,
 	.submit_request		= vbdev_gpt_submit_request,
-	.dump_config_json	= vbdev_gpt_dump_config_json,
+	.dump_info_json		= vbdev_gpt_dump_info_json,
 };
 
 static struct gpt_base *
@@ -114,7 +123,7 @@ spdk_gpt_base_bdev_init(struct spdk_bdev *bdev)
 
 	rc = spdk_bdev_part_base_construct(&gpt_base->part_base, bdev,
 					   spdk_gpt_base_bdev_hotremove_cb,
-					   SPDK_GET_BDEV_MODULE(gpt), &vbdev_gpt_fn_table,
+					   &gpt_if, &vbdev_gpt_fn_table,
 					   &g_gpt_disks, spdk_gpt_base_free,
 					   sizeof(struct gpt_channel), NULL, NULL);
 	if (rc) {
@@ -123,7 +132,8 @@ spdk_gpt_base_bdev_init(struct spdk_bdev *bdev)
 	}
 
 	gpt = &gpt_base->gpt;
-	gpt->buf = spdk_dma_zmalloc(SPDK_GPT_BUFFER_SIZE, 0x1000, NULL);
+	gpt->buf_size = spdk_max(SPDK_GPT_BUFFER_SIZE, bdev->blocklen);
+	gpt->buf = spdk_dma_zmalloc(gpt->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
 	if (!gpt->buf) {
 		SPDK_ERRLOG("Cannot alloc buf\n");
 		spdk_bdev_part_base_free(&gpt_base->part_base);
@@ -143,8 +153,7 @@ vbdev_gpt_destruct(void *ctx)
 {
 	struct gpt_disk *gpt_disk = ctx;
 
-	spdk_bdev_part_free(&gpt_disk->part);
-	return 0;
+	return spdk_bdev_part_free(&gpt_disk->part);
 }
 
 static void
@@ -181,7 +190,7 @@ write_string_utf16le(struct spdk_json_write_ctx *w, const uint16_t *str, size_t 
 }
 
 static int
-vbdev_gpt_dump_config_json(void *ctx, struct spdk_json_write_ctx *w)
+vbdev_gpt_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct gpt_disk *gpt_disk = ctx;
 	struct gpt_base *gpt_base = (struct gpt_base *)gpt_disk->part.base;
@@ -291,13 +300,13 @@ spdk_gpt_bdev_complete(struct spdk_bdev_io *bdev_io, bool status, void *arg)
 
 	rc = spdk_gpt_parse(&gpt_base->gpt);
 	if (rc) {
-		SPDK_DEBUGLOG(SPDK_TRACE_VBDEV_GPT, "Failed to parse gpt\n");
+		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_GPT, "Failed to parse gpt\n");
 		goto end;
 	}
 
 	rc = vbdev_gpt_create_bdevs(gpt_base);
 	if (rc < 0) {
-		SPDK_DEBUGLOG(SPDK_TRACE_VBDEV_GPT, "Failed to split dev=%s by gpt table\n",
+		SPDK_DEBUGLOG(SPDK_LOG_VBDEV_GPT, "Failed to split dev=%s by gpt table\n",
 			      spdk_bdev_get_name(bdev));
 	}
 
@@ -306,7 +315,7 @@ end:
 	 * Notify the generic bdev layer that the actions related to the original examine
 	 *  callback are now completed.
 	 */
-	spdk_bdev_module_examine_done(SPDK_GET_BDEV_MODULE(gpt));
+	spdk_bdev_module_examine_done(&gpt_if);
 
 	if (gpt_base->part_base.ref == 0) {
 		/* If no gpt_disk instances were created, free the base context */
@@ -334,7 +343,7 @@ vbdev_gpt_read_gpt(struct spdk_bdev *bdev)
 	}
 
 	rc = spdk_bdev_read(gpt_base->part_base.desc, gpt_base->ch, gpt_base->gpt.buf, 0,
-			    SPDK_GPT_BUFFER_SIZE, spdk_gpt_bdev_complete, gpt_base);
+			    gpt_base->gpt.buf_size, spdk_gpt_bdev_complete, gpt_base);
 	if (rc < 0) {
 		spdk_put_io_channel(gpt_base->ch);
 		spdk_bdev_part_base_free(&gpt_base->part_base);
@@ -359,28 +368,20 @@ vbdev_gpt_init(void)
 }
 
 static void
-vbdev_gpt_fini(void)
-{
-	spdk_bdev_part_tailq_fini(&g_gpt_disks);
-}
-
-static void
 vbdev_gpt_examine(struct spdk_bdev *bdev)
 {
 	int rc;
 
 	if (g_gpt_disabled) {
-		spdk_bdev_module_examine_done(SPDK_GET_BDEV_MODULE(gpt));
+		spdk_bdev_module_examine_done(&gpt_if);
 		return;
 	}
 
 	rc = vbdev_gpt_read_gpt(bdev);
 	if (rc) {
-		spdk_bdev_module_examine_done(SPDK_GET_BDEV_MODULE(gpt));
+		spdk_bdev_module_examine_done(&gpt_if);
 		SPDK_ERRLOG("Failed to read info from bdev %s\n", spdk_bdev_get_name(bdev));
 	}
 }
 
-SPDK_BDEV_MODULE_REGISTER(gpt, vbdev_gpt_init, vbdev_gpt_fini, NULL,
-			  NULL, vbdev_gpt_examine)
-SPDK_LOG_REGISTER_TRACE_FLAG("vbdev_gpt", SPDK_TRACE_VBDEV_GPT)
+SPDK_LOG_REGISTER_COMPONENT("vbdev_gpt", SPDK_LOG_VBDEV_GPT)

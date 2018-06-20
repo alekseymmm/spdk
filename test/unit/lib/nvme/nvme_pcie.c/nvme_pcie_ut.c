@@ -35,11 +35,30 @@
 
 #include "spdk_cunit.h"
 
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
 
 #include "nvme/nvme_pcie.c"
 
-struct spdk_trace_flag SPDK_TRACE_NVME = {
+pid_t g_spdk_nvme_pid;
+
+DEFINE_STUB(spdk_mem_register, int, (void *vaddr, size_t len), 0);
+DEFINE_STUB(spdk_mem_unregister, int, (void *vaddr, size_t len), 0);
+
+DEFINE_STUB(spdk_nvme_ctrlr_get_process,
+	    struct spdk_nvme_ctrlr_process *,
+	    (struct spdk_nvme_ctrlr *ctrlr, pid_t pid),
+	    NULL);
+
+DEFINE_STUB(spdk_nvme_ctrlr_get_current_process,
+	    struct spdk_nvme_ctrlr_process *,
+	    (struct spdk_nvme_ctrlr *ctrlr),
+	    NULL);
+
+DEFINE_STUB(spdk_nvme_wait_for_completion, int,
+	    (struct spdk_nvme_qpair *qpair,
+	     struct nvme_completion_poll_status *status), 0);
+
+struct spdk_trace_flag SPDK_LOG_NVME = {
 	.name = "nvme",
 	.enabled = false,
 };
@@ -92,6 +111,12 @@ nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 		struct spdk_nvme_ctrlr *ctrlr,
 		enum spdk_nvme_qprio qprio,
 		uint32_t num_requests)
+{
+	abort();
+}
+
+void
+nvme_qpair_deinit(struct spdk_nvme_qpair *qpair)
 {
 	abort();
 }
@@ -159,6 +184,12 @@ nvme_ctrlr_construct(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 void
+nvme_ctrlr_destruct_finish(struct spdk_nvme_ctrlr *ctrlr)
+{
+	abort();
+}
+
+void
 nvme_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 {
 	abort();
@@ -195,20 +226,21 @@ nvme_ctrlr_get_cap(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cap_register *
 	abort();
 }
 
+int
+nvme_ctrlr_get_vs(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_vs_register *vs)
+{
+	abort();
+}
+
 void
-nvme_ctrlr_init_cap(struct spdk_nvme_ctrlr *ctrlr, const union spdk_nvme_cap_register *cap)
+nvme_ctrlr_init_cap(struct spdk_nvme_ctrlr *ctrlr, const union spdk_nvme_cap_register *cap,
+		    const union spdk_nvme_vs_register *vs)
 {
 	abort();
 }
 
 uint64_t
 nvme_get_quirks(const struct spdk_pci_id *id)
-{
-	abort();
-}
-
-void
-nvme_free_request(struct nvme_request *req)
 {
 	abort();
 }
@@ -244,12 +276,6 @@ nvme_ctrlr_submit_admin_request(struct spdk_nvme_ctrlr *ctrlr,
 	abort();
 }
 
-struct nvme_request *
-nvme_allocate_request_null(struct spdk_nvme_qpair *qpair, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
-{
-	abort();
-}
-
 void
 nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
@@ -268,12 +294,26 @@ nvme_qpair_enable(struct spdk_nvme_qpair *qpair)
 	abort();
 }
 
+int
+nvme_request_check_timeout(struct nvme_request *req, uint16_t cid,
+			   struct spdk_nvme_ctrlr_process *active_proc,
+			   uint64_t now_tick)
+{
+	abort();
+}
+
 struct spdk_nvme_ctrlr *
 spdk_nvme_get_ctrlr_by_trid_unsafe(const struct spdk_nvme_transport_id *trid)
 {
 	return NULL;
 }
 
+union spdk_nvme_csts_register spdk_nvme_ctrlr_get_regs_csts(struct spdk_nvme_ctrlr *ctrlr)
+{
+	union spdk_nvme_csts_register csts = {};
+
+	return csts;
+}
 
 #if 0 /* TODO: update PCIe-specific unit test */
 static void
@@ -355,7 +395,7 @@ static void
 ut_insert_cq_entry(struct spdk_nvme_qpair *qpair, uint32_t slot)
 {
 	struct nvme_request	*req;
-	struct nvme_tracker 	*tr;
+	struct nvme_tracker	*tr;
 	struct spdk_nvme_cpl	*cpl;
 
 	req = calloc(1, sizeof(*req));
@@ -422,14 +462,11 @@ test_sgl_req(void)
 	struct nvme_request	*req;
 	struct spdk_nvme_ctrlr	ctrlr = {};
 	struct nvme_payload	payload = {};
-	struct nvme_tracker 	*sgl_tr = NULL;
-	uint64_t 		i;
+	struct nvme_tracker	*sgl_tr = NULL;
+	uint64_t		i;
 	struct io_request	io_req = {};
 
-	payload.type = NVME_PAYLOAD_TYPE_SGL;
-	payload.u.sgl.reset_sgl_fn = nvme_request_reset_sgl;
-	payload.u.sgl.next_sge_fn = nvme_request_next_sge;
-	payload.u.sgl.cb_arg = &io_req;
+	payload = NVME_PAYLOAD_SGL(nvme_request_reset_sgl, nvme_request_next_sge, &io_req, NULL);
 
 	prepare_submit_request_test(&qpair, &ctrlr);
 	req = nvme_allocate_request(&payload, 0x1000, NULL, &io_req);
@@ -500,14 +537,11 @@ test_hw_sgl_req(void)
 	struct nvme_request	*req;
 	struct spdk_nvme_ctrlr	ctrlr = {};
 	struct nvme_payload	payload = {};
-	struct nvme_tracker 	*sgl_tr = NULL;
-	uint64_t 		i;
+	struct nvme_tracker	*sgl_tr = NULL;
+	uint64_t		i;
 	struct io_request	io_req = {};
 
-	payload.type = NVME_PAYLOAD_TYPE_SGL;
-	payload.u.sgl.reset_sgl_fn = nvme_request_reset_sgl;
-	payload.u.sgl.next_sge_fn = nvme_request_next_sge;
-	payload.u.sgl.cb_arg = &io_req;
+	payload = NVME_PAYLOAD_SGL(nvme_request_reset_sgl, nvme_request_next_sge, &io_req, NULL);
 
 	prepare_submit_request_test(&qpair, &ctrlr);
 	req = nvme_allocate_request(&payload, 0x1000, NULL, &io_req);
@@ -785,6 +819,18 @@ test_prp_list_append(void)
 					    (NVME_MAX_PRP_LIST_ENTRIES + 1) * 0x1000, 0x1000) == -EINVAL);
 }
 
+static void test_shadow_doorbell_update(void)
+{
+	bool ret;
+
+	/* nvme_pcie_qpair_need_event(uint16_t event_idx, uint16_t new_idx, uint16_t old) */
+	ret = nvme_pcie_qpair_need_event(10, 15, 14);
+	CU_ASSERT(ret == false);
+
+	ret = nvme_pcie_qpair_need_event(14, 15, 14);
+	CU_ASSERT(ret == true);
+}
+
 int main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
@@ -801,7 +847,8 @@ int main(int argc, char **argv)
 	}
 
 	if (CU_add_test(suite, "prp_list_append", test_prp_list_append) == NULL
-	   ) {
+	    || CU_add_test(suite, "shadow_doorbell_update",
+			   test_shadow_doorbell_update) == NULL) {
 		CU_cleanup_registry();
 		return CU_get_error();
 	}

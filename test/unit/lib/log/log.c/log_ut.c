@@ -36,8 +36,8 @@
 #include "spdk_cunit.h"
 #include "spdk/log.h"
 
-#include "log.c"
-#include "log_flags.c"
+#include "log/log.c"
+#include "log/log_flags.c"
 
 static void
 log_test(void)
@@ -64,10 +64,10 @@ log_test(void)
 #endif
 
 	spdk_log_open();
-	spdk_log_set_trace_flag("debug");
+	spdk_log_set_trace_flag("log");
 	SPDK_WARNLOG("log warning unit test\n");
-	SPDK_DEBUGLOG(SPDK_TRACE_LOG, "log trace test\n");
-	SPDK_TRACEDUMP(SPDK_TRACE_LOG, "log trace dump test:", "trace dump", 10);
+	SPDK_DEBUGLOG(SPDK_LOG_LOG, "log trace test\n");
+	SPDK_TRACEDUMP(SPDK_LOG_LOG, "log trace dump test:", "trace dump", 10);
 	spdk_trace_dump(stderr, "spdk dump test:", "spdk dump", 9);
 
 	spdk_log_close();

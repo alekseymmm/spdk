@@ -37,7 +37,6 @@ include $(SPDK_ROOT_DIR)/CONFIG
 
 -include $(SPDK_ROOT_DIR)/mk/cc.mk
 
-C_OPT ?= -fno-omit-frame-pointer
 ifneq ($(V),1)
 Q ?= @
 endif
@@ -49,6 +48,7 @@ ifneq ($(prefix),)
 CONFIG_PREFIX=$(prefix)
 endif
 
+bindir?=$(CONFIG_PREFIX)/bin
 libdir?=$(CONFIG_PREFIX)/lib
 includedir?=$(CONFIG_PREFIX)/include
 
@@ -114,14 +114,45 @@ LIBS += -L/usr/local/lib
 COMMON_CFLAGS += -I/usr/local/include
 endif
 
-# Attach only if NVML lib specified with configure
-ifneq ($(CONFIG_NVML_DIR),)
-LIBS += -L$(CONFIG_NVML_DIR)/src/nondebug
-COMMON_CFLAGS += -I$(CONFIG_NVML_DIR)/src/include
+# Attach only if PMDK lib specified with configure
+ifneq ($(CONFIG_PMDK_DIR),)
+LIBS += -L$(CONFIG_PMDK_DIR)/src/nondebug
+COMMON_CFLAGS += -I$(CONFIG_PMDK_DIR)/src/include
+endif
+
+ifneq ($(CONFIG_VPP_DIR),)
+LIBS += -L$(CONFIG_VPP_DIR)/lib64
+COMMON_CFLAGS += -I$(CONFIG_VPP_DIR)/include
+endif
+
+#Attach only if FreeBSD and RDMA is specified with configure
+ifeq ($(OS),FreeBSD)
+ifeq ($(CONFIG_RDMA),y)
+# RDMA Userspace Verbs Library
+ifneq ("$(wildcard /usr/lib/libibverbs.*)","")
+LIBS += -libverbs
+endif
+# RDMA Connection Manager Library
+ifneq ("$(wildcard /usr/lib/librdmacm.*)","")
+LIBS += -lrdmacm
+endif
+# Mellanox - MLX4 HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libmlx4.*)","")
+LIBS += -lmlx4
+endif
+# Mellanox - MLX5 HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libmlx5.*)","")
+LIBS += -lmlx5
+endif
+# Chelsio HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libcxgb4.*)","")
+LIBS += -lcxgb4
+endif
+endif
 endif
 
 ifeq ($(CONFIG_DEBUG), y)
-COMMON_CFLAGS += -DDEBUG -O0
+COMMON_CFLAGS += -DDEBUG -O0 -fno-omit-frame-pointer
 else
 COMMON_CFLAGS += -DNDEBUG -O2
 # Enable _FORTIFY_SOURCE checks - these only work when optimizations are enabled.
@@ -206,6 +237,18 @@ INSTALL_LIB=\
 	$(Q)echo "  INSTALL $(DESTDIR)$(libdir)/$(notdir $(LIB))"; \
 	install -d -m 755 "$(DESTDIR)$(libdir)"; \
 	install -m 644 "$(LIB)" "$(DESTDIR)$(libdir)/"
+
+# Install a shared library
+INSTALL_SHARED_LIB=\
+	$(Q)echo "  INSTALL $(DESTDIR)$(libdir)/$(notdir $(SHARED_LIB))"; \
+	install -d -m 755 "$(DESTDIR)$(libdir)"; \
+	install -m 644 "$(SHARED_LIB)" "$(DESTDIR)$(libdir)/"
+
+# Install an app binary
+INSTALL_APP=\
+	$(Q)echo "  INSTALL $(DESTDIR)$(bindir)/$(APP)"; \
+	install -d -m 755 "$(DESTDIR)$(bindir)"; \
+	install -m 755 "$(APP)" "$(DESTDIR)$(bindir)/"
 
 # Install a header
 INSTALL_HEADER=\

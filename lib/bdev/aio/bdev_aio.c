@@ -39,9 +39,10 @@
 #include "spdk/conf.h"
 #include "spdk/env.h"
 #include "spdk/fd.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/util.h"
+#include "spdk/string.h"
 
 #include "spdk_internal/log.h"
 
@@ -58,8 +59,16 @@ bdev_aio_get_ctx_size(void)
 	return sizeof(struct bdev_aio_task);
 }
 
-SPDK_BDEV_MODULE_REGISTER(aio, bdev_aio_initialize, NULL, bdev_aio_get_spdk_running_config,
-			  bdev_aio_get_ctx_size, NULL)
+static struct spdk_bdev_module aio_if = {
+	.name		= "aio",
+	.module_init	= bdev_aio_initialize,
+	.module_fini	= NULL,
+	.config_text	= bdev_aio_get_spdk_running_config,
+	.get_ctx_size	= bdev_aio_get_ctx_size,
+	.examine	= NULL,
+};
+
+SPDK_BDEV_MODULE_REGISTER(&aio_if)
 
 static int
 bdev_aio_open(struct file_disk *disk)
@@ -71,7 +80,8 @@ bdev_aio_open(struct file_disk *disk)
 		/* Try without O_DIRECT for non-disk files */
 		fd = open(disk->filename, O_RDWR);
 		if (fd < 0) {
-			perror("open");
+			SPDK_ERRLOG("open() failed (file:%s), errno %d: %s\n",
+				    disk->filename, errno, spdk_strerror(errno));
 			disk->fd = -1;
 			return -1;
 		}
@@ -93,7 +103,8 @@ bdev_aio_close(struct file_disk *disk)
 
 	rc = close(disk->fd);
 	if (rc < 0) {
-		perror("close");
+		SPDK_ERRLOG("close() failed (fd=%d), errno %d: %s\n",
+			    disk->fd, errno, spdk_strerror(errno));
 		return -1;
 	}
 
@@ -115,20 +126,20 @@ bdev_aio_readv(struct file_disk *fdisk, struct spdk_io_channel *ch,
 	iocb->data = aio_task;
 	aio_task->len = nbytes;
 
-	SPDK_DEBUGLOG(SPDK_TRACE_AIO, "read %d iovs size %lu to off: %#lx\n",
+	SPDK_DEBUGLOG(SPDK_LOG_AIO, "read %d iovs size %lu to off: %#lx\n",
 		      iovcnt, nbytes, offset);
 
 	rc = io_submit(aio_ch->io_ctx, 1, &iocb);
 	if (rc < 0) {
-		if (rc == EAGAIN) {
+		if (rc == -EAGAIN) {
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_FAILED);
+			SPDK_ERRLOG("%s: io_submit returned %d\n", __func__, rc);
 		}
-		SPDK_ERRLOG("%s: io_submit returned %d\n", __func__, rc);
 		return -1;
 	}
-
+	aio_ch->io_inflight++;
 	return nbytes;
 }
 
@@ -145,26 +156,25 @@ bdev_aio_writev(struct file_disk *fdisk, struct spdk_io_channel *ch,
 	iocb->data = aio_task;
 	aio_task->len = len;
 
-	SPDK_DEBUGLOG(SPDK_TRACE_AIO, "write %d iovs size %lu from off: %#lx\n",
+	SPDK_DEBUGLOG(SPDK_LOG_AIO, "write %d iovs size %lu from off: %#lx\n",
 		      iovcnt, len, offset);
 
 	rc = io_submit(aio_ch->io_ctx, 1, &iocb);
 	if (rc < 0) {
-		if (rc == EAGAIN) {
+		if (rc == -EAGAIN) {
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_FAILED);
+			SPDK_ERRLOG("%s: io_submit returned %d\n", __func__, rc);
 		}
-		SPDK_ERRLOG("%s: io_submit returned %d\n", __func__, rc);
 		return -1;
 	}
-
+	aio_ch->io_inflight++;
 	return len;
 }
 
 static void
-bdev_aio_flush(struct file_disk *fdisk, struct bdev_aio_task *aio_task,
-	       uint64_t offset, uint64_t nbytes)
+bdev_aio_flush(struct file_disk *fdisk, struct bdev_aio_task *aio_task)
 {
 	int rc = fsync(fdisk->fd);
 
@@ -198,7 +208,7 @@ bdev_aio_initialize_io_channel(struct bdev_aio_io_channel *ch)
 	return 0;
 }
 
-static void
+static int
 bdev_aio_poll(void *arg)
 {
 	struct bdev_aio_io_channel *ch = arg;
@@ -216,7 +226,7 @@ bdev_aio_poll(void *arg)
 
 	if (nr < 0) {
 		SPDK_ERRLOG("%s: io_getevents returned %d\n", __func__, nr);
-		return;
+		return -1;
 	}
 
 	for (i = 0; i < nr; i++) {
@@ -228,13 +238,64 @@ bdev_aio_poll(void *arg)
 		}
 
 		spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), status);
+		ch->io_inflight--;
 	}
+
+	return nr;
+}
+
+static void
+_bdev_aio_get_io_inflight(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct bdev_aio_io_channel *aio_ch = spdk_io_channel_get_ctx(ch);
+
+	if (aio_ch->io_inflight) {
+		spdk_for_each_channel_continue(i, -1);
+		return;
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static int bdev_aio_reset_retry_timer(void *arg);
+
+static void
+_bdev_aio_get_io_inflight_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct file_disk *fdisk = spdk_io_channel_iter_get_ctx(i);
+
+	if (status == -1) {
+		fdisk->reset_retry_timer = spdk_poller_register(bdev_aio_reset_retry_timer, fdisk, 500);
+		return;
+	}
+
+	spdk_bdev_io_complete(spdk_bdev_io_from_ctx(fdisk->reset_task), SPDK_BDEV_IO_STATUS_SUCCESS);
+}
+
+static int
+bdev_aio_reset_retry_timer(void *arg)
+{
+	struct file_disk *fdisk = arg;
+
+	if (fdisk->reset_retry_timer) {
+		spdk_poller_unregister(&fdisk->reset_retry_timer);
+	}
+
+	spdk_for_each_channel(fdisk,
+			      _bdev_aio_get_io_inflight,
+			      fdisk,
+			      _bdev_aio_get_io_inflight_done);
+
+	return -1;
 }
 
 static void
 bdev_aio_reset(struct file_disk *fdisk, struct bdev_aio_task *aio_task)
 {
-	spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_SUCCESS);
+	fdisk->reset_task = aio_task;
+
+	bdev_aio_reset_retry_timer(fdisk);
 }
 
 static void bdev_aio_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
@@ -267,9 +328,7 @@ static int _bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev
 		return 0;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		bdev_aio_flush((struct file_disk *)bdev_io->bdev->ctxt,
-			       (struct bdev_aio_task *)bdev_io->driver_ctx,
-			       bdev_io->u.bdev.offset_blocks * bdev_io->bdev->blocklen,
-			       bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+			       (struct bdev_aio_task *)bdev_io->driver_ctx);
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -330,12 +389,12 @@ bdev_aio_get_io_channel(void *ctx)
 {
 	struct file_disk *fdisk = ctx;
 
-	return spdk_get_io_channel(&fdisk->fd);
+	return spdk_get_io_channel(fdisk);
 }
 
 
 static int
-bdev_aio_dump_config_json(void *ctx, struct spdk_json_write_ctx *w)
+bdev_aio_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct file_disk *fdisk = ctx;
 
@@ -350,18 +409,40 @@ bdev_aio_dump_config_json(void *ctx, struct spdk_json_write_ctx *w)
 	return 0;
 }
 
+static void
+bdev_aio_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	struct file_disk *fdisk = bdev->ctxt;
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_aio_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	if (fdisk->block_size_override) {
+		spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+	}
+	spdk_json_write_named_string(w, "filename", fdisk->filename);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
+
 static const struct spdk_bdev_fn_table aio_fn_table = {
 	.destruct		= bdev_aio_destruct,
 	.submit_request		= bdev_aio_submit_request,
 	.io_type_supported	= bdev_aio_io_type_supported,
 	.get_io_channel		= bdev_aio_get_io_channel,
-	.dump_config_json	= bdev_aio_dump_config_json,
+	.dump_info_json		= bdev_aio_dump_info_json,
+	.write_config_json	= bdev_aio_write_json_config,
 };
 
 static void aio_free_disk(struct file_disk *fdisk)
 {
-	if (fdisk == NULL)
+	if (fdisk == NULL) {
 		return;
+	}
 	free(fdisk->filename);
 	free(fdisk->disk.name);
 	free(fdisk);
@@ -375,7 +456,7 @@ create_aio_disk(const char *name, const char *filename, uint32_t block_size)
 	uint64_t disk_size;
 	int rc;
 
-	fdisk = calloc(sizeof(*fdisk), 1);
+	fdisk = calloc(1, sizeof(*fdisk));
 	if (!fdisk) {
 		SPDK_ERRLOG("Unable to allocate enough memory for aio backend\n");
 		return NULL;
@@ -398,7 +479,7 @@ create_aio_disk(const char *name, const char *filename, uint32_t block_size)
 		goto error_return;
 	}
 	fdisk->disk.product_name = "AIO disk";
-	fdisk->disk.module = SPDK_GET_BDEV_MODULE(aio);
+	fdisk->disk.module = &aio_if;
 
 	fdisk->disk.need_aligned_buffer = 1;
 	fdisk->disk.write_cache = 1;
@@ -449,11 +530,11 @@ create_aio_disk(const char *name, const char *filename, uint32_t block_size)
 
 	fdisk->disk.fn_table = &aio_fn_table;
 
-	spdk_io_device_register(&fdisk->fd, bdev_aio_create_cb, bdev_aio_destroy_cb,
+	spdk_io_device_register(fdisk, bdev_aio_create_cb, bdev_aio_destroy_cb,
 				sizeof(struct bdev_aio_io_channel));
 	rc = spdk_bdev_register(&fdisk->disk);
 	if (rc) {
-		spdk_io_device_unregister(&fdisk->fd, NULL);
+		spdk_io_device_unregister(fdisk, NULL);
 		goto error_return;
 	}
 
@@ -519,10 +600,10 @@ bdev_aio_initialize(void)
 static void
 bdev_aio_get_spdk_running_config(FILE *fp)
 {
-	char 	*file;
-	char 	*name;
-	uint32_t block_size;
-	struct 	 file_disk *fdisk;
+	char			*file;
+	char			*name;
+	uint32_t		block_size;
+	struct file_disk	*fdisk;
 
 	fprintf(fp,
 		"\n"
@@ -540,11 +621,12 @@ bdev_aio_get_spdk_running_config(FILE *fp)
 		name = fdisk->disk.name;
 		block_size = fdisk->disk.blocklen;
 		fprintf(fp, "  AIO %s %s ", file, name);
-		if (fdisk->block_size_override)
+		if (fdisk->block_size_override) {
 			fprintf(fp, "%d", block_size);
+		}
 		fprintf(fp, "\n");
 	}
 	fprintf(fp, "\n");
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("aio", SPDK_TRACE_AIO)
+SPDK_LOG_REGISTER_COMPONENT("aio", SPDK_LOG_AIO)

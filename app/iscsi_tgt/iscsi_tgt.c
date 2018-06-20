@@ -45,9 +45,9 @@ static void
 spdk_sigusr1(int signo __attribute__((__unused__)))
 {
 	char *config_str = NULL;
-	if (spdk_app_get_running_config(&config_str, "iscsi.conf") < 0)
+	if (spdk_app_get_running_config(&config_str, "iscsi.conf") < 0) {
 		fprintf(stderr, "Error getting config\n");
-	else {
+	} else {
 		fprintf(stdout, "============================\n");
 		fprintf(stdout, " iSCSI target running config\n");
 		fprintf(stdout, "=============================\n");
@@ -93,7 +93,11 @@ main(int argc, char **argv)
 	spdk_app_opts_init(&opts);
 	opts.config_file = SPDK_ISCSI_DEFAULT_CONFIG;
 	opts.name = "iscsi";
-	spdk_app_parse_args(argc, argv, &opts, "b", iscsi_parse_arg, iscsi_usage);
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b",
+				      iscsi_parse_arg, iscsi_usage)) !=
+	    SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
 
 	if (g_daemon_mode) {
 		if (daemon(1, 0) < 0) {
@@ -105,9 +109,11 @@ main(int argc, char **argv)
 	opts.shutdown_cb = NULL;
 	opts.usr1_handler = spdk_sigusr1;
 
-	printf("Using net framework %s\n", spdk_net_framework_get_name());
 	/* Blocks until the application is exiting */
 	rc = spdk_app_start(&opts, spdk_startup, NULL, NULL);
+	if (rc) {
+		SPDK_ERRLOG("Start iscsi target daemon:  spdk_app_start() retn non-zero\n");
+	}
 
 	spdk_app_fini();
 

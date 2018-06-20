@@ -53,11 +53,11 @@ extern struct rte_pci_bus rte_pci_bus;
 #endif
 #include <rte_dev.h>
 
-/* x86-64 userspace virtual addresses use only the low 47 bits [0..46],
- * which is enough to cover 128 TB.
+/* x86-64 and ARM userspace virtual addresses use only the low 48 bits [0..47],
+ * which is enough to cover 256 TB.
  */
-#define SHIFT_128TB	47 /* (1 << 47) == 128 TB */
-#define MASK_128TB	((1ULL << SHIFT_128TB) - 1)
+#define SHIFT_256TB	48 /* (1 << 48) == 256 TB */
+#define MASK_256TB	((1ULL << SHIFT_256TB) - 1)
 
 #define SHIFT_1GB	30 /* (1 << 30) == 1 GB */
 #define MASK_1GB	((1ULL << SHIFT_1GB) - 1)
@@ -72,7 +72,7 @@ extern struct rte_pci_bus rte_pci_bus;
 struct spdk_pci_enum_ctx {
 	struct rte_pci_driver	driver;
 	spdk_pci_enum_cb	cb_fn;
-	void 			*cb_arg;
+	void			*cb_arg;
 	pthread_mutex_t		mtx;
 	bool			is_registered;
 };
@@ -84,7 +84,21 @@ int spdk_pci_enumerate(struct spdk_pci_enum_ctx *ctx, spdk_pci_enum_cb enum_cb, 
 int spdk_pci_device_attach(struct spdk_pci_enum_ctx *ctx, spdk_pci_enum_cb enum_cb, void *enum_ctx,
 			   struct spdk_pci_addr *pci_address);
 
-void spdk_mem_map_init(void);
-void spdk_vtophys_init(void);
+int spdk_mem_map_init(void);
+int spdk_vtophys_init(void);
+
+/**
+ * Report a DMA-capable PCI device to the vtophys translation code.
+ * Increases the refcount of active DMA-capable devices managed by SPDK.
+ * This must be called after a `rte_pci_device` is created.
+ */
+void spdk_vtophys_pci_device_added(struct rte_pci_device *pci_device);
+
+/**
+ * Report the removal of a DMA-capable PCI device to the vtophys translation code.
+ * Decreases the refcount of active DMA-capable devices managed by SPDK.
+ * This must be called before a `rte_pci_device` is destroyed.
+ */
+void spdk_vtophys_pci_device_removed(struct rte_pci_device *pci_device);
 
 #endif

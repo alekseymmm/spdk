@@ -35,10 +35,10 @@
 
 #include "spdk/blob_bdev.h"
 #include "spdk/blob.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/log.h"
 #include "spdk/endian.h"
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 
 struct blob_bdev {
 	struct spdk_bs_dev	bs_dev;
@@ -140,17 +140,27 @@ static void
 bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t lba,
 		uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
+	struct blob_bdev *blob_bdev = (struct blob_bdev *)dev;
 	int rc;
 
-	rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, lba, lba_count,
-				    bdev_blob_io_complete, cb_args);
-	if (rc) {
-		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	if (spdk_bdev_io_type_supported(blob_bdev->bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
+		rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, lba, lba_count,
+					    bdev_blob_io_complete, cb_args);
+		if (rc) {
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+		}
+	} else {
+		/*
+		 * If the device doesn't support unmap, immediately complete
+		 * the request. Blobstore does not rely on unmap zeroing
+		 * data.
+		 */
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
 	}
 }
 
 int
-spdk_bs_bdev_claim(struct spdk_bs_dev *bs_dev, struct spdk_bdev_module_if *module)
+spdk_bs_bdev_claim(struct spdk_bs_dev *bs_dev, struct spdk_bdev_module *module)
 {
 	struct blob_bdev *blob_bdev = (struct blob_bdev *)bs_dev;
 	int rc;
@@ -226,18 +236,7 @@ spdk_bdev_create_bs_dev(struct spdk_bdev *bdev, spdk_bdev_remove_cb_t remove_cb,
 	b->bs_dev.readv = bdev_blob_readv;
 	b->bs_dev.writev = bdev_blob_writev;
 	b->bs_dev.write_zeroes = bdev_blob_write_zeroes;
-	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-		b->bs_dev.unmap = bdev_blob_unmap;
-	} else {
-		/*
-		 * If bdev doesn't support unmap, use write_zeroes as a fallback.
-		 * This will always work, since bdev implements write_zeroes on top of write
-		 * if the device doesn't natively support write_zeroes.
-		 */
-		SPDK_NOTICELOG("Bdev %s does not support unmap, write_zeroes will be used instead.\n",
-			       bdev->name);
-		b->bs_dev.unmap = bdev_blob_write_zeroes;
-	}
+	b->bs_dev.unmap = bdev_blob_unmap;
 
 	return &b->bs_dev;
 }

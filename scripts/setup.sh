@@ -3,16 +3,82 @@
 set -e
 
 rootdir=$(readlink -f $(dirname $0))/..
+source "$rootdir/scripts/common.sh"
 
-function linux_iter_pci_class_code {
-	# Argument is the class code
-	lspci -mm -n -D | awk -v cc="\"$1\"" -F " " '{if (cc ~ $2) print $1}' | tr -d '"'
+function usage()
+{
+	if [ `uname` = Linux ]; then
+		options="[config|reset|status|help]"
+	else
+		options="[config|reset|help]"
+	fi
+
+	[[ ! -z $2 ]] && ( echo "$2"; echo ""; )
+	echo "Helper script for allocating hugepages and binding NVMe, I/OAT and Virtio devices to"
+	echo "a generic VFIO kernel driver. If VFIO is not available on the system, this script will"
+	echo "fall back to UIO. NVMe and Virtio devices with active mountpoints will be ignored."
+	echo "All hugepage operations use default hugepage size on the system (hugepagesz)."
+	echo "Usage: $(basename $1) $options"
+	echo
+	echo "$options - as following:"
+	echo "config            Default mode. Allocate hugepages and bind PCI devices."
+	echo "reset             Rebind PCI devices back to their original drivers."
+	echo "                  Also cleanup any leftover spdk files/resources."
+	echo "                  Hugepage memory size will remain unchanged."
+	if [ `uname` = Linux ]; then
+		echo "status            Print status of all SPDK-compatible devices on the system."
+	fi
+	echo "help              Print this help message."
+	echo
+	echo "The following environment variables can be specified."
+	echo "HUGEMEM           Size of hugepage memory to allocate (in MB). 2048 by default."
+	echo "                  For NUMA systems, the hugepages will be evenly distributed"
+	echo "                  between CPU nodes"
+	echo "NRHUGE            Number of hugepages to allocate. This variable overwrites HUGEMEM."
+	echo "HUGENODE          Specific NUMA node to allocate hugepages on. To allocate"
+	echo "                  hugepages on multiple nodes run this script multiple times -"
+	echo "                  once for each node."
+	echo "PCI_WHITELIST     Whitespace separated list of PCI devices (NVMe, I/OAT, Virtio) to bind."
+	echo "                  Each device must be specified as a full PCI address."
+	echo "                  E.g. PCI_WHITELIST=\"0000:01:00.0 0000:02:00.0\""
+	echo "                  To blacklist all PCI devices use a non-valid address."
+	echo "                  E.g. PCI_WHITELIST=\"none\""
+	echo "                  If empty or unset, all PCI devices will be bound."
+	echo "TARGET_USER       User that will own hugepage mountpoint directory and vfio groups."
+	echo "                  By default the current user will be used."
+	exit 0
 }
 
-function linux_iter_pci_dev_id {
-	# Argument 1 is the vendor id
-	# Argument 2 is the device id
-	lspci -mm -n -D | awk -v ven="\"$1\"" -v dev="\"$2\"" -F " " '{if (ven ~ $3 && dev ~ $4) print $1}' | tr -d '"'
+# In monolithic kernels the lsmod won't work. So
+# back that with a /sys/modules check. Return a different code for
+# built-in vs module just in case we want that down the road.
+function check_for_driver {
+	$(lsmod | grep $1 > /dev/null)
+	if [ $? -eq 0 ]; then
+		return 1
+	else
+		if [[ -d /sys/module/$1 ]]; then
+			return 2
+		else
+			return 0
+		fi
+	fi
+	return 0
+}
+
+function pci_can_bind() {
+	if [[ ${#PCI_WHITELIST[@]} == 0 ]]; then
+		#no whitelist specified, bind all devices
+		return 1
+	fi
+
+	for i in ${PCI_WHITELIST[@]}
+	do
+		if [ "$i" == "$1" ] ; then
+			 return 1
+		fi
+	done
+	return 0
 }
 
 function linux_bind_driver() {
@@ -39,8 +105,8 @@ function linux_bind_driver() {
 
 	iommu_group=$(basename $(readlink -f /sys/bus/pci/devices/$bdf/iommu_group))
 	if [ -e "/dev/vfio/$iommu_group" ]; then
-		if [ "$username" != "" ]; then
-			chown "$username" "/dev/vfio/$iommu_group"
+		if [ -n "$TARGET_USER" ]; then
+			chown "$TARGET_USER" "/dev/vfio/$iommu_group"
 		fi
 	fi
 }
@@ -60,7 +126,7 @@ function linux_unbind_driver() {
 	echo "$bdf ($ven_dev_id): $old_driver_name -> no driver"
 }
 
-function linux_hugetlbfs_mount() {
+function linux_hugetlbfs_mounts() {
 	mount | grep ' type hugetlbfs ' | awk '{ print $3 }'
 }
 
@@ -69,12 +135,29 @@ function get_nvme_name_from_bdf {
 	nvme_devs=`lsblk -d --output NAME | grep "^nvme"`
 	set -e
 	for dev in $nvme_devs; do
-		bdf=$(basename $(readlink /sys/block/$dev/device/device))
-		if [ "$bdf" = "$1" ]; then
+		link_name=$(readlink /sys/block/$dev/device/device) || true
+		if [ -z "$link_name" ]; then
+			link_name=$(readlink /sys/block/$dev/device)
+		fi
+		link_bdf=$(basename "$link_name")
+		if [ "$link_bdf" = "$1" ]; then
 			eval "$2=$dev"
 			return
 		fi
 	done
+}
+
+function get_virtio_names_from_bdf {
+	blk_devs=`lsblk --nodeps --output NAME`
+	virtio_names=''
+
+	for dev in $blk_devs; do
+		if readlink "/sys/block/$dev" | grep -q "$1"; then
+			virtio_names="$virtio_names $dev"
+		fi
+	done
+
+	eval "$2='$virtio_names'"
 }
 
 function configure_linux_pci {
@@ -86,9 +169,13 @@ function configure_linux_pci {
 
 	# NVMe
 	modprobe $driver_name || true
-	for bdf in $(linux_iter_pci_class_code 0108); do
+	for bdf in $(iter_pci_class_code 01 08 02); do
 		blkname=''
 		get_nvme_name_from_bdf "$bdf" blkname
+		if pci_can_bind $bdf == "0" ; then
+			echo "Skipping un-whitelisted NVMe controller $blkname ($bdf)"
+			continue
+		fi
 		if [ "$blkname" != "" ]; then
 			mountpoints=$(lsblk /dev/$blkname --output MOUNTPOINT -n | wc -w)
 		else
@@ -108,20 +195,37 @@ function configure_linux_pci {
 	| awk -F"x" '{print $2}' > $TMP
 
 	for dev_id in `cat $TMP`; do
-		for bdf in $(linux_iter_pci_dev_id 8086 $dev_id); do
+		for bdf in $(iter_pci_dev_id 8086 $dev_id); do
+			if pci_can_bind $bdf == "0" ; then
+				echo "Skipping un-whitelisted I/OAT device at $bdf"
+				continue
+			fi
 			linux_bind_driver "$bdf" "$driver_name"
 		done
 	done
 	rm $TMP
 
-	# virtio-scsi
+	# virtio
 	TMP=`mktemp`
-	#collect all the device_id info of virtio-scsi devices.
-	grep "PCI_DEVICE_ID_VIRTIO_SCSI" $rootdir/include/spdk/pci_ids.h \
+	#collect all the device_id info of virtio devices.
+	grep "PCI_DEVICE_ID_VIRTIO" $rootdir/include/spdk/pci_ids.h \
 	| awk -F"x" '{print $2}' > $TMP
 
 	for dev_id in `cat $TMP`; do
-		for bdf in $(linux_iter_pci_dev_id 1af4 $dev_id); do
+		for bdf in $(iter_pci_dev_id 1af4 $dev_id); do
+			if pci_can_bind $bdf == "0" ; then
+				echo "Skipping un-whitelisted Virtio device at $bdf"
+				continue
+			fi
+			blknames=''
+			get_virtio_names_from_bdf "$bdf" blknames
+			for blkname in $blknames; do
+				if mount | grep -q "/dev/$blkname"; then
+					echo Active mountpoints on /dev/$blkname, so not binding PCI dev $bdf
+					continue 2
+				fi
+			done
+
 			linux_bind_driver "$bdf" "$driver_name"
 		done
 	done
@@ -131,17 +235,14 @@ function configure_linux_pci {
 }
 
 function configure_linux {
-	if [ "$SKIP_PCI" == 0 ]; then
-		configure_linux_pci
-	fi
+	configure_linux_pci
+	hugetlbfs_mounts=$(linux_hugetlbfs_mounts)
 
-	hugetlbfs_mount=$(linux_hugetlbfs_mount)
-
-	if [ -z "$hugetlbfs_mount" ]; then
-		hugetlbfs_mount=/mnt/huge
-		echo "Mounting hugetlbfs at $hugetlbfs_mount"
-		mkdir -p "$hugetlbfs_mount"
-		mount -t hugetlbfs nodev "$hugetlbfs_mount"
+	if [ -z "$hugetlbfs_mounts" ]; then
+		hugetlbfs_mounts=/mnt/huge
+		echo "Mounting hugetlbfs at $hugetlbfs_mounts"
+		mkdir -p "$hugetlbfs_mounts"
+		mount -t hugetlbfs nodev "$hugetlbfs_mounts"
 	fi
 
 	if [ -z "$HUGENODE" ]; then
@@ -160,9 +261,11 @@ function configure_linux {
 	fi
 
 	if [ "$driver_name" = "vfio-pci" ]; then
-		if [ "$username" != "" ]; then
-			chown "$username" "$hugetlbfs_mount"
-			chmod g+w "$hugetlbfs_mount"
+		if [ -n "$TARGET_USER" ]; then
+			for mount in $hugetlbfs_mounts; do
+				chown "$TARGET_USER" "$mount"
+				chmod g+w "$mount"
+			done
 		fi
 
 		MEMLOCK_AMNT=`ulimit -l`
@@ -189,11 +292,15 @@ function configure_linux {
 function reset_linux_pci {
 	# NVMe
 	set +e
-	lsmod | grep nvme > /dev/null
+	check_for_driver nvme
 	driver_loaded=$?
 	set -e
-	for bdf in $(linux_iter_pci_class_code 0108); do
-		if [ $driver_loaded -eq 0 ]; then
+	for bdf in $(iter_pci_class_code 01 08 02); do
+		if pci_can_bind $bdf == "0" ; then
+			echo "Skipping un-whitelisted NVMe controller $blkname ($bdf)"
+			continue
+		fi
+		if [ $driver_loaded -ne 0 ]; then
 			linux_bind_driver "$bdf" nvme
 		else
 			linux_unbind_driver "$bdf"
@@ -207,12 +314,16 @@ function reset_linux_pci {
 	| awk -F"x" '{print $2}' > $TMP
 
 	set +e
-	lsmod | grep ioatdma > /dev/null
+	check_for_driver ioatdma
 	driver_loaded=$?
 	set -e
 	for dev_id in `cat $TMP`; do
-		for bdf in $(linux_iter_pci_dev_id 8086 $dev_id); do
-			if [ $driver_loaded -eq 0 ]; then
+		for bdf in $(iter_pci_dev_id 8086 $dev_id); do
+			if pci_can_bind $bdf == "0" ; then
+				echo "Skipping un-whitelisted I/OAT device at $bdf"
+				continue
+			fi
+			if [ $driver_loaded -ne 0 ]; then
 				linux_bind_driver "$bdf" ioatdma
 			else
 				linux_unbind_driver "$bdf"
@@ -221,10 +332,10 @@ function reset_linux_pci {
 	done
 	rm $TMP
 
-	# virtio-scsi
+	# virtio
 	TMP=`mktemp`
-	#collect all the device_id info of virtio-scsi devices.
-	grep "PCI_DEVICE_ID_VIRTIO_SCSI" $rootdir/include/spdk/pci_ids.h \
+	#collect all the device_id info of virtio devices.
+	grep "PCI_DEVICE_ID_VIRTIO" $rootdir/include/spdk/pci_ids.h \
 	| awk -F"x" '{print $2}' > $TMP
 
 	# TODO: check if virtio-pci is loaded first and just unbind if it is not loaded
@@ -233,7 +344,11 @@ function reset_linux_pci {
 	#  underscore vs. dash right in the virtio_scsi name.
 	modprobe virtio-pci || true
 	for dev_id in `cat $TMP`; do
-		for bdf in $(linux_iter_pci_dev_id 1af4 $dev_id); do
+		for bdf in $(iter_pci_dev_id 1af4 $dev_id); do
+			if pci_can_bind $bdf == "0" ; then
+				echo "Skipping un-whitelisted Virtio device at $bdf"
+				continue
+			fi
 			linux_bind_driver "$bdf" virtio-pci
 		done
 	done
@@ -243,23 +358,50 @@ function reset_linux_pci {
 }
 
 function reset_linux {
-	if [ "$SKIP_PCI" == 0 ]; then
-		reset_linux_pci
-	fi
-
-	hugetlbfs_mount=$(linux_hugetlbfs_mount)
-	rm -f "$hugetlbfs_mount"/spdk*map_*
+	reset_linux_pci
+	for mount in $(linux_hugetlbfs_mounts); do
+		rm -f "$mount"/spdk*map_*
+	done
 	rm -f /run/.spdk*
 }
 
 function status_linux {
+	echo "Hugepages"
+	printf "%-6s %10s %8s / %6s\n" "node" "hugesize"  "free" "total"
+
+	numa_nodes=0
+	shopt -s nullglob
+	for path in /sys/devices/system/node/node?/hugepages/hugepages-*/; do
+		numa_nodes=$((numa_nodes + 1))
+		free_pages=`cat $path/free_hugepages`
+		all_pages=`cat $path/nr_hugepages`
+
+		[[ $path =~ (node[0-9]+)/hugepages/hugepages-([0-9]+kB) ]]
+
+		node=${BASH_REMATCH[1]}
+		huge_size=${BASH_REMATCH[2]}
+
+		printf "%-6s %10s %8s / %6s\n" $node $huge_size $free_pages $all_pages
+	done
+	shopt -u nullglob
+
+	# fall back to system-wide hugepages
+	if [ "$numa_nodes" = "0" ]; then
+		free_pages=`grep HugePages_Free /proc/meminfo | awk '{ print $2 }'`
+		all_pages=`grep HugePages_Total /proc/meminfo | awk '{ print $2 }'`
+		node="-"
+		huge_size="$HUGEPGSZ"
+
+		printf "%-6s %10s %8s / %6s\n" $node $huge_size $free_pages $all_pages
+	fi
+
 	echo "NVMe devices"
 
 	echo -e "BDF\t\tNuma Node\tDriver name\t\tDevice name"
-	for bdf in $(linux_iter_pci_class_code 0108); do
+	for bdf in $(iter_pci_class_code 01 08 02); do
 		driver=`grep DRIVER /sys/bus/pci/devices/$bdf/uevent |awk -F"=" '{print $2}'`
 		node=`cat /sys/bus/pci/devices/$bdf/numa_node`;
-		if [ "$driver" = "nvme" ]; then
+		if [ "$driver" = "nvme" -a -d /sys/bus/pci/devices/$bdf/nvme ]; then
 			name="\t"`ls /sys/bus/pci/devices/$bdf/nvme`;
 		else
 			name="-";
@@ -274,7 +416,7 @@ function status_linux {
 	| awk -F"x" '{print $2}'`
 	echo -e "BDF\t\tNuma Node\tDriver Name"
 	for dev_id in $TMP; do
-		for bdf in $(linux_iter_pci_dev_id 8086 $dev_id); do
+		for bdf in $(iter_pci_dev_id 8086 $dev_id); do
 			driver=`grep DRIVER /sys/bus/pci/devices/$bdf/uevent |awk -F"=" '{print $2}'`
 			node=`cat /sys/bus/pci/devices/$bdf/numa_node`;
 			echo -e "$bdf\t$node\t\t$driver"
@@ -283,15 +425,17 @@ function status_linux {
 
 	echo "virtio"
 
-	#collect all the device_id info of virtio-scsi devices.
-	TMP=`grep "PCI_DEVICE_ID_VIRTIO_SCSI" $rootdir/include/spdk/pci_ids.h \
+	#collect all the device_id info of virtio devices.
+	TMP=`grep "PCI_DEVICE_ID_VIRTIO" $rootdir/include/spdk/pci_ids.h \
 	| awk -F"x" '{print $2}'`
-	echo -e "BDF\t\tNuma Node\tDriver Name"
+	echo -e "BDF\t\tNuma Node\tDriver Name\t\tDevice Name"
 	for dev_id in $TMP; do
-		for bdf in $(linux_iter_pci_dev_id 1af4 $dev_id); do
+		for bdf in $(iter_pci_dev_id 1af4 $dev_id); do
 			driver=`grep DRIVER /sys/bus/pci/devices/$bdf/uevent |awk -F"=" '{print $2}'`
 			node=`cat /sys/bus/pci/devices/$bdf/numa_node`;
-			echo -e "$bdf\t$node\t\t$driver"
+			blknames=''
+			get_virtio_names_from_bdf "$bdf" blknames
+			echo -e "$bdf\t$node\t\t$driver\t\t$blknames"
 		done
 	done
 }
@@ -321,45 +465,51 @@ function configure_freebsd_pci {
 }
 
 function configure_freebsd {
-	if [ "$SKIP_PCI" == 0 ]; then
-		configure_freebsd_pci
+	configure_freebsd_pci
+	# If contigmem is already loaded but the HUGEMEM specified doesn't match the
+	#  previous value, unload contigmem so that we can reload with the new value.
+	if kldstat -q -m contigmem; then
+		if [ `kenv hw.contigmem.num_buffers` -ne "$((HUGEMEM / 256))" ]; then
+			kldunload contigmem.ko
+		fi
 	fi
-
-	kldunload contigmem.ko || true
-	kenv hw.contigmem.num_buffers=$((HUGEMEM / 256))
-	kenv hw.contigmem.buffer_size=$((256 * 1024 * 1024))
-	kldload contigmem.ko
+	if ! kldstat -q -m contigmem; then
+		kenv hw.contigmem.num_buffers=$((HUGEMEM / 256))
+		kenv hw.contigmem.buffer_size=$((256 * 1024 * 1024))
+		kldload contigmem.ko
+	fi
 }
 
 function reset_freebsd {
 	kldunload contigmem.ko || true
-
-	if [ "$SKIP_PCI" == 0 ]; then
-		kldunload nic_uio.ko || true
-	fi
+	kldunload nic_uio.ko || true
 }
 
-username=$1
-mode=$2
+mode=$1
 
-if [ "$username" = "reset" -o "$username" = "config" -o "$username" = "status" ]; then
-	mode="$username"
-	username=""
-fi
-
-if [ "$mode" == "" ]; then
+if [ -z "$mode" ]; then
 	mode="config"
 fi
 
-if [ "$username" = "" ]; then
-	username="$SUDO_USER"
-	if [ "$username" = "" ]; then
-		username=`logname 2>/dev/null` || true
-	fi
+: ${HUGEMEM:=2048}
+: ${PCI_WHITELIST:=""}
+
+if [ -n "$NVME_WHITELIST" ]; then
+	PCI_WHITELIST="$PCI_WHITELIST $NVME_WHITELIST"
 fi
 
-: ${HUGEMEM:=2048}
-: ${SKIP_PCI:=0}
+if [ -n "$SKIP_PCI" ]; then
+	PCI_WHITELIST="none"
+fi
+
+declare -a PCI_WHITELIST=(${PCI_WHITELIST})
+
+if [ -z "$TARGET_USER" ]; then
+	TARGET_USER="$SUDO_USER"
+	if [ -z "$TARGET_USER" ]; then
+		TARGET_USER=`logname 2>/dev/null` || true
+	fi
+fi
 
 if [ `uname` = Linux ]; then
 	HUGEPGSZ=$(( `grep Hugepagesize /proc/meminfo | cut -d : -f 2 | tr -dc '0-9'` ))
@@ -372,11 +522,19 @@ if [ `uname` = Linux ]; then
 		reset_linux
 	elif [ "$mode" == "status" ]; then
 		status_linux
+	elif [ "$mode" == "help" ]; then
+		usage $0
+	else
+		usage $0 "Invalid argument '$mode'"
 	fi
 else
 	if [ "$mode" == "config" ]; then
 		configure_freebsd
 	elif [ "$mode" == "reset" ]; then
 		reset_freebsd
+	elif [ "$mode" == "help" ]; then
+		usage $0
+	else
+		usage $0 "Invalid argument '$mode'"
 	fi
 fi

@@ -31,15 +31,17 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "spdk/thread.h"
+#include "bs_scheduler.c"
+
+
 #define DEV_BUFFER_SIZE (64 * 1024 * 1024)
 #define DEV_BUFFER_BLOCKLEN (4096)
 #define DEV_BUFFER_BLOCKCNT (DEV_BUFFER_SIZE / DEV_BUFFER_BLOCKLEN)
 uint8_t *g_dev_buffer;
 
 /* Define here for UT only. */
-struct spdk_io_channel {
-	struct spdk_thread		*thread;
-} g_io_channel;
+struct spdk_io_channel g_io_channel;
 
 static struct spdk_io_channel *
 dev_create_channel(struct spdk_bs_dev *dev)
@@ -58,6 +60,21 @@ dev_destroy(struct spdk_bs_dev *dev)
 	free(dev);
 }
 
+
+static void
+dev_complete_cb(void *arg)
+{
+	struct spdk_bs_dev_cb_args *cb_args = arg;
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+}
+
+static void
+dev_complete(void *arg)
+{
+	_bs_send_msg(dev_complete_cb, arg, NULL);
+}
+
 static void
 dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	 uint64_t lba, uint32_t lba_count,
@@ -69,7 +86,7 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 	length = lba_count * DEV_BUFFER_BLOCKLEN;
 	SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 	memcpy(payload, &g_dev_buffer[offset], length);
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
@@ -83,7 +100,7 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 	length = lba_count * DEV_BUFFER_BLOCKLEN;
 	SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 	memcpy(&g_dev_buffer[offset], payload, length);
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
@@ -117,7 +134,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		offset += iov[i].iov_len;
 	}
 
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
@@ -139,14 +156,14 @@ dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		offset += iov[i].iov_len;
 	}
 
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
 dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	  struct spdk_bs_dev_cb_args *cb_args)
 {
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
@@ -159,7 +176,8 @@ dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	offset = lba * DEV_BUFFER_BLOCKLEN;
 	length = lba_count * DEV_BUFFER_BLOCKLEN;
 	SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	memset(&g_dev_buffer[offset], 0, length);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static void
@@ -173,7 +191,7 @@ dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	length = lba_count * DEV_BUFFER_BLOCKLEN;
 	SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 	memset(&g_dev_buffer[offset], 0, length);
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
 static struct spdk_bs_dev *

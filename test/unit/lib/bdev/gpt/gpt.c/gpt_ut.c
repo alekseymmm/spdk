@@ -33,9 +33,9 @@
 
 #include "spdk_cunit.h"
 
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
 
-#include "gpt/gpt.c"
+#include "bdev/gpt/gpt.c"
 
 static void
 test_check_mbr(void)

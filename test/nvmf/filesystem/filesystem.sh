@@ -2,7 +2,7 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
 
 MALLOC_BDEV_SIZE=64
@@ -38,6 +38,9 @@ modprobe -v nvme-rdma
 $rpc_py construct_nvmf_subsystem nqn.2016-06.io.spdk:cnode1 "trtype:RDMA traddr:$NVMF_FIRST_TARGET_IP trsvcid:4420" "" -a -s SPDK00000000000001 -n "$bdevs"
 
 nvme connect -t rdma -n "nqn.2016-06.io.spdk:cnode1" -a "$NVMF_FIRST_TARGET_IP" -s "$NVMF_PORT"
+
+waitforblk "nvme0n1"
+waitforblk "nvme0n2"
 
 mkdir -p /mnt/device
 

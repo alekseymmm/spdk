@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "net_internal.h"
+
 #include "spdk/stdinc.h"
 #include "spdk/string.h"
 
@@ -46,12 +48,11 @@ static TAILQ_HEAD(, spdk_interface) g_interface_head;
 
 static pthread_mutex_t interface_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint32_t spdk_get_ifc_ipv4(void)
+static int spdk_get_ifc_ipv4(void)
 {
 	int ret;
 	int rtattrlen;
 	int netlink_fd;
-	char errbuf[64];
 	uint32_t ipv4_addr;
 
 	struct {
@@ -91,16 +92,14 @@ static uint32_t spdk_get_ifc_ipv4(void)
 	/* Send and recv the message from kernel */
 	ret = send(netlink_fd, &req, req.n.nlmsg_len, 0);
 	if (ret < 0) {
-		spdk_strerror_r(errno, errbuf, sizeof(errbuf));
-		SPDK_ERRLOG("netlink send failed: %s\n", errbuf);
+		SPDK_ERRLOG("netlink send failed: %s\n", spdk_strerror(errno));
 		ret = 1;
 		goto exit;
 	}
 
 	ret = recv(netlink_fd, buf, sizeof(buf), 0);
 	if (ret <= 0) {
-		spdk_strerror_r(errno, errbuf, sizeof(errbuf));
-		SPDK_ERRLOG("netlink recv failed: %s\n", errbuf);
+		SPDK_ERRLOG("netlink recv failed: %s\n", spdk_strerror(errno));
 		ret = 1;
 		goto exit;
 	}
@@ -157,7 +156,7 @@ exit:
 }
 
 
-static void spdk_process_new_interface_msg(struct nlmsghdr *h)
+static int spdk_process_new_interface_msg(struct nlmsghdr *h)
 {
 	int len;
 	struct spdk_interface *ifc;
@@ -169,7 +168,7 @@ static void spdk_process_new_interface_msg(struct nlmsghdr *h)
 	ifc = (struct spdk_interface *) malloc(sizeof(*ifc));
 	if (ifc == NULL) {
 		SPDK_ERRLOG("%s: Malloc failed\n", __func__);
-		exit(1);
+		return 1;
 	}
 
 	memset(ifc, 0, sizeof(*ifc));
@@ -185,7 +184,8 @@ static void spdk_process_new_interface_msg(struct nlmsghdr *h)
 		case IFLA_IFNAME:
 			if (if_indextoname(iface->ifi_index, ifc->name) == NULL) {
 				SPDK_ERRLOG("Indextoname failed!\n");
-				exit(1);
+				free(ifc);
+				return 2;
 			}
 			break;
 		default:
@@ -193,28 +193,29 @@ static void spdk_process_new_interface_msg(struct nlmsghdr *h)
 		}
 	}
 	TAILQ_INSERT_TAIL(&g_interface_head, ifc, tailq);
+	return 0;
 }
 
-static uint32_t spdk_prepare_ifc_list(void)
+static int spdk_prepare_ifc_list(void)
 {
-	uint32_t ret = 0;
+	int ret = 0;
 	struct nl_req_s {
 		struct nlmsghdr hdr;
 		struct rtgenmsg gen;
 		struct ifinfomsg ifi;
 	};
 	int netlink_fd;
-	struct sockaddr_nl local;  /* Our local (user space) side of the communication */
-	struct sockaddr_nl kernel; /* The remote (kernel space) side of the communication */
+	struct sockaddr_nl local;	/* Our local (user space) side of the communication */
+	struct sockaddr_nl kernel;	/* The remote (kernel space) side of the communication */
 
-	struct msghdr rtnl_msg;    /* Generic msghdr struct for use with sendmsg */
-	struct iovec io;	   /* IO vector for sendmsg */
+	struct msghdr rtnl_msg;		/* Generic msghdr struct for use with sendmsg */
+	struct iovec io;		/* IO vector for sendmsg */
 
-	struct nl_req_s req;       /* Structure that describes the rtnetlink packet itself */
-	char reply[16384]; 	   /* a large buffer to receive lots of link information */
+	struct nl_req_s req;		/* Structure that describes the rtnetlink packet itself */
+	char reply[16384];		/* a large buffer to receive lots of link information */
 
-	pid_t pid = getpid();	   /* Our process ID to build the correct netlink address */
-	int end = 0;		   /* some flag to end loop parsing */
+	pid_t pid = getpid();		/* Our process ID to build the correct netlink address */
+	int end = 0;			/* some flag to end loop parsing */
 
 	/*
 	 * Prepare netlink socket for kernel/user space communication
@@ -287,7 +288,10 @@ static uint32_t spdk_prepare_ifc_list(void)
 					end++;
 					break;
 				case RTM_NEWLINK:	/* This is a RTM_NEWLINK message, which contains lots of information about a link */
-					spdk_process_new_interface_msg(msg_ptr);
+					ret = spdk_process_new_interface_msg(msg_ptr);
+					if (ret != 0) {
+						goto exit;
+					}
 					break;
 				default:
 					break;
@@ -331,8 +335,9 @@ static int netlink_addr_msg(uint32_t ifc_idx, uint32_t ip_address, uint32_t crea
 	} req;
 	struct rtattr *rta;
 
-	if (spdk_interface_available(ifc_idx))
+	if (spdk_interface_available(ifc_idx)) {
 		return -1;
+	}
 
 	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (fd < 0) {
@@ -419,11 +424,15 @@ static void spdk_interface_ip_update(void)
 int
 spdk_interface_init(void)
 {
-	TAILQ_INIT(&g_interface_head);
-	spdk_prepare_ifc_list();
-	spdk_get_ifc_ipv4();
+	int rc = 0;
 
-	return 0;
+	TAILQ_INIT(&g_interface_head);
+	rc = spdk_prepare_ifc_list();
+	if (!rc) {
+		rc = spdk_get_ifc_ipv4();
+	}
+
+	return rc;
 }
 
 void

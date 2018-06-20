@@ -36,7 +36,7 @@
 #include "spdk/likely.h"
 #include "spdk/util.h"
 #include "spdk/rpc.h"
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
 #include "bdev_pmem.h"
@@ -51,15 +51,18 @@ struct pmem_disk {
 
 static TAILQ_HEAD(, pmem_disk) g_pmem_disks = TAILQ_HEAD_INITIALIZER(g_pmem_disks);
 
-static int pmem_disk_count = 0;
-
 static int bdev_pmem_initialize(void);
 static void bdev_pmem_finish(void);
 
-SPDK_BDEV_MODULE_REGISTER(pmem, bdev_pmem_initialize, bdev_pmem_finish,
-			  NULL, NULL, NULL)
-SPDK_BDEV_MODULE_ASYNC_FINI(pmem);
+static struct spdk_bdev_module pmem_if = {
+	.name = "pmem",
+	.module_init = bdev_pmem_initialize,
+	.module_fini = bdev_pmem_finish,
+	.async_fini = true,
 
+};
+
+SPDK_BDEV_MODULE_REGISTER(&pmem_if)
 
 typedef int(*spdk_bdev_pmem_io_request)(PMEMblkpool *pbp, void *buf, long long blockno);
 
@@ -130,7 +133,7 @@ bdev_pmem_submit_io(struct spdk_bdev_io *bdev_io, struct pmem_disk *pdisk,
 		goto end;
 	}
 
-	SPDK_DEBUGLOG(SPDK_TRACE_BDEV_PMEM, "io %lu bytes from offset %#lx\n",
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV_PMEM, "io %lu bytes from offset %#lx\n",
 		      num_blocks, offset_blocks);
 
 	for (nbytes = num_blocks * block_size; nbytes > 0; iov++) {
@@ -251,7 +254,7 @@ bdev_pmem_get_io_channel(void *ctx)
 }
 
 static int
-bdev_pmem_dump_config_json(void *ctx, struct spdk_json_write_ctx *w)
+bdev_pmem_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct pmem_disk *pdisk = ctx;
 
@@ -275,21 +278,46 @@ bdev_pmem_destroy_cb(void *io_device, void *ctx_buf)
 {
 }
 
+static void
+bdev_pmem_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	struct pmem_disk *disk = bdev->ctxt;
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_pmem_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	spdk_json_write_named_string(w, "pmem_file", disk->pmem_file);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
+
 static const struct spdk_bdev_fn_table pmem_fn_table = {
 	.destruct		= bdev_pmem_destruct,
 	.submit_request		= bdev_pmem_submit_request,
 	.io_type_supported	= bdev_pmem_io_type_supported,
 	.get_io_channel		= bdev_pmem_get_io_channel,
-	.dump_config_json	= bdev_pmem_dump_config_json,
+	.dump_info_json		= bdev_pmem_dump_info_json,
+	.write_config_json	= bdev_pmem_write_config_json,
 };
 
 int
-spdk_create_pmem_disk(const char *pmem_file, char *name, struct spdk_bdev **bdev)
+spdk_create_pmem_disk(const char *pmem_file, const char *name, struct spdk_bdev **bdev)
 {
 	uint64_t num_blocks;
 	uint32_t block_size;
 	struct pmem_disk *pdisk;
 	int rc;
+
+	*bdev = NULL;
+
+	if (name == NULL) {
+		SPDK_ERRLOG("Missing name parameter for spdk_create_pmem_disk()\n");
+		return EINVAL;
+	}
 
 	if (pmemblk_check(pmem_file, 0) != 1) {
 		SPDK_ERRLOG("Pool '%s' check failed: %s\n", pmem_file, pmemblk_errormsg());
@@ -325,12 +353,8 @@ spdk_create_pmem_disk(const char *pmem_file, char *name, struct spdk_bdev **bdev
 		free(pdisk);
 		return EINVAL;
 	}
-	if (name) {
-		pdisk->disk.name = spdk_sprintf_alloc("%s", name);
-	} else {
-		pdisk->disk.name = spdk_sprintf_alloc("pmem%d", pmem_disk_count);
-	}
 
+	pdisk->disk.name = strdup(name);
 	if (!pdisk->disk.name) {
 		pmemblk_close(pdisk->pool);
 		free(pdisk);
@@ -338,15 +362,13 @@ spdk_create_pmem_disk(const char *pmem_file, char *name, struct spdk_bdev **bdev
 	}
 
 	pdisk->disk.product_name = "pmemblk disk";
-	pmem_disk_count++;
-
 	pdisk->disk.write_cache = 0;
 	pdisk->disk.blocklen = block_size;
 	pdisk->disk.blockcnt = num_blocks;
 
 	pdisk->disk.ctxt = pdisk;
 	pdisk->disk.fn_table = &pmem_fn_table;
-	pdisk->disk.module = SPDK_GET_BDEV_MODULE(pmem);
+	pdisk->disk.module = &pmem_if;
 
 	rc = spdk_bdev_register(&pdisk->disk);
 	if (rc) {
@@ -363,6 +385,41 @@ spdk_create_pmem_disk(const char *pmem_file, char *name, struct spdk_bdev **bdev
 	return 0;
 }
 
+static void
+bdev_pmem_read_conf(void)
+{
+	struct spdk_conf_section *sp;
+	struct spdk_bdev *bdev;
+	const char *pmem_file;
+	const char *bdev_name;
+	int i;
+
+	sp = spdk_conf_find_section(NULL, "Pmem");
+	if (sp == NULL) {
+		return;
+	}
+
+	for (i = 0; ; i++) {
+		if (!spdk_conf_section_get_nval(sp, "Blk", i)) {
+			break;
+		}
+
+		pmem_file = spdk_conf_section_get_nmval(sp, "Blk", i, 0);
+		if (pmem_file == NULL) {
+			SPDK_ERRLOG("Pmem: missing filename\n");
+			continue;
+		}
+
+		bdev_name = spdk_conf_section_get_nmval(sp, "Blk", i, 1);
+		if (bdev_name == NULL) {
+			SPDK_ERRLOG("Pmem: missing bdev name\n");
+			continue;
+		}
+
+		spdk_create_pmem_disk(pmem_file, bdev_name, &bdev);
+	}
+}
+
 static int
 bdev_pmem_initialize(void)
 {
@@ -375,6 +432,8 @@ bdev_pmem_initialize(void)
 	}
 
 	spdk_io_device_register(&g_pmem_disks, bdev_pmem_create_cb, bdev_pmem_destroy_cb, 0);
+
+	bdev_pmem_read_conf();
 
 	return 0;
 
@@ -389,14 +448,7 @@ bdev_pmem_finish_done(void *io_device)
 static void
 bdev_pmem_finish(void)
 {
-	struct pmem_disk *pdisk, *tmp;
-
-	TAILQ_FOREACH_SAFE(pdisk, &g_pmem_disks, tailq, tmp) {
-		bdev_pmem_destruct(pdisk);
-		spdk_bdev_unregister(&pdisk->disk, NULL, NULL);
-	}
-
 	spdk_io_device_unregister(&g_pmem_disks, bdev_pmem_finish_done);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("bdev_pmem", SPDK_TRACE_BDEV_PMEM)
+SPDK_LOG_REGISTER_COMPONENT("bdev_pmem", SPDK_LOG_BDEV_PMEM)

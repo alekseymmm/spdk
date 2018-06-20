@@ -37,6 +37,7 @@
 #include "spdk/event.h"
 
 static char g_path[256];
+static bool g_unaffinitize_thread = false;
 
 static void
 bdev_svc_usage(void)
@@ -54,7 +55,9 @@ bdev_svc_start(void *arg1, void *arg2)
 	int fd;
 	int shm_id = (intptr_t)arg1;
 
-	spdk_unaffinitize_thread();
+	if (g_unaffinitize_thread) {
+		spdk_unaffinitize_thread();
+	}
 
 	snprintf(g_path, sizeof(g_path), "/var/run/spdk_bdev%d", shm_id);
 	fd = open(g_path, O_CREAT | O_EXCL | O_RDWR, S_IFREG);
@@ -85,9 +88,20 @@ main(int argc, char **argv)
 	opts.shutdown_cb = bdev_svc_shutdown;
 	opts.max_delay_us = 1000 * 1000;
 
-	rc = spdk_app_parse_args(argc, argv, &opts, "", bdev_svc_parse_arg, bdev_svc_usage);
-	if (rc) {
-		return rc;
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "",
+				      bdev_svc_parse_arg, bdev_svc_usage)) !=
+	    SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
+
+	/* User did not specify a reactor mask.  Test scripts may do this when using
+	 *  bdev_svc as a primary process to speed up nvme test programs by running
+	 *  them as secondary processes.  In that case, we will unaffinitize the thread
+	 *  in the bdev_svc_start routine, which will allow the scheduler to move this
+	 *  thread so it doesn't conflict with pinned threads in the secondary processes.
+	 */
+	if (opts.reactor_mask == NULL) {
+		g_unaffinitize_thread = true;
 	}
 
 	rc = spdk_app_start(&opts, bdev_svc_start, (void *)(intptr_t)opts.shm_id, NULL);

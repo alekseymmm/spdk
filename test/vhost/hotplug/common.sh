@@ -1,19 +1,15 @@
-#!/usr/bin/env bash
-set -e
-BASE_DIR=$(readlink -f $(dirname $0))
-[[ -z "$TEST_DIR" ]] && TEST_DIR="$(cd $BASE_DIR/../../../../ && pwd)"
-
 dry_run=false
 no_shutdown=false
 fio_bin="fio"
 fio_jobs="$BASE_DIR/fio_jobs/"
 test_type=spdk_vhost_scsi
 reuse_vms=false
-force_build=false
 vms=()
 used_vms=""
 disk_split=""
 x=""
+scsi_hot_remove_test=0
+blk_hot_remove_test=0
 
 
 function usage() {
@@ -35,8 +31,7 @@ function usage() {
     echo "                          NUM - VM number (mandatory)"
     echo "                          OS - VM os disk path (optional)"
     echo "                          DISKS - VM os test disks/devices path (virtio - optional, kernel_vhost - mandatory)"
-    echo "                          If test-type=spdk_vhost_blk then each disk can have additional size parameter, e.g."
-    echo "                          --vm=X,os.qcow,DISK_size_35G; unit can be M or G; default - 20G"
+    echo "    --scsi-hotremove-test Run scsi hotremove tests"
     exit 0
 }
 
@@ -50,6 +45,8 @@ while getopts 'xh-:' optchar; do
             fio-jobs=*) fio_jobs="${OPTARG#*=}" ;;
             test-type=*) test_type="${OPTARG#*=}" ;;
             vm=*) vms+=("${OPTARG#*=}") ;;
+            scsi-hotremove-test) scsi_hot_remove_test=1 ;;
+            blk-hotremove-test) blk_hot_remove_test=1 ;;
             *) usage $0 "Invalid argument '$OPTARG'" ;;
         esac
         ;;
@@ -66,59 +63,59 @@ tmp_attach_job=$BASE_DIR/fio_jobs/fio_attach.job.tmp
 tmp_detach_job=$BASE_DIR/fio_jobs/fio_detach.job.tmp
 . $BASE_DIR/../common/common.sh
 
-rpc_py="python $SPDK_BUILD_DIR/scripts/rpc.py "
+rpc_py="python $SPDK_BUILD_DIR/scripts/rpc.py -s $(get_vhost_dir)/rpc.sock"
 
 function print_test_fio_header() {
-    echo "==============="
-    echo ""
-    echo "INFO: Testing..."
+    notice "==============="
+    notice ""
+    notice "Testing..."
 
-    echo "INFO: Running fio jobs ..."
+    notice "Running fio jobs ..."
     if [ $# -gt 0 ]; then
         echo $1
     fi
 }
 
 function run_vhost() {
-    echo "==============="
-    echo ""
-    echo "INFO: running SPDK"
-    echo ""
-    $BASE_DIR/../common/run_vhost.sh $x --work-dir=$TEST_DIR --conf-dir=$BASE_DIR
-    echo
+    notice "==============="
+    notice ""
+    notice "running SPDK"
+    notice ""
+    spdk_vhost_run --conf-path=$BASE_DIR
+    notice ""
 }
 
 function vms_setup() {
     for vm_conf in ${vms[@]}; do
         IFS=',' read -ra conf <<< "$vm_conf"
-        setup_cmd="$BASE_DIR/../common/vm_setup.sh $x --work-dir=$TEST_DIR --test-type=$test_type"
         if [[ x"${conf[0]}" == x"" ]] || ! assert_number ${conf[0]}; then
-            echo "ERROR: invalid VM configuration syntax $vm_conf"
-            exit 1;
+            fail "invalid VM configuration syntax $vm_conf"
         fi
 
         # Sanity check if VM is not defined twice
         for vm_num in $used_vms; do
             if [[ $vm_num -eq ${conf[0]} ]]; then
-                echo "ERROR: VM$vm_num defined more than twice ( $(printf "'%s' " "${vms[@]}"))!"
-                exit 1
+                fail "VM$vm_num defined more than twice ( $(printf "'%s' " "${vms[@]}"))!"
             fi
         done
 
-        setup_cmd+=" -f ${conf[0]}"
         used_vms+=" ${conf[0]}"
-        [[ x"${conf[1]}" != x"" ]] && setup_cmd+=" --os=${conf[1]}"
-        [[ x"${conf[2]}" != x"" ]] && setup_cmd+=" --disk=${conf[2]}"
 
+        setup_cmd="vm_setup --disk-type=$test_type --force=${conf[0]}"
+        [[ x"${conf[1]}" != x"" ]] && setup_cmd+=" --os=${conf[1]}"
+        [[ x"${conf[2]}" != x"" ]] && setup_cmd+=" --disks=${conf[2]}"
         $setup_cmd
     done
 }
 
+function vm_run_with_arg() {
+    vm_run $@
+    vm_wait_for_boot 600 $@
+}
+
 function vms_setup_and_run() {
     vms_setup
-    # Run everything
-    $BASE_DIR/../common/vm_run.sh $x --work-dir=$TEST_DIR $used_vms
-    vm_wait_for_boot 600 $used_vms
+    vm_run_with_arg $@
 }
 
 function vms_prepare() {
@@ -128,47 +125,106 @@ function vms_prepare() {
         qemu_mask_param="VM_${vm_num}_qemu_mask"
 
         host_name="VM-${vm_num}-${!qemu_mask_param}"
-        echo "INFO: Setting up hostname: $host_name"
+        notice "Setting up hostname: $host_name"
         vm_ssh $vm_num "hostname $host_name"
         vm_start_fio_server --fio-bin=$fio_bin $readonly $vm_num
     done
 }
 
 function vms_reboot_all() {
-    echo "Rebooting all vms "
+    notice "Rebooting all vms "
     for vm_num in $1; do
         vm_ssh $vm_num "reboot" || true
+        while vm_os_booted $vm_num; do
+             sleep 0.5
+        done
     done
 
-    vm_wait_for_boot 600 $1
+    vm_wait_for_boot 300 $1
 }
 
 function check_fio_retcode() {
-    fio_retcode=$3
+    local fio_retcode=$3
     echo $1
-    retcode_expected=$2
+    local retcode_expected=$2
     if [ $retcode_expected == 0 ]; then
         if [ $fio_retcode != 0 ]; then
-            echo "    Fio test ended with error."
-            vm_shutdown_all
-            spdk_vhost_kill
-            exit 1
+            error "    Fio test ended with error."
         else
-            echo "    Fio test ended with success."
+            notice "    Fio test ended with success."
         fi
     else
         if [ $fio_retcode != 0 ]; then
-            echo "    Fio test ended with expected error."
+            notice "    Fio test ended with expected error."
         else
-            echo "    Fio test ended with unexpected success."
-            vm_shutdown_all
-            spdk_vhost_kill
-            exit 1
+            error "    Fio test ended with unexpected success."
         fi
     fi
 }
 
+function wait_for_finish() {
+    local wait_for_pid=$1
+    local sequence=${2:-30}
+    for i in `seq 1 $sequence`; do
+        if kill -0 $wait_for_pid; then
+             sleep 0.5
+             continue
+        else
+             break
+        fi
+    done
+    if kill -0 $wait_for_pid; then
+        error "Timeout for fio command"
+    fi
+
+    wait $wait_for_pid
+}
+
+
 function reboot_all_and_prepare() {
-    vms_reboot_all $1
-    vms_prepare $1
+    vms_reboot_all "$1"
+    vms_prepare "$1"
+}
+
+function post_test_case() {
+    vm_shutdown_all
+    spdk_vhost_kill
+}
+
+function on_error_exit() {
+    set +e
+    echo "Error on $1 - $2"
+    post_test_case
+    print_backtrace
+    exit 1
+}
+
+function check_disks() {
+    if [ "$1" == "$2" ]; then
+        echo "Disk has not been deleted"
+        exit 1
+    fi
+}
+
+function get_traddr() {
+    local nvme_name=$1
+    local nvme="$( $SPDK_BUILD_DIR/scripts/gen_nvme.sh )"
+    while read -r line; do
+        if [[ $line == *"TransportID"* ]] && [[ $line == *$nvme_name* ]]; then
+            local word_array=($line)
+            for word in "${word_array[@]}"; do
+                if [[ $word == *"traddr"* ]]; then
+                    traddr=$( echo $word | sed 's/traddr://' | sed 's/"//' )
+                fi
+            done
+        fi
+    done <<< "$nvme"
+}
+
+function delete_nvme() {
+    $rpc_py delete_bdev $1
+}
+
+function add_nvme() {
+    $rpc_py construct_nvme_bdev -b $1 -t PCIe -a $2
 }

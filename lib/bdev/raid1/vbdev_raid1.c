@@ -39,10 +39,8 @@
 #include "spdk/string.h"
 #include "spdk/util.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
-
-SPDK_DECLARE_BDEV_MODULE(raid1);
 
 struct spdk_vbdev_base;
 typedef void (*spdk_raid1_vbdev_base_free_fn)(struct spdk_vbdev_base *base);
@@ -56,7 +54,7 @@ struct spdk_vbdev_base {
 	bool				claimed;
 	const struct spdk_bdev_fn_table	*fn_table;
 	spdk_raid1_vbdev_base_free_fn		base_free_fn;
-	struct spdk_bdev_module_if	*module;
+	struct spdk_bdev_module	*module;
 	spdk_io_channel_create_cb	ch_create_cb;
 	spdk_io_channel_destroy_cb	ch_destroy_cb;
 };
@@ -89,6 +87,7 @@ struct raid1_io_task {
 	uint32_t child_io_num;
 };
 
+static struct spdk_bdev_module raid1_if;
 static void
 spdk_raid1_vbdev_base_free(struct spdk_vbdev_base *base)
 {
@@ -310,7 +309,7 @@ vbdev_raid1_get_io_channel(void *ctx)
 static const struct spdk_bdev_fn_table vbdev_raid1_fn_table = {
 	.destruct		= vbdev_raid1_destruct,
 	.submit_request		= vbdev_raid1_submit_request,
-	.dump_config_json	= vbdev_raid1_dump_config_json,
+	.write_config_json	= NULL,/*vbdev_raid1_dump_config_json,*/
 	.get_io_channel		= vbdev_raid1_get_io_channel,
 	.io_type_supported	= vbdev_raid1_io_type_supported,
 };
@@ -388,7 +387,7 @@ spdk_raid1_vbdev_free(struct raid1_disk *rdisk)
 
 static int
 spdk_raid1_vbdev_base_construct(struct spdk_vbdev_base *base, struct spdk_bdev **bdev,
-				uint32_t bdev_num, spdk_bdev_remove_cb_t remove_cb, struct spdk_bdev_module_if *module,
+				uint32_t bdev_num, spdk_bdev_remove_cb_t remove_cb, struct spdk_bdev_module *module,
 				const struct spdk_bdev_fn_table *fn_table, spdk_raid1_vbdev_base_free_fn free_fn,
 				uint32_t channel_size, spdk_io_channel_create_cb ch_create_cb,
 				spdk_io_channel_destroy_cb ch_destroy_cb)
@@ -465,7 +464,7 @@ spdk_raid1_disk_construct(struct raid1_disk *rdisk, struct spdk_vbdev_base *base
 	}
 
 	rdisk->bdev.ctxt = rdisk;
-	rdisk->bdev.module = base->module;
+	rdisk->bdev.module = &raid1_if;
 	rdisk->bdev.fn_table = base->fn_table;
 
 	__sync_fetch_and_add(&base->ref, 1);
@@ -475,7 +474,7 @@ spdk_raid1_disk_construct(struct raid1_disk *rdisk, struct spdk_vbdev_base *base
 		int rc;
 
 		for (i = 0; i < base->num_children; i++) {
-			rc = spdk_bdev_module_claim_bdev(base->bdev[i], base->desc[i], base->module);
+			rc = spdk_bdev_module_claim_bdev(base->bdev[i], base->desc[i], rdisk->bdev.module);
 			if (rc) {
 				SPDK_ERRLOG("could not claim bdev %s\n", spdk_bdev_get_name(base->bdev[i]));
 				return -1;
@@ -528,7 +527,7 @@ spdk_vbdev_raid1_create(struct raid1_conf *conf)
 	}
 
 	rc = spdk_raid1_vbdev_base_construct(base, bdevs, 2, NULL,
-					     SPDK_GET_BDEV_MODULE(raid1), &vbdev_raid1_fn_table,
+					     &raid1_if, &vbdev_raid1_fn_table,
 					     spdk_raid1_free_base, sizeof(struct raid1_channel), NULL, NULL);
 
 	if (rc) {
@@ -581,7 +580,7 @@ vbdev_raid1_examine(struct spdk_bdev *bdev)
 			conf->real_child_num++;
 			if (conf->real_child_num == 2) {
 				if (spdk_vbdev_raid1_create(conf)) {
-					SPDK_DEBUGLOG(SPDK_TRACE_VBDEV_RAID1, "could not create raid1 vbdev %s\n", conf->name);
+					SPDK_ERRLOG("could not create raid1 vbdev %s\n", conf->name);
 				}
 			}
 			goto ret;
@@ -589,7 +588,7 @@ vbdev_raid1_examine(struct spdk_bdev *bdev)
 	}
 
 ret:
-	spdk_bdev_module_examine_done(SPDK_GET_BDEV_MODULE(raid1));
+	spdk_bdev_module_examine_done(&raid1_if);
 }
 
 static int
@@ -613,7 +612,7 @@ vbdev_raid1_init(void)
 
 		conf.name = spdk_conf_section_get_nmval(sp, "Raid1", i, 0);
 		if (!conf.name) {
-			SPDK_DEBUGLOG(SPDK_TRACE_VBDEV_RAID1, "Raid configuration missing raid bdev name\n");
+			SPDK_ERRLOG( "Raid configuration missing raid bdev name\n");
 			continue;
 		}
 
@@ -621,7 +620,7 @@ vbdev_raid1_init(void)
 		conf.second_child_name = spdk_conf_section_get_nmval(sp, "Raid1", i, 2);
 		if (!conf.first_child_name || !conf.second_child_name ||
 		    !strcmp(conf.first_child_name, conf.second_child_name)) {
-			SPDK_DEBUGLOG(SPDK_TRACE_VBDEV_RAID1, "Invaid child device names\n");
+			SPDK_ERRLOG( "Invaid child device names\n");
 			continue;
 		}
 
@@ -654,6 +653,14 @@ vbdev_raid1_finish(void)
 	}
 }
 
-SPDK_BDEV_MODULE_REGISTER(raid1, vbdev_raid1_init, vbdev_raid1_finish, NULL,
-			  vbdev_raid1_get_ctx_size, vbdev_raid1_examine)
-SPDK_LOG_REGISTER_TRACE_FLAG("vbdev_raid1", SPDK_TRACE_VBDEV_RAID1)
+static struct spdk_bdev_module raid1_if = {
+	.name = "raid1",
+	.module_init = vbdev_raid1_init,
+	.config_text = NULL,/*vbdev_passthru_get_spdk_running_config,*/
+	.get_ctx_size = vbdev_raid1_get_ctx_size,
+	.examine = vbdev_raid1_examine,
+	.module_fini = vbdev_raid1_finish
+};
+
+SPDK_BDEV_MODULE_REGISTER(&raid1_if)
+SPDK_LOG_REGISTER_COMPONENT("vbdev_raid1", SPDK_LOG_VBDEV_RAID1)

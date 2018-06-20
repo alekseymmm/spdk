@@ -34,11 +34,10 @@
 #include "spdk/nvmf_spec.h"
 #include "nvme_internal.h"
 
-#include <uuid/uuid.h>
-
 #define SPDK_NVME_DRIVER_NAME "spdk_nvme_driver"
 
 struct nvme_driver	*g_spdk_nvme_driver;
+pid_t			g_spdk_nvme_pid;
 
 int32_t			spdk_nvme_retry_count;
 
@@ -100,57 +99,47 @@ nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 	status->done = true;
 }
 
-struct nvme_request *
-nvme_allocate_request(struct spdk_nvme_qpair *qpair,
-		      const struct nvme_payload *payload, uint32_t payload_size,
-		      spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+/**
+ * Poll qpair for completions until a command completes.
+ *
+ * \param qpair queue to poll
+ * \param status completion status
+ * \param robust_mutex optional robust mutex to lock while polling qpair
+ *
+ * \return 0 if command completed without error, negative errno on failure
+ *
+ * The command to wait upon must be submitted with nvme_completion_poll_cb as the callback
+ * and status as the callback argument.
+ */
+int
+spdk_nvme_wait_for_completion_robust_lock(
+	struct spdk_nvme_qpair *qpair,
+	struct nvme_completion_poll_status *status,
+	pthread_mutex_t *robust_mutex)
 {
-	struct nvme_request *req;
+	memset(&status->cpl, 0, sizeof(status->cpl));
+	status->done = false;
 
-	req = STAILQ_FIRST(&qpair->free_req);
-	if (req == NULL) {
-		return req;
+	while (status->done == false) {
+		if (robust_mutex) {
+			nvme_robust_mutex_lock(robust_mutex);
+		}
+
+		spdk_nvme_qpair_process_completions(qpair, 0);
+
+		if (robust_mutex) {
+			nvme_robust_mutex_unlock(robust_mutex);
+		}
 	}
 
-	STAILQ_REMOVE_HEAD(&qpair->free_req, stailq);
-
-	/*
-	 * Only memset up to (but not including) the children
-	 *  TAILQ_ENTRY.  children, and following members, are
-	 *  only used as part of I/O splitting so we avoid
-	 *  memsetting them until it is actually needed.
-	 *  They will be initialized in nvme_request_add_child()
-	 *  if the request is split.
-	 */
-	memset(req, 0, offsetof(struct nvme_request, children));
-	req->cb_fn = cb_fn;
-	req->cb_arg = cb_arg;
-	req->payload = *payload;
-	req->payload_size = payload_size;
-	req->qpair = qpair;
-	req->pid = getpid();
-
-	return req;
+	return spdk_nvme_cpl_is_error(&status->cpl) ? -EIO : 0;
 }
 
-struct nvme_request *
-nvme_allocate_request_contig(struct spdk_nvme_qpair *qpair,
-			     void *buffer, uint32_t payload_size,
-			     spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+int
+spdk_nvme_wait_for_completion(struct spdk_nvme_qpair *qpair,
+			      struct nvme_completion_poll_status *status)
 {
-	struct nvme_payload payload;
-
-	payload.type = NVME_PAYLOAD_TYPE_CONTIG;
-	payload.u.contig = buffer;
-	payload.md = NULL;
-
-	return nvme_allocate_request(qpair, &payload, payload_size, cb_fn, cb_arg);
-}
-
-struct nvme_request *
-nvme_allocate_request_null(struct spdk_nvme_qpair *qpair, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
-{
-	return nvme_allocate_request_contig(qpair, NULL, 0, cb_fn, cb_arg);
+	return spdk_nvme_wait_for_completion_robust_lock(qpair, status, NULL);
 }
 
 static void
@@ -161,15 +150,15 @@ nvme_user_copy_cmd_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	if (req->user_buffer && req->payload_size) {
 		/* Copy back to the user buffer and free the contig buffer */
-		assert(req->payload.type == NVME_PAYLOAD_TYPE_CONTIG);
+		assert(nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_CONTIG);
 		xfer = spdk_nvme_opc_get_data_transfer(req->cmd.opc);
 		if (xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST ||
 		    xfer == SPDK_NVME_DATA_BIDIRECTIONAL) {
 			assert(req->pid == getpid());
-			memcpy(req->user_buffer, req->payload.u.contig, req->payload_size);
+			memcpy(req->user_buffer, req->payload.contig_or_cb_arg, req->payload_size);
 		}
 
-		spdk_dma_free(req->payload.u.contig);
+		spdk_dma_free(req->payload.contig_or_cb_arg);
 	}
 
 	/* Call the user's original callback now that the buffer has been copied */
@@ -217,14 +206,57 @@ nvme_allocate_request_user_copy(struct spdk_nvme_qpair *qpair,
 	return req;
 }
 
-void
-nvme_free_request(struct nvme_request *req)
+/**
+ * Check if a request has exceeded the controller timeout.
+ *
+ * \param req request to check for timeout.
+ * \param cid command ID for command submitted by req (will be passed to timeout_cb_fn)
+ * \param active_proc per-process data for the controller associated with req
+ * \param now_tick current time from spdk_get_ticks()
+ * \return 0 if requests submitted more recently than req should still be checked for timeouts, or
+ * 1 if requests newer than req need not be checked.
+ *
+ * The request's timeout callback will be called if needed; the caller is only responsible for
+ * calling this function on each outstanding request.
+ */
+int
+nvme_request_check_timeout(struct nvme_request *req, uint16_t cid,
+			   struct spdk_nvme_ctrlr_process *active_proc,
+			   uint64_t now_tick)
 {
-	assert(req != NULL);
-	assert(req->num_children == 0);
-	assert(req->qpair != NULL);
+	struct spdk_nvme_qpair *qpair = req->qpair;
+	struct spdk_nvme_ctrlr *ctrlr = qpair->ctrlr;
 
-	STAILQ_INSERT_HEAD(&req->qpair->free_req, req, stailq);
+	assert(active_proc->timeout_cb_fn != NULL);
+
+	if (req->timed_out || req->submit_tick == 0) {
+		return 0;
+	}
+
+	if (req->pid != g_spdk_nvme_pid) {
+		return 0;
+	}
+
+	if (nvme_qpair_is_admin_queue(qpair) &&
+	    req->cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+		return 0;
+	}
+
+	if (req->submit_tick + active_proc->timeout_ticks > now_tick) {
+		return 1;
+	}
+
+	req->timed_out = true;
+
+	/*
+	 * We don't want to expose the admin queue to the user,
+	 * so when we're timing out admin commands set the
+	 * qpair to NULL.
+	 */
+	active_proc->timeout_cb_fn(active_proc->timeout_cb_arg, ctrlr,
+				   nvme_qpair_is_admin_queue(qpair) ? NULL : qpair,
+				   cid);
+	return 0;
 }
 
 int
@@ -254,10 +286,12 @@ nvme_robust_mutex_init_shared(pthread_mutex_t *mtx)
 static int
 nvme_driver_init(void)
 {
-	uuid_t host_id;
 	int ret = 0;
 	/* Any socket ID */
 	int socket_id = -1;
+
+	/* Each process needs its own pid. */
+	g_spdk_nvme_pid = getpid();
 
 	/*
 	 * Only one thread from one process will do this driver init work.
@@ -327,10 +361,7 @@ nvme_driver_init(void)
 
 	TAILQ_INIT(&g_spdk_nvme_driver->shared_attached_ctrlrs);
 
-	SPDK_STATIC_ASSERT(sizeof(host_id) == sizeof(g_spdk_nvme_driver->default_extended_host_id),
-			   "host ID size mismatch");
-	uuid_generate(host_id);
-	memcpy(g_spdk_nvme_driver->default_extended_host_id, host_id, sizeof(host_id));
+	spdk_uuid_generate(&g_spdk_nvme_driver->default_extended_host_id);
 
 	nvme_robust_mutex_unlock(&g_spdk_nvme_driver->lock);
 
@@ -344,12 +375,14 @@ nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid, void *devhandle,
 	struct spdk_nvme_ctrlr *ctrlr;
 	struct spdk_nvme_ctrlr_opts opts;
 
+	assert(trid != NULL);
+
 	spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
 
 	if (!probe_cb || probe_cb(cb_ctx, trid, &opts)) {
 		ctrlr = nvme_transport_ctrlr_construct(trid, &opts, devhandle);
 		if (ctrlr == NULL) {
-			SPDK_ERRLOG("Failed to construct NVMe controller\n");
+			SPDK_ERRLOG("Failed to construct NVMe controller for SSD: %s\n", trid->traddr);
 			return -1;
 		}
 
@@ -387,6 +420,7 @@ nvme_init_controllers(void *cb_ctx, spdk_nvme_attach_cb attach_cb)
 			if (start_rc) {
 				/* Controller failed to initialize. */
 				TAILQ_REMOVE(&g_nvme_init_ctrlrs, ctrlr, tailq);
+				SPDK_ERRLOG("Failed to initialize SSD: %s\n", ctrlr->trid.traddr);
 				nvme_ctrlr_destruct(ctrlr);
 				rc = -1;
 				break;
@@ -816,4 +850,4 @@ spdk_nvme_transport_id_compare(const struct spdk_nvme_transport_id *trid1,
 	return 0;
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("nvme", SPDK_TRACE_NVME)
+SPDK_LOG_REGISTER_COMPONENT("nvme", SPDK_LOG_NVME)

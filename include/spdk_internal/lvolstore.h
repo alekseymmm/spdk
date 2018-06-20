@@ -36,25 +36,26 @@
 
 #include "spdk/blob.h"
 #include "spdk/lvol.h"
-#include "spdk_internal/bdev.h"
-
-#include <uuid/uuid.h>
+#include "spdk/uuid.h"
+#include "spdk/bdev_module.h"
 
 /* Default size of blobstore cluster */
-#define SPDK_LVS_OPTS_CLUSTER_SZ (1024 * 1024 * 1024)
-
-/* Length of string returned from uuid_unparse() */
-#define UUID_STRING_LEN 37
+#define SPDK_LVS_OPTS_CLUSTER_SZ (4 * 1024 * 1024)
 
 struct spdk_lvs_req {
 	spdk_lvs_op_complete    cb_fn;
 	void                    *cb_arg;
+	struct spdk_lvol_store		*lvol_store;
+	int				lvserrno;
 };
 
 struct spdk_lvol_req {
-	spdk_lvol_op_complete    cb_fn;
+	spdk_lvol_op_complete   cb_fn;
 	void                    *cb_arg;
 	struct spdk_lvol	*lvol;
+	size_t			sz;
+	struct spdk_io_channel	*channel;
+	char			name[SPDK_LVOL_NAME_MAX];
 };
 
 struct spdk_lvs_with_handle_req {
@@ -70,7 +71,6 @@ struct spdk_lvs_destroy_req {
 	spdk_lvs_op_complete    cb_fn;
 	void                    *cb_arg;
 	struct spdk_lvol_store	*lvs;
-	bool			unmap_device;
 };
 
 struct spdk_lvol_with_handle_req {
@@ -84,25 +84,29 @@ struct spdk_lvol_store {
 	struct spdk_blob_store		*blobstore;
 	struct spdk_blob		*super_blob;
 	spdk_blob_id			super_blob_id;
-	uuid_t				uuid;
+	struct spdk_uuid		uuid;
 	struct spdk_lvs_req		*destruct_req;
 	int				lvol_count;
 	int				lvols_opened;
 	bool				destruct;
 	TAILQ_HEAD(, spdk_lvol)		lvols;
+	TAILQ_HEAD(, spdk_lvol)		pending_lvols;
 	bool				on_list;
 	TAILQ_ENTRY(spdk_lvol_store)	link;
 	char				name[SPDK_LVS_NAME_MAX];
+	char				new_name[SPDK_LVS_NAME_MAX];
 };
 
 struct spdk_lvol {
 	struct spdk_lvol_store		*lvol_store;
 	struct spdk_blob		*blob;
-	uint64_t			num_clusters;
 	spdk_blob_id			blob_id;
-	char				*old_name;
+	char				*unique_id;
 	char				name[SPDK_LVOL_NAME_MAX];
+	struct spdk_uuid		uuid;
+	char				uuid_str[SPDK_UUID_STRING_LEN];
 	bool				close_only;
+	bool				thin_provision;
 	struct spdk_bdev		*bdev;
 	int				ref_count;
 	bool				action_in_progress;
@@ -116,7 +120,7 @@ struct lvol_task {
 struct lvol_store_bdev *vbdev_lvol_store_first(void);
 struct lvol_store_bdev *vbdev_lvol_store_next(struct lvol_store_bdev *prev);
 
-int spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
-		     void *cb_arg);
+void spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
+		      void *cb_arg);
 
 #endif /* SPDK_INTERNAL_LVOLSTORE_H */

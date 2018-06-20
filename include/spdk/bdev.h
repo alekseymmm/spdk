@@ -43,10 +43,20 @@
 
 #include "spdk/scsi_spec.h"
 #include "spdk/nvme_spec.h"
+#include "spdk/json.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define SPDK_BDEV_SMALL_BUF_MAX_SIZE 8192
 #define SPDK_BDEV_LARGE_BUF_MAX_SIZE (64 * 1024)
 
+/**
+ * Block device remove callback.
+ *
+ * \param remove_ctx Context for the removed block device.
+ */
 typedef void (*spdk_bdev_remove_cb_t)(void *remove_ctx);
 
 /**
@@ -59,6 +69,7 @@ struct spdk_bdev_io;
 struct spdk_bdev_fn_table;
 struct spdk_io_channel;
 struct spdk_json_write_ctx;
+struct spdk_uuid;
 
 /** bdev status */
 enum spdk_bdev_status {
@@ -91,15 +102,16 @@ enum spdk_bdev_io_type {
 	SPDK_BDEV_IO_TYPE_NVME_IO,
 	SPDK_BDEV_IO_TYPE_NVME_IO_MD,
 	SPDK_BDEV_IO_TYPE_WRITE_ZEROES,
+	SPDK_BDEV_NUM_IO_TYPES /* Keep last */
 };
 
 /**
  * Block device completion callback.
  *
  * \param bdev_io Block device I/O that has completed.
- * \param success true if I/O completed successfully or false if it failed; additional error
- *                information may be retrieved from bdev_io by calling
- *                spdk_bdev_io_get_nvme_status() or spdk_bdev_io_get_scsi_status().
+ * \param success True if I/O completed successfully or false if it failed;
+ * additional error information may be retrieved from bdev_io by calling
+ * spdk_bdev_io_get_nvme_status() or spdk_bdev_io_get_scsi_status().
  * \param cb_arg Callback argument specified when bdev_io was submitted.
  */
 typedef void (*spdk_bdev_io_completion_cb)(struct spdk_bdev_io *bdev_io,
@@ -111,10 +123,36 @@ struct spdk_bdev_io_stat {
 	uint64_t num_read_ops;
 	uint64_t bytes_written;
 	uint64_t num_write_ops;
+	uint64_t read_latency_ticks;
+	uint64_t write_latency_ticks;
+	uint64_t ticks_rate;
 };
 
+struct spdk_bdev_opts {
+	uint32_t bdev_io_pool_size;
+	uint32_t bdev_io_cache_size;
+};
+
+void spdk_bdev_get_opts(struct spdk_bdev_opts *opts);
+
+int spdk_bdev_set_opts(struct spdk_bdev_opts *opts);
+
+/**
+ * Block device initialization callback.
+ *
+ * \param cb_arg Callback argument.
+ * \param rc 0 if block device initialized successfully or negative errno if it failed.
+ */
 typedef void (*spdk_bdev_init_cb)(void *cb_arg, int rc);
+
+/**
+ * Block device finish callback.
+ *
+ * \param cb_arg Callback argument.
+ */
 typedef void (*spdk_bdev_fini_cb)(void *cb_arg);
+typedef void (*spdk_bdev_get_device_stat_cb)(struct spdk_bdev *bdev,
+		struct spdk_bdev_io_stat *stat, void *cb_arg, int rc);
 
 /**
  * Initialize block device modules.
@@ -138,6 +176,13 @@ void spdk_bdev_finish(spdk_bdev_fini_cb cb_fn, void *cb_arg);
  * \param fp The pointer to a file that will be written to the configuration options.
  */
 void spdk_bdev_config_text(FILE *fp);
+
+/**
+ * Get the full configuration options for the registered block device modules and created bdevs.
+ *
+ * \param w pointer to a JSON write context where the configuration will be written.
+ */
+void spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w);
 
 /**
  * Get block device by the block device name.
@@ -222,7 +267,7 @@ struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
 bool spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type);
 
 /**
- * Output driver-specific configuration to a JSON stream.
+ * Output driver-specific information to a JSON stream.
  *
  * The JSON write context will be initialized with an open object, so the bdev
  * driver should write a name(based on the driver name) followed by a JSON value
@@ -232,7 +277,22 @@ bool spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type 
  * \param w JSON write context. It will store the driver-specific configuration context.
  * \return 0 on success, negated errno on failure.
  */
-int spdk_bdev_dump_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
+int spdk_bdev_dump_info_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
+
+/**
+ * Output bdev-specific configuration to a JSON stream.
+ *
+ * If supported, the object with following keys will be written:
+ * method - name of the constructor method
+ * params - parameters necessary to recreate this \c bdev
+ *
+ * If \c bdev does not support writing JSON configuration then object will be written
+ * with only one key - the name of this bdev.
+ *
+ * \param bdev block device to query configuration.
+ * \param w pointer to a JSON write context where \c bdev the configuration will be written.
+ */
+void spdk_bdev_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 
 /**
  * Get block device name.
@@ -269,6 +329,27 @@ uint32_t spdk_bdev_get_block_size(const struct spdk_bdev *bdev);
 uint64_t spdk_bdev_get_num_blocks(const struct spdk_bdev *bdev);
 
 /**
+ * Get IOs per second of block device for the QoS rate limiting.
+ *
+ * \param bdev Block device to query.
+ * \return IOs per second.
+ *
+ * Return 0 for no QoS enforced on the queried block device.
+ */
+uint64_t spdk_bdev_get_qos_ios_per_sec(struct spdk_bdev *bdev);
+
+/**
+ * Set an IOPS-based quality of service rate limit on a bdev.
+ *
+ * \param bdev Block device.
+ * \param ios_per_sec I/O per second limit.
+ * \param cb_fn Callback function to be called when the QoS limit has been updated.
+ * \param cb_arg Argument to pass to cb_fn.
+ */
+void spdk_bdev_set_qos_limit_iops(struct spdk_bdev *bdev, uint64_t ios_per_sec,
+				  void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
+
+/**
  * Get minimum I/O buffer address alignment for a bdev.
  *
  * \param bdev Block device to query.
@@ -297,6 +378,17 @@ uint32_t spdk_bdev_get_optimal_io_boundary(const struct spdk_bdev *bdev);
 bool spdk_bdev_has_write_cache(const struct spdk_bdev *bdev);
 
 /**
+ * Get a bdev's UUID.
+ *
+ * \param bdev Block device to query.
+ * \return Pointer to UUID.
+ *
+ * Not all bdevs will have a UUID; in this case, the returned UUID will be
+ * the nil UUID (all bytes zero).
+ */
+const struct spdk_uuid *spdk_bdev_get_uuid(const struct spdk_bdev *bdev);
+
+/**
  * Obtain an I/O channel for the block device opened by the specified
  * descriptor. I/O channels are bound to threads, so the resulting I/O
  * channel may only be used from the thread it was originally obtained
@@ -309,7 +401,17 @@ bool spdk_bdev_has_write_cache(const struct spdk_bdev *bdev);
 struct spdk_io_channel *spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc);
 
 /**
+ * \defgroup bdev_io_submit_functions bdev I/O Submit Functions
+ *
+ * These functions submit a new I/O request to a bdev.  The I/O request will
+ *  be represented by an spdk_bdev_io structure allocated from a global pool.
+ *  These functions will return -ENOMEM if the spdk_bdev_io pool is empty.
+ */
+
+/**
  * Submit a read request to the bdev on the given channel.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -322,6 +424,8 @@ struct spdk_io_channel *spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc);
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
  */
 int spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		   void *buf, uint64_t offset, uint64_t nbytes,
@@ -329,6 +433,8 @@ int spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 
 /**
  * Submit a read request to the bdev on the given channel.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -341,6 +447,8 @@ int spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
  */
 int spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			  void *buf, uint64_t offset_blocks, uint64_t num_blocks,
@@ -352,6 +460,8 @@ int spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
  * gather list. Some physical devices place memory alignment requirements on
  * data and may not be able to directly transfer into the buffers provided. In
  * this case, the request may fail.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -365,6 +475,8 @@ int spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
  */
 int spdk_bdev_readv(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		    struct iovec *iov, int iovcnt,
@@ -378,6 +490,8 @@ int spdk_bdev_readv(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * data and may not be able to directly transfer into the buffers provided. In
  * this case, the request may fail.
  *
+ * \ingroup bdev_io_submit_functions
+ *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
  * \param iov A scatter gather list of buffers to be read into.
@@ -390,6 +504,8 @@ int spdk_bdev_readv(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
  */
 int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   struct iovec *iov, int iovcnt,
@@ -398,6 +514,8 @@ int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 
 /**
  * Submit a write request to the bdev on the given channel.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -410,6 +528,9 @@ int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		    void *buf, uint64_t offset, uint64_t nbytes,
@@ -417,6 +538,8 @@ int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 
 /**
  * Submit a write request to the bdev on the given channel.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -429,6 +552,9 @@ int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   void *buf, uint64_t offset_blocks, uint64_t num_blocks,
@@ -440,6 +566,8 @@ int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * gather list. Some physical devices place memory alignment requirements on
  * data and may not be able to directly transfer out of the buffers provided. In
  * this case, the request may fail.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -453,6 +581,9 @@ int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_writev(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		     struct iovec *iov, int iovcnt,
@@ -466,6 +597,8 @@ int spdk_bdev_writev(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * data and may not be able to directly transfer out of the buffers provided. In
  * this case, the request may fail.
  *
+ * \ingroup bdev_io_submit_functions
+ *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
  * \param iov A scatter gather list of buffers to be written from.
@@ -478,6 +611,9 @@ int spdk_bdev_writev(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			    struct iovec *iov, int iovcnt,
@@ -487,6 +623,8 @@ int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel 
 /**
  * Submit a write zeroes request to the bdev on the given channel. This command
  *  ensures that all bytes in the specified range are set to 00h
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -498,6 +636,9 @@ int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel 
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_write_zeroes(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   uint64_t offset, uint64_t len,
@@ -506,6 +647,8 @@ int spdk_bdev_write_zeroes(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 /**
  * Submit a write zeroes request to the bdev on the given channel. This command
  *  ensures that all bytes in the specified range are set to 00h
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -517,6 +660,9 @@ int spdk_bdev_write_zeroes(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_write_zeroes_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				  uint64_t offset_blocks, uint64_t num_blocks,
@@ -526,6 +672,8 @@ int spdk_bdev_write_zeroes_blocks(struct spdk_bdev_desc *desc, struct spdk_io_ch
  * Submit an unmap request to the block device. Unmap is sometimes also called trim or
  * deallocate. This notifies the device that the data in the blocks described is no
  * longer valid. Reading blocks that have been unmapped results in indeterminate data.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -537,6 +685,9 @@ int spdk_bdev_write_zeroes_blocks(struct spdk_bdev_desc *desc, struct spdk_io_ch
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_unmap(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		    uint64_t offset, uint64_t nbytes,
@@ -546,6 +697,8 @@ int spdk_bdev_unmap(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * Submit an unmap request to the block device. Unmap is sometimes also called trim or
  * deallocate. This notifies the device that the data in the blocks described is no
  * longer valid. Reading blocks that have been unmapped results in indeterminate data.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -557,6 +710,9 @@ int spdk_bdev_unmap(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_unmap_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   uint64_t offset_blocks, uint64_t num_blocks,
@@ -566,6 +722,8 @@ int spdk_bdev_unmap_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * Submit a flush request to the bdev on the given channel. For devices with volatile
  * caches, data is not guaranteed to be persistent until the completion of a flush
  * request. Call spdk_bdev_has_write_cache() to check if the bdev has a volatile cache.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -577,6 +735,9 @@ int spdk_bdev_unmap_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset and/or nbytes are not aligned or out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_flush(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		    uint64_t offset, uint64_t length,
@@ -586,6 +747,8 @@ int spdk_bdev_flush(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * Submit a flush request to the bdev on the given channel. For devices with volatile
  * caches, data is not guaranteed to be persistent until the completion of a flush
  * request. Call spdk_bdev_has_write_cache() to check if the bdev has a volatile cache.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -597,6 +760,9 @@ int spdk_bdev_flush(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_flush_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   uint64_t offset_blocks, uint64_t num_blocks,
@@ -604,6 +770,8 @@ int spdk_bdev_flush_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 
 /**
  * Submit a reset request to the bdev on the given channel.
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -613,6 +781,7 @@ int spdk_bdev_flush_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
  */
 int spdk_bdev_reset(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		    spdk_bdev_io_completion_cb cb, void *cb_arg);
@@ -625,6 +794,8 @@ int spdk_bdev_reset(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * The SGL/PRP will be automated generated based on the given buffer,
  * so that portion of the command may be left empty.
  *
+ * \ingroup bdev_io_submit_functions
+ *
  * \param desc Block device descriptor.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
  * \param cmd The raw NVMe command. Must be an admin command.
@@ -636,6 +807,8 @@ int spdk_bdev_reset(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_nvme_admin_passthru(struct spdk_bdev_desc *desc,
 				  struct spdk_io_channel *ch,
@@ -647,6 +820,8 @@ int spdk_bdev_nvme_admin_passthru(struct spdk_bdev_desc *desc,
  * Submit an NVMe I/O command to the bdev. This passes directly through
  * the block layer to the device. Support for NVMe passthru is optional,
  * indicated by calling spdk_bdev_io_type_supported().
+ *
+ * \ingroup bdev_io_submit_functions
  *
  * The SGL/PRP will be automated generated based on the given buffer,
  * so that portion of the command may be left empty. Also, the namespace
@@ -663,6 +838,8 @@ int spdk_bdev_nvme_admin_passthru(struct spdk_bdev_desc *desc,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_nvme_io_passthru(struct spdk_bdev_desc *bdev_desc,
 			       struct spdk_io_channel *ch,
@@ -675,11 +852,13 @@ int spdk_bdev_nvme_io_passthru(struct spdk_bdev_desc *bdev_desc,
  * the block layer to the device. Support for NVMe passthru is optional,
  * indicated by calling spdk_bdev_io_type_supported().
  *
+ * \ingroup bdev_io_submit_functions
+ *
  * The SGL/PRP will be automated generated based on the given buffer,
  * so that portion of the command may be left empty. Also, the namespace
  * id (nsid) will be populated automatically.
  *
- * \param bdev Block device
+ * \param bdev_desc Block device descriptor
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
  * \param cmd The raw NVMe command. Must be in the NVM command set.
  * \param buf Data buffer to written from.
@@ -692,6 +871,8 @@ int spdk_bdev_nvme_io_passthru(struct spdk_bdev_desc *bdev_desc,
  * \return 0 on success. On success, the callback will always
  * be called (even if the request ultimately failed). Return
  * negated errno on failure, in which case the callback will not be called.
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
  */
 int spdk_bdev_nvme_io_passthru_md(struct spdk_bdev_desc *bdev_desc,
 				  struct spdk_io_channel *ch,
@@ -700,18 +881,16 @@ int spdk_bdev_nvme_io_passthru_md(struct spdk_bdev_desc *bdev_desc,
 				  spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
- * Free an I/O request. This should be called after the callback for the I/O has
- * been called and notifies the bdev layer that memory may now be released.
+ * Free an I/O request. This should only be called after the completion callback
+ * for the I/O has been called and notifies the bdev layer that memory may now
+ * be released.
  *
  * \param bdev_io I/O request.
- *
- * \return -1 on failure, 0 on success.
  */
-int spdk_bdev_free_io(struct spdk_bdev_io *bdev_io);
+void spdk_bdev_free_io(struct spdk_bdev_io *bdev_io);
 
 /**
- * Return I/O statistics for this channel. After returning stats, zero out
- * the current state of the statistics.
+ * Return I/O statistics for this channel.
  *
  * \param bdev Block device.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
@@ -720,6 +899,18 @@ int spdk_bdev_free_io(struct spdk_bdev_io *bdev_io);
  */
 void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			   struct spdk_bdev_io_stat *stat);
+
+/**
+ * Return I/O statistics for this bdev. All the required information will be passed
+ * via the callback function.
+ *
+ * \param bdev Block device to query.
+ * \param stat Structure for aggregating collected statistics.  Passed as argument to cb.
+ * \param cb Called when this operation completes.
+ * \param cb_arg Argument passed to callback function.
+ */
+void spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat,
+			       spdk_bdev_get_device_stat_cb cb, void *cb_arg);
 
 /**
  * Get the status of bdev_io as an NVMe status code.
@@ -750,5 +941,9 @@ void spdk_bdev_io_get_scsi_status(const struct spdk_bdev_io *bdev_io,
  * \param iovcntp Pointer to be filled with number of iovec entries.
  */
 void spdk_bdev_io_get_iovec(struct spdk_bdev_io *bdev_io, struct iovec **iovp, int *iovcntp);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SPDK_BDEV_H_ */

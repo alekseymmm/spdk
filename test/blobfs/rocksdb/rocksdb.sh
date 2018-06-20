@@ -13,13 +13,17 @@ run_step() {
 	echo "--spdk_cache_size=$CACHE_SIZE" >> "$1"_flags.txt
 
 	echo -n Start $1 test phase...
-	/usr/bin/time taskset 0xFFF $DB_BENCH --flagfile="$1"_flags.txt &> "$1"_db_bench.txt
+	/usr/bin/time taskset 0xFF $DB_BENCH --flagfile="$1"_flags.txt &> "$1"_db_bench.txt
 	echo done.
+}
+
+run_bsdump() {
+	$rootdir/examples/blob/cli/blobcli -c $ROCKSDB_CONF -b Nvme0n1 -D &> bsdump.txt
 }
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 
 DB_BENCH_DIR=/usr/src/rocksdb
 DB_BENCH=$DB_BENCH_DIR/db_bench
@@ -44,20 +48,24 @@ timing_exit db_bench_build
 cp $rootdir/etc/spdk/rocksdb.conf.in $ROCKSDB_CONF
 $rootdir/scripts/gen_nvme.sh >> $ROCKSDB_CONF
 
-trap 'rm -f $ROCKSDB_CONF; exit 1' SIGINT SIGTERM EXIT
+trap 'run_bsdump; rm -f $ROCKSDB_CONF; exit 1' SIGINT SIGTERM EXIT
 
 timing_enter mkfs
-$rootdir/test/lib/blobfs/mkfs/mkfs $ROCKSDB_CONF Nvme0n1
+$rootdir/test/blobfs/mkfs/mkfs $ROCKSDB_CONF Nvme0n1
 timing_exit mkfs
 
 mkdir $output_dir/rocksdb
 RESULTS_DIR=$output_dir/rocksdb
-DURATION=30
-NUM_KEYS=50000000
 CACHE_SIZE=4096
+if [ $RUN_NIGHTLY_FAILING -eq 1 ]; then
+	DURATION=60
+	NUM_KEYS=100000000
+else
+	DURATION=20
+	NUM_KEYS=20000000
+fi
 
 cd $RESULTS_DIR
-
 cp $testdir/common_flags.txt insert_flags.txt
 echo "--benchmarks=fillseq" >> insert_flags.txt
 echo "--threads=1" >> insert_flags.txt
@@ -120,6 +128,8 @@ timing_exit rocksdb_randread
 
 trap - SIGINT SIGTERM EXIT
 
+run_bsdump
 rm -f $ROCKSDB_CONF
 
+report_test_completion "blobfs"
 timing_exit rocksdb

@@ -40,11 +40,12 @@
 #include "nvmf_internal.h"
 #include "transport.h"
 
+#include "spdk/event.h"
 #include "spdk/string.h"
 #include "spdk/trace.h"
 #include "spdk/nvmf_spec.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
 static void
@@ -58,7 +59,7 @@ nvmf_update_discovery_log(struct spdk_nvmf_tgt *tgt)
 	size_t cur_size;
 	uint32_t sid;
 
-	SPDK_DEBUGLOG(SPDK_TRACE_NVMF, "Generating log page for genctr %" PRIu64 "\n",
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Generating log page for genctr %" PRIu64 "\n",
 		      tgt->discovery_genctr);
 
 	cur_size = sizeof(struct spdk_nvmf_discovery_log_page);
@@ -68,7 +69,7 @@ nvmf_update_discovery_log(struct spdk_nvmf_tgt *tgt)
 		return;
 	}
 
-	for (sid = 0; sid < tgt->max_sid; sid++) {
+	for (sid = 0; sid < tgt->opts.max_subsystems; sid++) {
 		subsystem = tgt->subsystems[sid];
 		if (subsystem == NULL) {
 			continue;

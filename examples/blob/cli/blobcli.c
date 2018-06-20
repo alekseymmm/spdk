@@ -41,6 +41,7 @@
 #include "spdk/log.h"
 #include "spdk/version.h"
 #include "spdk/string.h"
+#include "spdk/uuid.h"
 
 /*
  * The following is not a public header file, but the CLI does expose
@@ -80,6 +81,7 @@ enum cli_action_type {
 	CLI_LIST_BDEVS,
 	CLI_LIST_BLOBS,
 	CLI_INIT_BS,
+	CLI_DUMP_BS,
 	CLI_SHELL_EXIT,
 	CLI_HELP,
 };
@@ -147,6 +149,7 @@ print_cmds(void)
 	printf("\nCommands include:\n");
 	printf("\t-b bdev - name of the block device to use (example: Nvme0n1)\n");
 	printf("\t-d <blobid> filename - dump contents of a blob to a file\n");
+	printf("\t-D - dump metadata contents of an existing blobstore\n");
 	printf("\t-f <blobid> value - fill a blob with a decimal value\n");
 	printf("\t-h - this help screen\n");
 	printf("\t-i - initialize a blobstore\n");
@@ -173,7 +176,7 @@ usage(struct cli_context_t *cli_context, char *msg)
 		printf("%s", msg);
 	}
 
-	if (cli_context && cli_context->cli_mode == CLI_MODE_CMD) {
+	if (!cli_context || cli_context->cli_mode == CLI_MODE_CMD) {
 		printf("Version %s\n", SPDK_VERSION_STRING);
 		printf("Usage: %s [-c SPDK config_file] Command\n", program_name);
 		printf("\n%s is a command line tool for interacting with blobstore\n",
@@ -181,7 +184,7 @@ usage(struct cli_context_t *cli_context, char *msg)
 		printf("on the underlying device specified in the conf file passed\n");
 		printf("in as a command line option.\n");
 	}
-	if (cli_context && cli_context->cli_mode != CLI_MODE_SCRIPT) {
+	if (!cli_context || cli_context->cli_mode != CLI_MODE_SCRIPT) {
 		print_cmds();
 	}
 }
@@ -286,30 +289,16 @@ sync_cb(void *arg1, int bserrno)
 		return;
 	}
 
-	spdk_bs_md_close_blob(&cli_context->blob, close_cb,
-			      cli_context);
+	spdk_blob_close(cli_context->blob, close_cb, cli_context);
 }
 
-/*
- * Callback function for opening a blob after creating.
- */
 static void
-open_now_resize_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
+resize_cb(void *cb_arg, int bserrno)
 {
 	struct cli_context_t *cli_context = cb_arg;
-	int rc = 0;
 	uint64_t total = 0;
 
 	if (bserrno) {
-		unload_bs(cli_context, "Error in open completion",
-			  bserrno);
-		return;
-	}
-	cli_context->blob = blob;
-
-	rc = spdk_bs_md_resize_blob(cli_context->blob,
-				    cli_context->num_clusters);
-	if (rc) {
 		unload_bs(cli_context, "Error in blob resize",
 			  bserrno);
 		return;
@@ -323,8 +312,26 @@ open_now_resize_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	 * Always a good idea to sync after MD changes or the changes
 	 * may be lost if things aren't closed cleanly.
 	 */
-	spdk_bs_md_sync_blob(cli_context->blob, sync_cb,
-			     cli_context);
+	spdk_blob_sync_md(cli_context->blob, sync_cb, cli_context);
+}
+
+/*
+ * Callback function for opening a blob after creating.
+ */
+static void
+open_now_resize_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct cli_context_t *cli_context = cb_arg;
+
+	if (bserrno) {
+		unload_bs(cli_context, "Error in open completion",
+			  bserrno);
+		return;
+	}
+	cli_context->blob = blob;
+
+	spdk_blob_resize(cli_context->blob, cli_context->num_clusters,
+			 resize_cb, cli_context);
 }
 
 /*
@@ -350,8 +357,8 @@ blob_create_cb(void *arg1, spdk_blob_id blobid, int bserrno)
 	}
 
 	/* We have to open the blob before we can do things like resize. */
-	spdk_bs_md_open_blob(cli_context->bs, cli_context->blobid,
-			     open_now_resize_cb, cli_context);
+	spdk_bs_open_blob(cli_context->bs, cli_context->blobid,
+			  open_now_resize_cb, cli_context);
 }
 
 /*
@@ -408,7 +415,7 @@ show_bs_cb(void *arg1, spdk_blob_id blobid, int bserrno)
 	printf("\nBlobstore Private Info:\n");
 	printf("\tMetadata start (pages): %" PRIu64 "\n",
 	       cli_context->bs->md_start);
-	printf("\tMetadata length (pages): %d \n",
+	printf("\tMetadata length (pages): %d\n",
 	       cli_context->bs->md_len);
 
 	unload_bs(cli_context, "", 0);
@@ -440,14 +447,14 @@ show_blob(struct cli_context_t *cli_context)
 	val = spdk_blob_get_num_pages(cli_context->blob);
 	printf("# of pages: %" PRIu64 "\n", val);
 
-	spdk_bs_md_get_xattr_names(cli_context->blob, &names);
+	spdk_blob_get_xattr_names(cli_context->blob, &names);
 
 	printf("# of xattrs: %d\n", spdk_xattr_names_get_count(names));
 	printf("xattrs:\n");
 	for (i = 0; i < spdk_xattr_names_get_count(names); i++) {
-		spdk_bs_md_get_xattr_value(cli_context->blob,
-					   spdk_xattr_names_get_name(names, i),
-					   &value, &value_len);
+		spdk_blob_get_xattr_value(cli_context->blob,
+					  spdk_xattr_names_get_name(names, i),
+					  &value, &value_len);
 		if ((value_len + 1) > sizeof(data)) {
 			printf("FYI: adjusting size of xattr due to CLI limits.\n");
 			value_len = sizeof(data) - 1;
@@ -474,9 +481,6 @@ show_blob(struct cli_context_t *cli_context)
 		break;
 	case SPDK_BLOB_STATE_LOADING:
 		printf("state: LOADING\n");
-		break;
-	case SPDK_BLOB_STATE_SYNCING:
-		printf("state: SYNCING\n");
 		break;
 	default:
 		printf("state: UNKNOWN\n");
@@ -522,8 +526,7 @@ blob_iter_cb(void *arg1, struct spdk_blob *blob, int bserrno)
 		show_blob(cli_context);
 	}
 
-	spdk_bs_md_iter_next(cli_context->bs, &blob, blob_iter_cb,
-			     cli_context);
+	spdk_bs_iter_next(cli_context->bs, blob, blob_iter_cb, cli_context);
 }
 
 /*
@@ -560,18 +563,15 @@ set_xattr_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	cli_context->blob = blob;
 
 	if (cli_context->action == CLI_SET_XATTR) {
-		spdk_blob_md_set_xattr(cli_context->blob,
-				       cli_context->key,
-				       cli_context->value,
-				       strlen(cli_context->value) + 1);
+		spdk_blob_set_xattr(cli_context->blob, cli_context->key,
+				    cli_context->value, strlen(cli_context->value) + 1);
 		printf("Xattr has been set.\n");
 	} else {
-		spdk_blob_md_remove_xattr(cli_context->blob,
-					  cli_context->key);
+		spdk_blob_remove_xattr(cli_context->blob, cli_context->key);
 		printf("Xattr has been removed.\n");
 	}
 
-	spdk_bs_md_sync_blob(cli_context->blob, sync_cb, cli_context);
+	spdk_blob_sync_md(cli_context->blob, sync_cb, cli_context);
 }
 
 /*
@@ -602,15 +602,14 @@ read_dump_cb(void *arg1, int bserrno)
 	printf(".");
 	if (++cli_context->page_count < cli_context->blob_pages) {
 		/* perform another read */
-		spdk_bs_io_read_blob(cli_context->blob, cli_context->channel,
-				     cli_context->buff, cli_context->page_count,
-				     NUM_PAGES, read_dump_cb, cli_context);
+		spdk_blob_io_read(cli_context->blob, cli_context->channel,
+				  cli_context->buff, cli_context->page_count,
+				  NUM_PAGES, read_dump_cb, cli_context);
 	} else {
 		/* done reading */
 		printf("\nFile write complete (to %s).\n", cli_context->file);
 		fclose(cli_context->fp);
-		spdk_bs_md_close_blob(&cli_context->blob, close_cb,
-				      cli_context);
+		spdk_blob_close(cli_context->blob, close_cb, cli_context);
 	}
 }
 
@@ -651,14 +650,14 @@ write_imp_cb(void *arg1, int bserrno)
 	}
 	if (++cli_context->page_count < cli_context->blob_pages) {
 		printf(".");
-		spdk_bs_io_write_blob(cli_context->blob, cli_context->channel,
-				      cli_context->buff, cli_context->page_count,
-				      NUM_PAGES, write_imp_cb, cli_context);
+		spdk_blob_io_write(cli_context->blob, cli_context->channel,
+				   cli_context->buff, cli_context->page_count,
+				   NUM_PAGES, write_imp_cb, cli_context);
 	} else {
 		/* done writing */
 		printf("\nBlob import complete (from %s).\n", cli_context->file);
 		fclose(cli_context->fp);
-		spdk_bs_md_close_blob(&cli_context->blob, close_cb, cli_context);
+		spdk_blob_close(cli_context->blob, close_cb, cli_context);
 	}
 }
 
@@ -688,7 +687,7 @@ dump_imp_open_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 					    ALIGN_4K, NULL);
 	if (cli_context->buff == NULL) {
 		printf("Error in allocating memory\n");
-		spdk_bs_md_close_blob(&cli_context->blob, close_cb, cli_context);
+		spdk_blob_close(cli_context->blob, close_cb, cli_context);
 		return;
 	}
 	printf("Working");
@@ -698,19 +697,19 @@ dump_imp_open_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		cli_context->fp = fopen(cli_context->file, "w");
 		if (cli_context->fp == NULL) {
 			printf("Error in opening file\n");
-			spdk_bs_md_close_blob(&cli_context->blob, close_cb, cli_context);
+			spdk_blob_close(cli_context->blob, close_cb, cli_context);
 			return;
 		}
 
 		/* read a page of data from the blob */
-		spdk_bs_io_read_blob(cli_context->blob, cli_context->channel,
-				     cli_context->buff, cli_context->page_count,
-				     NUM_PAGES, read_dump_cb, cli_context);
+		spdk_blob_io_read(cli_context->blob, cli_context->channel,
+				  cli_context->buff, cli_context->page_count,
+				  NUM_PAGES, read_dump_cb, cli_context);
 	} else {
 		cli_context->fp = fopen(cli_context->file, "r");
 		if (cli_context->fp == NULL) {
-			printf("Error in opening file\n");
-			spdk_bs_md_close_blob(&cli_context->blob, close_cb, cli_context);
+			printf("Error in opening file: errno %d\n", errno);
+			spdk_blob_close(cli_context->blob, close_cb, cli_context);
 			return;
 		}
 
@@ -731,9 +730,9 @@ dump_imp_open_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 			       cli_context->page_size - cli_context->filesize);
 		}
 
-		spdk_bs_io_write_blob(cli_context->blob, cli_context->channel,
-				      cli_context->buff, cli_context->page_count,
-				      NUM_PAGES, write_imp_cb, cli_context);
+		spdk_blob_io_write(cli_context->blob, cli_context->channel,
+				   cli_context->buff, cli_context->page_count,
+				   NUM_PAGES, write_imp_cb, cli_context);
 	}
 }
 
@@ -752,14 +751,13 @@ write_cb(void *arg1, int bserrno)
 	}
 	printf(".");
 	if (++cli_context->page_count < cli_context->blob_pages) {
-		spdk_bs_io_write_blob(cli_context->blob, cli_context->channel,
-				      cli_context->buff, cli_context->page_count,
-				      NUM_PAGES, write_cb, cli_context);
+		spdk_blob_io_write(cli_context->blob, cli_context->channel,
+				   cli_context->buff, cli_context->page_count,
+				   NUM_PAGES, write_cb, cli_context);
 	} else {
 		/* done writing */
 		printf("\nBlob fill complete (with 0x%x).\n", cli_context->fill_value);
-		spdk_bs_md_close_blob(&cli_context->blob, close_cb,
-				      cli_context);
+		spdk_blob_close(cli_context->blob, close_cb, cli_context);
 	}
 }
 
@@ -791,9 +789,9 @@ fill_blob_cb(void *arg1, struct spdk_blob *blob, int bserrno)
 	memset(cli_context->buff, cli_context->fill_value,
 	       cli_context->page_size);
 	printf("Working");
-	spdk_bs_io_write_blob(cli_context->blob, cli_context->channel,
-			      cli_context->buff,
-			      STARTING_PAGE, NUM_PAGES, write_cb, cli_context);
+	spdk_blob_io_write(cli_context->blob, cli_context->channel,
+			   cli_context->buff,
+			   STARTING_PAGE, NUM_PAGES, write_cb, cli_context);
 }
 
 /*
@@ -830,27 +828,26 @@ load_bs_cb(void *arg1, struct spdk_blob_store *bs, int bserrno)
 		spdk_bs_get_super(cli_context->bs, show_bs_cb, cli_context);
 		break;
 	case CLI_CREATE_BLOB:
-		spdk_bs_md_create_blob(cli_context->bs, blob_create_cb,
-				       cli_context);
+		spdk_bs_create_blob(cli_context->bs, blob_create_cb, cli_context);
 		break;
 	case CLI_SET_XATTR:
 	case CLI_REM_XATTR:
-		spdk_bs_md_open_blob(cli_context->bs, cli_context->blobid,
-				     set_xattr_cb, cli_context);
+		spdk_bs_open_blob(cli_context->bs, cli_context->blobid,
+				  set_xattr_cb, cli_context);
 		break;
 	case CLI_SHOW_BLOB:
 	case CLI_LIST_BLOBS:
-		spdk_bs_md_iter_first(cli_context->bs, blob_iter_cb, cli_context);
+		spdk_bs_iter_first(cli_context->bs, blob_iter_cb, cli_context);
 
 		break;
 	case CLI_DUMP_BLOB:
 	case CLI_IMPORT_BLOB:
-		spdk_bs_md_open_blob(cli_context->bs, cli_context->blobid,
-				     dump_imp_open_cb, cli_context);
+		spdk_bs_open_blob(cli_context->bs, cli_context->blobid,
+				  dump_imp_open_cb, cli_context);
 		break;
 	case CLI_FILL:
-		spdk_bs_md_open_blob(cli_context->bs, cli_context->blobid,
-				     fill_blob_cb, cli_context);
+		spdk_bs_open_blob(cli_context->bs, cli_context->blobid,
+				  fill_blob_cb, cli_context);
 		break;
 
 	default:
@@ -964,6 +961,77 @@ init_bs(struct cli_context_t *cli_context)
 		     cli_context);
 }
 
+static void
+spdk_bsdump_done(void *arg, int bserrno)
+{
+	struct cli_context_t *cli_context = arg;
+
+	if (cli_context->cli_mode == CLI_MODE_CMD) {
+		spdk_app_stop(0);
+	} else {
+		cli_context->action = CLI_NONE;
+		cli_start(cli_context, NULL);
+	}
+}
+
+static void
+bsdump_print_xattr(FILE *fp, const char *bstype, const char *name, const void *value,
+		   size_t value_len)
+{
+	if (strncmp(bstype, "BLOBFS", SPDK_BLOBSTORE_TYPE_LENGTH) == 0) {
+		if (strcmp(name, "name") == 0) {
+			fprintf(fp, "%.*s", (int)value_len, (char *)value);
+		} else if (strcmp(name, "length") == 0 && value_len == sizeof(uint64_t)) {
+			uint64_t length;
+
+			memcpy(&length, value, sizeof(length));
+			fprintf(fp, "%" PRIu64, length);
+		} else {
+			fprintf(fp, "?");
+		}
+	} else if (strncmp(bstype, "LVOLSTORE", SPDK_BLOBSTORE_TYPE_LENGTH) == 0) {
+		if (strcmp(name, "name") == 0) {
+			fprintf(fp, "%s", (char *)value);
+		} else if (strcmp(name, "uuid") == 0 && value_len == sizeof(struct spdk_uuid)) {
+			char uuid[SPDK_UUID_STRING_LEN];
+
+			spdk_uuid_fmt_lower(uuid, sizeof(uuid), (struct spdk_uuid *)value);
+			fprintf(fp, "%s", uuid);
+		} else {
+			fprintf(fp, "?");
+		}
+	} else {
+		fprintf(fp, "?");
+	}
+}
+
+/*
+ * Dump metadata of an existing blobstore in a human-readable format.
+ */
+static void
+dump_bs(struct cli_context_t *cli_context)
+{
+	struct spdk_bdev *bdev = NULL;
+
+	bdev = spdk_bdev_get_by_name(cli_context->bdev_name);
+	if (bdev == NULL) {
+		printf("Could not find a bdev\n");
+		spdk_app_stop(-1);
+		return;
+	}
+	printf("Init blobstore using bdev Product Name: %s\n",
+	       spdk_bdev_get_product_name(bdev));
+
+	cli_context->bs_dev = spdk_bdev_create_bs_dev(bdev, NULL, NULL);
+	if (cli_context->bs_dev == NULL) {
+		printf("Could not create blob bdev!!\n");
+		spdk_app_stop(-1);
+		return;
+	}
+
+	spdk_bs_dump(cli_context->bs_dev, stdout, bsdump_print_xattr, spdk_bsdump_done, cli_context);
+}
+
 /*
  * Common cmd/option parser for command and shell modes.
  */
@@ -974,7 +1042,7 @@ cmd_parser(int argc, char **argv, struct cli_context_t *cli_context)
 	int cmd_chosen = 0;
 	char resp;
 
-	while ((op = getopt(argc, argv, "b:c:d:f:hil:m:n:p:r:s:ST:Xx:")) != -1) {
+	while ((op = getopt(argc, argv, "b:c:d:f:hil:m:n:p:r:s:DST:Xx:")) != -1) {
 		switch (op) {
 		case 'b':
 			if (strcmp(cli_context->bdev_name, "") == 0) {
@@ -990,6 +1058,10 @@ cmd_parser(int argc, char **argv, struct cli_context_t *cli_context)
 			} else {
 				usage(cli_context, "ERROR: -c option not valid during shell mode.\n");
 			}
+			break;
+		case 'D':
+			cmd_chosen++;
+			cli_context->action = CLI_DUMP_BS;
 			break;
 		case 'd':
 			if (argv[optind] != NULL) {
@@ -1306,6 +1378,13 @@ cli_shell(void *arg1, void *arg2)
 	printf("blob> ");
 	bytes_in = getline(&line, &buf_size, stdin);
 
+	/* If getline() failed (EOF), exit the shell. */
+	if (bytes_in < 0) {
+		free(line);
+		cli_context->action = CLI_SHELL_EXIT;
+		return true;
+	}
+
 	/* parse input and update cli_context so we can use common option parser */
 	if (bytes_in > 0) {
 		tok = strtok(line, " ");
@@ -1379,6 +1458,9 @@ cli_start(void *arg1, void *arg2)
 		break;
 	case CLI_INIT_BS:
 		init_bs(cli_context);
+		break;
+	case CLI_DUMP_BS:
+		dump_bs(cli_context);
 		break;
 	case CLI_LIST_BDEVS:
 		list_bdevs(cli_context);

@@ -38,13 +38,15 @@
 #include "spdk_internal/event.h"
 
 static void
+spdk_iscsi_subsystem_init_complete(void *cb_arg, int rc)
+{
+	spdk_subsystem_init_next(rc);
+}
+
+static void
 spdk_iscsi_subsystem_init(void)
 {
-	int rc;
-
-	rc = spdk_iscsi_init();
-
-	spdk_subsystem_init_next(rc);
+	spdk_iscsi_init(spdk_iscsi_subsystem_init_complete, NULL);
 }
 
 static void
@@ -59,6 +61,21 @@ spdk_iscsi_subsystem_fini(void)
 	spdk_iscsi_fini(spdk_iscsi_subsystem_fini_done, NULL);
 }
 
-SPDK_SUBSYSTEM_REGISTER(iscsi, spdk_iscsi_subsystem_init, spdk_iscsi_subsystem_fini,
-			spdk_iscsi_config_text)
+static void
+spdk_iscsi_subsystem_config_json(struct spdk_json_write_ctx *w,
+				 struct spdk_event *done_ev)
+{
+	spdk_iscsi_config_json(w);
+	spdk_event_call(done_ev);
+}
+
+static struct spdk_subsystem g_spdk_subsystem_iscsi = {
+	.name = "iscsi",
+	.init = spdk_iscsi_subsystem_init,
+	.fini = spdk_iscsi_subsystem_fini,
+	.config = spdk_iscsi_config_text,
+	.write_config_json = spdk_iscsi_subsystem_config_json,
+};
+
+SPDK_SUBSYSTEM_REGISTER(g_spdk_subsystem_iscsi);
 SPDK_SUBSYSTEM_DEPEND(iscsi, scsi)

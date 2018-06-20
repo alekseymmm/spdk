@@ -96,10 +96,12 @@ union spdk_nvme_cap_register {
 		uint32_t nssrs		: 1;
 
 		/** command sets supported */
-		uint32_t css_nvm	: 1;
+		uint32_t css		: 8;
 
-		uint32_t css_reserved	: 3;
-		uint32_t reserved2	: 7;
+		/** boot partition support */
+		uint32_t bps		: 1;
+
+		uint32_t reserved2	: 2;
 
 		/** memory page size minimum */
 		uint32_t mpsmin		: 4;
@@ -111,6 +113,17 @@ union spdk_nvme_cap_register {
 	} bits;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cap_register) == 8, "Incorrect size");
+
+/**
+ * I/O Command Set Selected
+ *
+ * Only a single command set is defined as of NVMe 1.3 (NVM).
+ */
+enum spdk_nvme_cc_css {
+	SPDK_NVME_CC_CSS_NVM		= 0x0,	/**< NVM command set */
+};
+
+#define SPDK_NVME_CAP_CSS_NVM (1u << SPDK_NVME_CC_CSS_NVM) /**< NVM command set supported */
 
 union spdk_nvme_cc_register {
 	uint32_t	raw;
@@ -371,7 +384,8 @@ enum spdk_nvme_sgl_descriptor_type {
 	SPDK_NVME_SGL_TYPE_SEGMENT		= 0x2,
 	SPDK_NVME_SGL_TYPE_LAST_SEGMENT		= 0x3,
 	SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK	= 0x4,
-	/* 0x5 - 0xE reserved */
+	SPDK_NVME_SGL_TYPE_TRANSPORT_DATA_BLOCK	= 0x5,
+	/* 0x6 - 0xE reserved */
 	SPDK_NVME_SGL_TYPE_VENDOR_SPECIFIC	= 0xF
 };
 
@@ -397,7 +411,7 @@ struct __attribute__((packed)) spdk_nvme_sgl_descriptor {
 		} unkeyed;
 
 		struct {
-			uint64_t length 	: 24;
+			uint64_t length		: 24;
 			uint64_t key		: 32;
 			uint64_t subtype	: 4;
 			uint64_t type		: 4;
@@ -748,32 +762,58 @@ static inline enum spdk_nvme_data_transfer spdk_nvme_opc_get_data_transfer(uint8
 
 enum spdk_nvme_feat {
 	/* 0x00 - reserved */
+
+	/** cdw11 layout defined by \ref spdk_nvme_feat_arbitration */
 	SPDK_NVME_FEAT_ARBITRATION				= 0x01,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_power_management */
 	SPDK_NVME_FEAT_POWER_MANAGEMENT				= 0x02,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_lba_range_type */
 	SPDK_NVME_FEAT_LBA_RANGE_TYPE				= 0x03,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_temperature_threshold */
 	SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD			= 0x04,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_error_recovery */
 	SPDK_NVME_FEAT_ERROR_RECOVERY				= 0x05,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_volatile_write_cache */
 	SPDK_NVME_FEAT_VOLATILE_WRITE_CACHE			= 0x06,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_number_of_queues */
 	SPDK_NVME_FEAT_NUMBER_OF_QUEUES				= 0x07,
 	SPDK_NVME_FEAT_INTERRUPT_COALESCING			= 0x08,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_interrupt_vector_configuration */
 	SPDK_NVME_FEAT_INTERRUPT_VECTOR_CONFIGURATION		= 0x09,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_write_atomicity */
 	SPDK_NVME_FEAT_WRITE_ATOMICITY				= 0x0A,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_async_event_configuration */
 	SPDK_NVME_FEAT_ASYNC_EVENT_CONFIGURATION		= 0x0B,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_autonomous_power_state_transition */
 	SPDK_NVME_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION	= 0x0C,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_host_mem_buffer */
 	SPDK_NVME_FEAT_HOST_MEM_BUFFER				= 0x0D,
 	SPDK_NVME_FEAT_TIMESTAMP				= 0x0E,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_keep_alive_timer */
 	SPDK_NVME_FEAT_KEEP_ALIVE_TIMER				= 0x0F,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_host_controlled_thermal_management */
 	SPDK_NVME_FEAT_HOST_CONTROLLED_THERMAL_MANAGEMENT	= 0x10,
+	/** cdw11 layout defined by \ref spdk_nvme_feat_non_operational_power_state_config */
 	SPDK_NVME_FEAT_NON_OPERATIONAL_POWER_STATE_CONFIG	= 0x11,
 
+	/* 0x12-0x77 - reserved */
+
+	/* 0x78-0x7F - NVMe-MI features */
+
+	/** cdw11 layout defined by \ref spdk_nvme_feat_software_progress_marker */
 	SPDK_NVME_FEAT_SOFTWARE_PROGRESS_MARKER			= 0x80,
-	/* 0x81-0xBF - command set specific */
+
+	/** cdw11 layout defined by \ref spdk_nvme_feat_host_identifier */
 	SPDK_NVME_FEAT_HOST_IDENTIFIER				= 0x81,
 	SPDK_NVME_FEAT_HOST_RESERVE_MASK			= 0x82,
 	SPDK_NVME_FEAT_HOST_RESERVE_PERSIST			= 0x83,
+
+	/* 0x84-0xBF - command set specific (reserved) */
+
 	/* 0xC0-0xFF - vendor specific */
 };
 
+/** Bit set of attributes for DATASET MANAGEMENT commands. */
 enum spdk_nvme_dsm_attribute {
 	SPDK_NVME_DSM_ATTR_INTEGRAL_READ		= 0x1,
 	SPDK_NVME_DSM_ATTR_INTEGRAL_WRITE		= 0x2,
@@ -1199,7 +1239,8 @@ struct __attribute__((packed)) spdk_nvme_ctrlr_data {
 		uint32_t	oversized_sgl : 1;
 		uint32_t	metadata_address : 1;
 		uint32_t	sgl_offset : 1;
-		uint32_t	reserved2: 11;
+		uint32_t	transport_sgl : 1;
+		uint32_t	reserved2 : 10;
 	} sgls;
 
 	uint8_t			reserved4[228];
@@ -1745,17 +1786,427 @@ struct __attribute__((packed)) spdk_nvme_health_information_page {
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_health_information_page) == 512, "Incorrect size");
 
+/* Commands Supported and Effects Data Structure */
+struct spdk_nvme_cmds_and_effect_entry {
+	/** Command Supported */
+	uint16_t csupp : 1;
+
+	/** Logic Block Content Change  */
+	uint16_t lbcc  : 1;
+
+	/** Namespace Capability Change */
+	uint16_t ncc   : 1;
+
+	/** Namespace Inventory Change */
+	uint16_t nic   : 1;
+
+	/** Controller Capability Change */
+	uint16_t ccc   : 1;
+
+	uint16_t reserved1 : 11;
+
+	/* Command Submission and Execution recommendation
+	 * 000 - No command submission or execution restriction
+	 * 001 - Submitted when there is no outstanding command to same NS
+	 * 010 - Submitted when there is no outstanding command to any NS
+	 * others - Reserved
+	 * \ref command_submission_and_execution in section 5.14.1.5 NVMe Revision 1.3
+	 */
+	uint16_t cse : 3;
+
+	uint16_t reserved2 : 13;
+};
+
+/* Commands Supported and Effects Log Page */
+struct spdk_nvme_cmds_and_effect_log_page {
+	/** Commands Supported and Effects Data Structure for the Admin Commands */
+	struct spdk_nvme_cmds_and_effect_entry admin_cmds_supported[256];
+
+	/** Commands Supported and Effects Data Structure for the IO Commands */
+	struct spdk_nvme_cmds_and_effect_entry io_cmds_supported[256];
+
+	uint8_t reserved0[2048];
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_cmds_and_effect_log_page) == 4096, "Incorrect size");
+
+/**
+ * Asynchronous Event Type
+ */
+enum spdk_nvme_async_event_type {
+	/* Error Status */
+	SPDK_NVME_ASYNC_EVENT_TYPE_ERROR	= 0x0,
+	/* SMART/Health Status */
+	SPDK_NVME_ASYNC_EVENT_TYPE_SMART	= 0x1,
+	/* Notice */
+	SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE	= 0x2,
+	/* 0x3 - 0x5 Reserved */
+
+	/* I/O Command Set Specific Status */
+	SPDK_NVME_ASYNC_EVENT_TYPE_IO		= 0x6,
+	/* Vendor Specific */
+	SPDK_NVME_ASYNC_EVENT_TYPE_VENDOR	= 0x7,
+};
+
+/**
+ * Asynchronous Event Information for Error Status
+ */
+enum spdk_nvme_async_event_info_error {
+	/* Write to Invalid Doorbell Register */
+	SPDK_NVME_ASYNC_EVENT_WRITE_INVALID_DB		= 0x0,
+	/* Invalid Doorbell Register Write Value */
+	SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE		= 0x1,
+	/* Diagnostic Failure */
+	SPDK_NVME_ASYNC_EVENT_DIAGNOSTIC_FAILURE	= 0x2,
+	/* Persistent Internal Error */
+	SPDK_NVME_ASYNC_EVENT_PERSISTENT_INTERNAL	= 0x3,
+	/* Transient Internal Error */
+	SPDK_NVME_ASYNC_EVENT_TRANSIENT_INTERNAL	= 0x4,
+	/* Firmware Image Load Error */
+	SPDK_NVME_ASYNC_EVENT_FW_IMAGE_LOAD		= 0x5,
+
+	/* 0x6 - 0xFF Reserved */
+};
+
+/**
+ * Asynchronous Event Information for SMART/Health Status
+ */
+enum spdk_nvme_async_event_info_smart {
+	/* NVM Subsystem Reliability */
+	SPDK_NVME_ASYNC_EVENT_SUBSYSTEM_RELIABILITY	= 0x0,
+	/* Temperature Threshold */
+	SPDK_NVME_ASYNC_EVENT_TEMPERATURE_THRESHOLD	= 0x1,
+	/* Spare Below Threshold */
+	SPDK_NVME_ASYNC_EVENT_SPARE_BELOW_THRESHOLD	= 0x2,
+
+	/* 0x3 - 0xFF Reserved */
+};
+
+/**
+ * Asynchronous Event Information for Notice
+ */
+enum spdk_nvme_async_event_info_notice {
+	/* Namespace Attribute Changed */
+	SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED		= 0x0,
+	/* Firmware Activation Starting */
+	SPDK_NVME_ASYNC_EVENT_FW_ACTIVATION_START	= 0x1,
+	/* Telemetry Log Changed */
+	SPDK_NVME_ASYNC_EVENT_TELEMETRY_LOG_CHANGED	= 0x2,
+
+	/* 0x3 - 0xFF Reserved */
+};
+
+/**
+ * Asynchronous Event Information for NVM Command Set Specific Status
+ */
+enum spdk_nvme_async_event_info_nvm_command_set {
+	/* Reservation Log Page Avaiable */
+	SPDK_NVME_ASYNC_EVENT_RESERVATION_LOG_AVAIL	= 0x0,
+	/* Sanitize Operation Completed */
+	SPDK_NVME_ASYNC_EVENT_SANITIZE_COMPLETED	= 0x1,
+
+	/* 0x2 - 0xFF Reserved */
+};
+
+/**
+ * Asynchronous Event Request Completion
+ */
+union spdk_nvme_async_event_completion {
+	uint32_t raw;
+	struct {
+		uint32_t async_event_type	: 3;
+		uint32_t reserved1		: 5;
+		uint32_t async_event_info	: 8;
+		uint32_t log_page_identifier	: 8;
+		uint32_t reserved2		: 8;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_async_event_completion) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_ARBITRATION
+ */
+union spdk_nvme_feat_arbitration {
+	uint32_t raw;
+	struct {
+		/** Arbitration Burst */
+		uint32_t ab : 3;
+
+		uint32_t reserved : 5;
+
+		/** Low Priority Weight */
+		uint32_t lpw : 8;
+
+		/** Medium Priority Weight */
+		uint32_t mpw : 8;
+
+		/** High Priority Weight */
+		uint32_t hpw : 8;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_arbitration) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_POWER_MANAGEMENT
+ */
+union spdk_nvme_feat_power_management {
+	uint32_t raw;
+	struct {
+		/** Power State */
+		uint32_t ps : 5;
+
+		/** Workload Hint */
+		uint32_t wh : 3;
+
+		uint32_t reserved : 24;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_power_management) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_LBA_RANGE_TYPE
+ */
+union spdk_nvme_feat_lba_range_type {
+	uint32_t raw;
+	struct {
+		/** Number of LBA Ranges */
+		uint32_t num : 6;
+
+		uint32_t reserved : 26;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_lba_range_type) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD
+ */
+union spdk_nvme_feat_temperature_threshold {
+	uint32_t raw;
+	struct {
+		/** Temperature Threshold */
+		uint32_t tmpth : 16;
+
+		/** Threshold Temperature Select */
+		uint32_t tmpsel : 4;
+
+		/** Threshold Type Select */
+		uint32_t thsel : 2;
+
+		uint32_t reserved : 10;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_temperature_threshold) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_ERROR_RECOVERY
+ */
+union spdk_nvme_feat_error_recovery {
+	uint32_t raw;
+	struct {
+		/** Time Limited Error Recovery */
+		uint32_t tler : 16;
+
+		/** Deallocated or Unwritten Logical Block Error Enable */
+		uint32_t dulbe : 1;
+
+		uint32_t reserved : 15;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_error_recovery) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_VOLATILE_WRITE_CACHE
+ */
+union spdk_nvme_feat_volatile_write_cache {
+	uint32_t raw;
+	struct {
+		/** Volatile Write Cache Enable */
+		uint32_t wce : 1;
+
+		uint32_t reserved : 31;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_volatile_write_cache) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_NUMBER_OF_QUEUES
+ */
+union spdk_nvme_feat_number_of_queues {
+	uint32_t raw;
+	struct {
+		/** Number of I/O Submission Queues Requested */
+		uint32_t nsqr : 16;
+
+		/** Number of I/O Completion Queues Requested */
+		uint32_t ncqr : 16;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_number_of_queues) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_INTERRUPT_VECTOR_CONFIGURATION
+ */
+union spdk_nvme_feat_interrupt_vector_configuration {
+	uint32_t raw;
+	struct {
+		/** Interrupt Vector */
+		uint32_t iv : 16;
+
+		/** Coalescing Disable */
+		uint32_t cd : 1;
+
+		uint32_t reserved : 15;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_interrupt_vector_configuration) == 4,
+		   "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_WRITE_ATOMICITY
+ */
+union spdk_nvme_feat_write_atomicity {
+	uint32_t raw;
+	struct {
+		/** Disable Normal */
+		uint32_t dn : 1;
+
+		uint32_t reserved : 31;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_write_atomicity) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features / Get Features \ref SPDK_NVME_FEAT_ASYNC_EVENT_CONFIGURATION
+ */
+union spdk_nvme_feat_async_event_configuration {
+	uint32_t raw;
+	struct {
+		union spdk_nvme_critical_warning_state crit_warn;
+		uint32_t ns_attr_notice		: 1;
+		uint32_t fw_activation_notice	: 1;
+		uint32_t telemetry_log_notice	: 1;
+		uint32_t reserved		: 21;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_async_event_configuration) == 4, "Incorrect size");
+/* Old name defined for compatibility */
+#define spdk_nvme_async_event_config spdk_nvme_feat_async_event_configuration
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION
+ */
+union spdk_nvme_feat_autonomous_power_state_transition {
+	uint32_t raw;
+	struct {
+		/** Autonomous Power State Transition Enable */
+		uint32_t apste : 1;
+
+		uint32_t reserved : 31;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_autonomous_power_state_transition) == 4,
+		   "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_HOST_MEM_BUFFER
+ */
+union spdk_nvme_feat_host_mem_buffer {
+	uint32_t raw;
+	struct {
+		/** Enable Host Memory */
+		uint32_t ehm : 1;
+
+		/** Memory Return */
+		uint32_t mr : 1;
+
+		uint32_t reserved : 30;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_host_mem_buffer) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_KEEP_ALIVE_TIMER
+ */
+union spdk_nvme_feat_keep_alive_timer {
+	uint32_t raw;
+	struct {
+		/** Keep Alive Timeout */
+		uint32_t kato : 32;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_keep_alive_timer) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_HOST_CONTROLLED_THERMAL_MANAGEMENT
+ */
+union spdk_nvme_feat_host_controlled_thermal_management {
+	uint32_t raw;
+	struct {
+		/** Thermal Management Temperature 2 */
+		uint32_t tmt2 : 16;
+
+		/** Thermal Management Temperature 1 */
+		uint32_t tmt1 : 16;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_host_controlled_thermal_management) == 4,
+		   "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_NON_OPERATIONAL_POWER_STATE_CONFIG
+ */
+union spdk_nvme_feat_non_operational_power_state_config {
+	uint32_t raw;
+	struct {
+		/** Non-Operational Power State Permissive Mode Enable */
+		uint32_t noppme : 1;
+
+		uint32_t reserved : 31;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_non_operational_power_state_config) == 4,
+		   "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_SOFTWARE_PROGRESS_MARKER
+ */
+union spdk_nvme_feat_software_progress_marker {
+	uint32_t raw;
+	struct {
+		/** Pre-boot Software Load Count */
+		uint32_t pbslc : 8;
+
+		uint32_t reserved : 24;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_software_progress_marker) == 4, "Incorrect size");
+
+/**
+ * Data used by Set Features/Get Features \ref SPDK_NVME_FEAT_HOST_IDENTIFIER
+ */
+union spdk_nvme_feat_host_identifier {
+	uint32_t raw;
+	struct {
+		/** Enable Extended Host Identifier */
+		uint32_t exhid : 1;
+
+		uint32_t reserved : 31;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_feat_host_identifier) == 4, "Incorrect size");
+
 /**
  * Firmware slot information page (\ref SPDK_NVME_LOG_FIRMWARE_SLOT)
  */
 struct spdk_nvme_firmware_page {
 	struct {
-		uint8_t	slot		: 3; /* slot for current FW */
-		uint8_t	reserved	: 5;
+		uint8_t	active_slot	: 3; /**< Slot for current FW */
+		uint8_t	reserved3	: 1;
+		uint8_t	next_reset_slot	: 3; /**< Slot that will be active at next controller reset */
+		uint8_t	reserved7	: 1;
 	} afi;
 
 	uint8_t			reserved[7];
-	uint64_t		revision[7]; /* revisions for 7 slots */
+	uint8_t			revision[7][8]; /** Revisions for 7 slots (ASCII strings) */
 	uint8_t			reserved2[448];
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_firmware_page) == 512, "Incorrect size");

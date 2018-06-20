@@ -1,42 +1,31 @@
 # Storage Performance Development Kit {#index}
 
-# Introduction {#intro}
-- @ref getting_started
-- @ref vagrant
-- @ref changelog
-- [Source Code (GitHub)](https://github.com/spdk/spdk/)
+# Introduction
+@copydoc intro
 
-# User Guides {#user_guides}
+# Concepts
+@copydoc concepts
 
-- @ref iscsi_getting_started
-- @ref nvmf_getting_started
-- @ref blobfs_getting_started
+# User Guides
+@copydoc user_guides
 
-# General Information {#general}
+# Programmer Guides
+@copydoc prog_guides
 
- - @ref directory_structure
- - @ref memory
- - @ref porting
- - [Public API header files](files.html)
- - @ref jsonrpc
+# General Information
+@copydoc general
 
-# Modules {#modules}
+# Miscellaneous
+@copydoc misc
 
-- @ref event
-- @ref nvme
-- @ref nvmf
-- @ref ioat
-- @ref iscsi
-- @ref bdev
-- @ref blob
-- @ref blobfs
-- @ref vhost
-- @ref virtio
+# Modules
+@copydoc modules
 
-# Tools {#tools}
+# Tools
+@copydoc tools
 
-- @ref nvme-cli
+# Experimental Tools
+@copydoc experimental_tools
 
-# Performance Reports {#performancereports}
-
-- [SPDK 17.07 vhost-scsi Performance Report](https://ci.spdk.io/download/performance-reports/SPDK17_07_vhost_scsi_performance_report.pdf)
+# Performance Reports
+@copydoc performance_reports

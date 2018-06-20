@@ -45,15 +45,20 @@
 #define NVME_IO_ALIGN		4096
 
 static bool spdk_env_initialized;
+static int spdk_enable_sgl = 0;
 
 struct spdk_fio_options {
 	void	*pad;	/* off1 used in option descriptions may not be 0 */
 	int	mem_size;
 	int	shm_id;
+	int	enable_sgl;
+	char	*hostnqn;
 };
 
 struct spdk_fio_request {
 	struct io_u		*io;
+	/** Offset in current iovec, fio only uses 1 vector */
+	uint32_t iov_offset;
 
 	struct spdk_fio_thread	*fio_thread;
 };
@@ -67,6 +72,7 @@ struct spdk_fio_ctrlr {
 
 static struct spdk_fio_ctrlr *ctrlr_g;
 static int td_count;
+static pthread_t g_ctrlr_thread_id = 0;
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_error;
 
@@ -74,8 +80,8 @@ struct spdk_fio_qpair {
 	struct fio_file		*f;
 	struct spdk_nvme_qpair	*qpair;
 	struct spdk_nvme_ns	*ns;
-	struct spdk_fio_qpair 	*next;
-	struct spdk_fio_ctrlr   *fio_ctrlr;
+	struct spdk_fio_qpair	*next;
+	struct spdk_fio_ctrlr	*fio_ctrlr;
 };
 
 struct spdk_fio_thread {
@@ -91,10 +97,55 @@ struct spdk_fio_thread {
 
 };
 
+static void *
+spdk_fio_poll_ctrlrs(void *arg)
+{
+	struct spdk_fio_ctrlr *fio_ctrlr;
+	int oldstate;
+	int rc;
+
+	/* Loop until the thread is cancelled */
+	while (true) {
+		rc = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to set cancel state disabled on g_init_thread (%d): %s\n",
+				    rc, spdk_strerror(rc));
+		}
+
+		pthread_mutex_lock(&mutex);
+		fio_ctrlr = ctrlr_g;
+
+		while (fio_ctrlr) {
+			spdk_nvme_ctrlr_process_admin_completions(fio_ctrlr->ctrlr);
+			fio_ctrlr = fio_ctrlr->next;
+		}
+
+		pthread_mutex_unlock(&mutex);
+
+		rc = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to set cancel state enabled on g_init_thread (%d): %s\n",
+				    rc, spdk_strerror(rc));
+		}
+
+		/* This is a pthread cancellation point and cannot be removed. */
+		sleep(1);
+	}
+
+	return NULL;
+}
+
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
+	struct thread_data	*td = cb_ctx;
+	struct spdk_fio_options *fio_options = td->eo;
+
+	if (fio_options->hostnqn) {
+		snprintf(opts->hostnqn, sizeof(opts->hostnqn), "%s", fio_options->hostnqn);
+	}
+
 	return true;
 }
 
@@ -117,7 +168,7 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct thread_data 	*td = cb_ctx;
+	struct thread_data	*td = cb_ctx;
 	struct spdk_fio_thread	*fio_thread = td->io_ops_data;
 	struct spdk_fio_ctrlr	*fio_ctrlr;
 	struct spdk_fio_qpair	*fio_qpair;
@@ -155,6 +206,12 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	ns = spdk_nvme_ctrlr_get_ns(fio_ctrlr->ctrlr, ns_id);
 	if (ns == NULL) {
 		SPDK_ERRLOG("Cannot get namespace by ns_id=%d\n", ns_id);
+		g_error = true;
+		return;
+	}
+
+	if (!spdk_nvme_ns_is_active(ns)) {
+		SPDK_ERRLOG("Inactive namespace by ns_id=%d\n", ns_id);
 		g_error = true;
 		return;
 	}
@@ -243,9 +300,23 @@ static int spdk_fio_setup(struct thread_data *td)
 		opts.name = "fio";
 		opts.mem_size = fio_options->mem_size;
 		opts.shm_id = fio_options->shm_id;
-		spdk_env_init(&opts);
+		spdk_enable_sgl = fio_options->enable_sgl;
+		if (spdk_env_init(&opts) < 0) {
+			SPDK_ERRLOG("Unable to initialize SPDK env\n");
+			free(fio_thread->iocq);
+			free(fio_thread);
+			fio_thread = NULL;
+			pthread_mutex_unlock(&mutex);
+			return 1;
+		}
 		spdk_env_initialized = true;
 		spdk_unaffinitize_thread();
+
+		/* Spawn a thread to continue polling the controllers */
+		rc = pthread_create(&g_ctrlr_thread_id, NULL, &spdk_fio_poll_ctrlrs, NULL);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to spawn a thread to poll admin queues. They won't be polled.\n");
+		}
 	}
 
 	for_each_file(td, f, i) {
@@ -372,7 +443,40 @@ static void spdk_fio_completion_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
 	fio_thread->iocq[fio_thread->iocq_count++] = fio_req->io;
 }
 
-static int spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
+static void
+spdk_nvme_io_reset_sgl(void *ref, uint32_t sgl_offset)
+{
+	struct spdk_fio_request *fio_req = (struct spdk_fio_request *)ref;
+
+	fio_req->iov_offset = sgl_offset;
+}
+
+static int
+spdk_nvme_io_next_sge(void *ref, void **address, uint32_t *length)
+{
+	struct spdk_fio_request *fio_req = (struct spdk_fio_request *)ref;
+	struct io_u *io_u = fio_req->io;
+
+	*address = io_u->buf;
+	*length = io_u->xfer_buflen;
+
+	if (fio_req->iov_offset) {
+		assert(fio_req->iov_offset <= io_u->xfer_buflen);
+		*address += fio_req->iov_offset;
+		*length -= fio_req->iov_offset;
+	}
+
+	return 0;
+}
+
+#if FIO_IOOPS_VERSION >= 24
+typedef enum fio_q_status fio_q_status_t;
+#else
+typedef int fio_q_status_t;
+#endif
+
+static fio_q_status_t
+spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 {
 	int rc = 1;
 	struct spdk_fio_thread	*fio_thread = td->io_ops_data;
@@ -402,12 +506,24 @@ static int spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 
 	switch (io_u->ddir) {
 	case DDIR_READ:
-		rc = spdk_nvme_ns_cmd_read(ns, fio_qpair->qpair, io_u->buf, lba, lba_count,
-					   spdk_fio_completion_cb, fio_req, 0);
+		if (!spdk_enable_sgl) {
+			rc = spdk_nvme_ns_cmd_read(ns, fio_qpair->qpair, io_u->buf, lba, lba_count,
+						   spdk_fio_completion_cb, fio_req, 0);
+		} else {
+			rc = spdk_nvme_ns_cmd_readv(ns, fio_qpair->qpair, lba,
+						    lba_count, spdk_fio_completion_cb, fio_req, 0,
+						    spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge);
+		}
 		break;
 	case DDIR_WRITE:
-		rc = spdk_nvme_ns_cmd_write(ns, fio_qpair->qpair, io_u->buf, lba, lba_count,
-					    spdk_fio_completion_cb, fio_req, 0);
+		if (!spdk_enable_sgl) {
+			rc = spdk_nvme_ns_cmd_write(ns, fio_qpair->qpair, io_u->buf, lba, lba_count,
+						    spdk_fio_completion_cb, fio_req, 0);
+		} else {
+			rc = spdk_nvme_ns_cmd_writev(ns, fio_qpair->qpair, lba,
+						     lba_count, spdk_fio_completion_cb, fio_req, 0,
+						     spdk_nvme_io_reset_sgl, spdk_nvme_io_next_sge);
+		}
 		break;
 	default:
 		assert(false);
@@ -510,6 +626,10 @@ static void spdk_fio_cleanup(struct thread_data *td)
 
 	free(fio_thread);
 
+	if (pthread_cancel(g_ctrlr_thread_id) == 0) {
+		pthread_join(g_ctrlr_thread_id, NULL);
+	}
+
 	pthread_mutex_lock(&mutex);
 	td_count--;
 	if (td_count == 0) {
@@ -544,6 +664,24 @@ static struct fio_option options[] = {
 		.type		= FIO_OPT_INT,
 		.off1		= offsetof(struct spdk_fio_options, shm_id),
 		.def		= "-1",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "enable_sgl",
+		.lname		= "SGL used for I/O commands",
+		.type		= FIO_OPT_INT,
+		.off1		= offsetof(struct spdk_fio_options, enable_sgl),
+		.def		= "0",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "hostnqn",
+		.lname		= "Host NQN to use when connecting to controllers.",
+		.type		= FIO_OPT_STR_STORE,
+		.off1		= offsetof(struct spdk_fio_options, hostnqn),
+		.help		= "Host NQN",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},

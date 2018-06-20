@@ -387,8 +387,9 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 
 	/* Always support DMA copy */
 	ioat->dma_capabilities = SPDK_IOAT_ENGINE_COPY_SUPPORTED;
-	if (ioat->regs->dmacapability & SPDK_IOAT_DMACAP_BFILL)
+	if (ioat->regs->dmacapability & SPDK_IOAT_DMACAP_BFILL) {
 		ioat->dma_capabilities |= SPDK_IOAT_ENGINE_FILL_SUPPORTED;
+	}
 	xfercap = ioat->regs->xfercap;
 
 	/* Only bits [4:0] are valid. */
@@ -446,8 +447,9 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 	while (i-- > 0) {
 		spdk_delay_us(100);
 		status = ioat_get_chansts(ioat);
-		if (is_ioat_idle(status))
+		if (is_ioat_idle(status)) {
 			break;
+		}
 	}
 
 	if (is_ioat_idle(status)) {
@@ -465,7 +467,7 @@ ioat_channel_start(struct spdk_ioat_chan *ioat)
 static struct spdk_ioat_chan *
 ioat_attach(void *device)
 {
-	struct spdk_ioat_chan 	*ioat;
+	struct spdk_ioat_chan *ioat;
 	uint32_t cmd_reg;
 
 	ioat = calloc(1, sizeof(struct spdk_ioat_chan));
@@ -717,4 +719,4 @@ spdk_ioat_process_events(struct spdk_ioat_chan *ioat)
 	return ioat_process_channel_events(ioat);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("ioat", SPDK_TRACE_IOAT)
+SPDK_LOG_REGISTER_COMPONENT("ioat", SPDK_LOG_IOAT)

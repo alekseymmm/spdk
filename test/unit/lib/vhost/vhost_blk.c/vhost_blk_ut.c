@@ -36,15 +36,15 @@
 #include "CUnit/Basic.h"
 #include "spdk_cunit.h"
 #include "spdk_internal/mock.h"
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
 
-#include "vhost_blk.c"
+#include "vhost/vhost_blk.c"
 #include "unit/lib/vhost/test_vhost.c"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk/env.h"
 
-DEFINE_STUB(spdk_bdev_free_io, int, (struct spdk_bdev_io *bdev_io), 0);
+DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
 DEFINE_STUB(spdk_bdev_readv, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 				   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t nbytes, spdk_bdev_io_completion_cb cb,
 				   void *cb_arg), 0);
@@ -60,6 +60,11 @@ DEFINE_STUB(spdk_bdev_open, int, (struct spdk_bdev *bdev, bool write,
 DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
 DEFINE_STUB(rte_vhost_driver_enable_features, int, (const char *path, uint64_t features), 0);
 DEFINE_STUB_P(spdk_bdev_get_io_channel, struct spdk_io_channel, (struct spdk_bdev_desc *desc), {0});
+DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 512);
+DEFINE_STUB(spdk_bdev_get_num_blocks, uint64_t, (const struct spdk_bdev *bdev), 0x1);
+DEFINE_STUB(spdk_bdev_has_write_cache, bool, (const struct spdk_bdev *bdev), false);
+
+SPDK_LOG_REGISTER_COMPONENT("vhost", SPDK_LOG_VHOST)
 
 static void
 vhost_blk_controller_construct_test(void)
@@ -88,7 +93,7 @@ alloc_bvdev(void)
 					   SPDK_CACHE_LINE_SIZE, NULL);
 
 	SPDK_CU_ASSERT_FATAL(bvdev != NULL);
-	bvdev->vdev.type = SPDK_VHOST_DEV_T_BLK;
+	bvdev->vdev.backend = &vhost_blk_device_backend;
 	return bvdev;
 }
 
@@ -98,8 +103,8 @@ vhost_blk_construct_test(void)
 	int rc;
 	struct spdk_bdev *ut_p_spdk_bdev = MOCK_PASS_THRU_P;
 
-	MOCK_SET(spdk_vhost_dev_remove_fail, bool, false);
-	MOCK_SET(spdk_vhost_dev_construct_fail, bool, false);
+	MOCK_SET(spdk_vhost_dev_unregister_fail, bool, false);
+	MOCK_SET(spdk_vhost_dev_register_fail, bool, false);
 
 	/* Create device with invalid name */
 	MOCK_SET_P(spdk_bdev_get_by_name, struct spdk_bdev *, NULL);
@@ -114,7 +119,7 @@ vhost_blk_construct_test(void)
 
 	/* Failed to construct controller */
 	MOCK_SET(spdk_bdev_open, int, 0);
-	MOCK_SET(spdk_vhost_dev_construct_fail, bool, true);
+	MOCK_SET(spdk_vhost_dev_register_fail, bool, true);
 	rc = spdk_vhost_blk_construct("vhost.0", "0x1", "Malloc0", true);
 	CU_ASSERT(rc != 0);
 
@@ -123,8 +128,8 @@ vhost_blk_construct_test(void)
 	rc = spdk_vhost_blk_construct("vhost.0", "0x1", "Malloc0", true);
 	CU_ASSERT(rc != 0);
 
-	/* Failed to set readonly as a feature and failde to remove controller */
-	MOCK_SET(spdk_vhost_dev_remove_fail, bool, true);
+	/* Failed to set readonly as a feature and failed to remove controller */
+	MOCK_SET(spdk_vhost_dev_unregister_fail, bool, true);
 	rc = spdk_vhost_blk_construct("vhost.0", "0x1", "Malloc0", true);
 	CU_ASSERT(rc != 0);
 }
@@ -138,13 +143,13 @@ vhost_blk_destroy_test(void)
 	bvdev = alloc_bvdev();
 
 	/* Device has an incorrect type */
-	bvdev->vdev.type = SPDK_VHOST_DEV_T_SCSI;
+	bvdev->vdev.backend = NULL;;
 	rc = spdk_vhost_blk_destroy(&bvdev->vdev);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Failed to remove device */
-	bvdev->vdev.type = SPDK_VHOST_DEV_T_BLK;
-	MOCK_SET(spdk_vhost_dev_remove_fail, bool, true);
+	bvdev->vdev.backend = &vhost_blk_device_backend;
+	MOCK_SET(spdk_vhost_dev_unregister_fail, bool, true);
 	rc = spdk_vhost_blk_destroy(&bvdev->vdev);
 	CU_ASSERT(rc == -1);
 
@@ -169,7 +174,7 @@ main(int argc, char **argv)
 		return CU_get_error();
 	}
 
-	suite = CU_add_suite("vhost_scsi_suite", test_setup, NULL);
+	suite = CU_add_suite("vhost_blk_suite", test_setup, NULL);
 	if (suite == NULL) {
 		CU_cleanup_registry();
 		return CU_get_error();

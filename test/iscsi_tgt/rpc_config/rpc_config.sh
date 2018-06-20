@@ -2,16 +2,11 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
 timing_enter rpc_config
 
-# iSCSI target configuration
-PORT=3260
-INITIATOR_TAG=2
-INITIATOR_NAME=ALL
-NETMASK=$INITIATOR_IP/32
 MALLOC_BDEV_SIZE=64
 
 
@@ -31,7 +26,7 @@ echo "iscsi_tgt is listening. Running tests..."
 
 timing_exit start_iscsi_tgt
 
-$rpc_config_py $rpc_py
+$rpc_config_py $rpc_py $TARGET_IP $INITIATOR_IP $ISCSI_PORT $NETMASK $TARGET_NAMESPACE
 
 $rpc_py get_bdevs
 

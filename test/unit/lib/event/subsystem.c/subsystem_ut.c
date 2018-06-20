@@ -35,7 +35,8 @@
 
 #include "spdk_cunit.h"
 
-#include "subsystem.c"
+#include "unit/lib/json_mock.c"
+#include "event/subsystem.c"
 
 static struct spdk_subsystem g_ut_subsystems[8];
 static struct spdk_subsystem_depend g_ut_subsystem_deps[8];
@@ -105,8 +106,8 @@ subsystem_clear(void)
 		TAILQ_REMOVE(&g_subsystems, subsystem, tailq);
 	}
 
-	TAILQ_FOREACH_SAFE(subsystem_dep, &g_depends, tailq, subsystem_dep_tmp) {
-		TAILQ_REMOVE(&g_depends, subsystem_dep, tailq);
+	TAILQ_FOREACH_SAFE(subsystem_dep, &g_subsystems_deps, tailq, subsystem_dep_tmp) {
+		TAILQ_REMOVE(&g_subsystems_deps, subsystem_dep, tailq);
 	}
 }
 
@@ -202,10 +203,26 @@ subsystem_sort_test_depends_on_multiple(void)
 	TAILQ_REMOVE(&g_subsystems, subsystem, tailq);
 }
 
-SPDK_SUBSYSTEM_REGISTER(subsystem1, NULL, NULL, NULL)
-SPDK_SUBSYSTEM_REGISTER(subsystem2, NULL, NULL, NULL)
-SPDK_SUBSYSTEM_REGISTER(subsystem3, NULL, NULL, NULL)
-SPDK_SUBSYSTEM_REGISTER(subsystem4, NULL, NULL, NULL)
+struct spdk_subsystem subsystem1 = {
+	.name = "subsystem1",
+};
+
+struct spdk_subsystem subsystem2 = {
+	.name = "subsystem2",
+};
+struct spdk_subsystem subsystem3 = {
+	.name = "subsystem3",
+};
+
+struct spdk_subsystem subsystem4 = {
+	.name = "subsystem4",
+};
+
+SPDK_SUBSYSTEM_REGISTER(subsystem1);
+SPDK_SUBSYSTEM_REGISTER(subsystem2);
+SPDK_SUBSYSTEM_REGISTER(subsystem3);
+SPDK_SUBSYSTEM_REGISTER(subsystem4);
+
 SPDK_SUBSYSTEM_DEPEND(subsystem1, subsystem2)
 SPDK_SUBSYSTEM_DEPEND(subsystem2, subsystem3)
 SPDK_SUBSYSTEM_DEPEND(subsystem3, subsystem4)
@@ -250,7 +267,7 @@ int
 main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
-	unsigned int 	num_failures;
+	unsigned int	num_failures;
 
 	if (CU_initialize_registry() != CUE_SUCCESS) {
 		return CU_get_error();

@@ -78,6 +78,219 @@ Example response:
 ~~~
 
 
+# Block Device Abstraction Layer {#jsonrpc_components_bdev}
+
+## set_bdev_options {#rpc_set_bdev_options}
+
+Set global parameters for the block device (bdev) subsystem.  This RPC may only be called
+before subsystems have been initialized.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+bdev_io_pool_size       | Optional | number      | Number of spdk_bdev_io structures in shared buffer pool
+bdev_io_cache_size      | Optional | number      | Maximum number of spdk_bdev_io structures cached per thread
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "set_bdev_options",
+  "params": {
+    "bdev_io_pool_size": 65536,
+    "bdev_io_cache_size": 256
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## get_bdevs {#rpc_get_bdevs}
+
+Get information about block devices (bdevs).
+
+### Parameters
+
+The user may specify no parameters in order to list all block devices, or a block device may be
+specified by name.
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Optional | string      | Block device name
+
+### Response
+
+The response is an array of objects containing information about the requested block devices.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_bdevs",
+  "params": {
+    "name": "Malloc0"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "name": "Malloc0",
+      "product_name": "Malloc disk",
+      "block_size": 512,
+      "num_blocks": 20480,
+      "claimed": false,
+      "supported_io_types": {
+        "read": true,
+        "write": true,
+        "unmap": true,
+        "write_zeroes": true,
+        "flush": true,
+        "reset": true,
+        "nvme_admin": false,
+        "nvme_io": false
+      },
+      "driver_specific": {}
+    }
+  ]
+}
+~~~
+
+## get_bdevs_iostat {#rpc_get_bdevs_iostat}
+
+Get I/O statistics of block devices (bdevs).
+
+### Parameters
+
+The user may specify no parameters in order to list all block devices, or a block device may be
+specified by name.
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Optional | string      | Block device name
+
+### Response
+
+The response is an array of objects containing I/O statistics of the requested block devices.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_bdevs_iostat",
+  "params": {
+    "name": "Nvme0n1"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "name": "Nvme0n1",
+      "bytes_read": 34051522560,
+      "num_read_ops": 8312910,
+      "bytes_written": 0,
+      "num_write_ops": 0
+    }
+  ]
+}
+~~~
+
+## delete_bdev {#rpc_delete_bdev}
+
+Unregister a block device.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "delete_bdev",
+  "params": {
+    "name": "Malloc0"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Block device name
+
+## set_bdev_qos_limit_iops {#rpc_set_bdev_qos_limit_iops}
+
+Set an IOPS-based quality of service rate limit on a bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Block device name
+ios_per_sec             | Required | number      | Number of I/Os per second to allow. 0 means unlimited.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "set_bdev_qos_limit_iops",
+  "params": {
+    "name": "Malloc0"
+    "ios_per_sec": 20000
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
 # NVMe-oF Target {#jsonrpc_components_nvmf_tgt}
 
 ## get_nvmf_subsystems method {#rpc_get_nvmf_subsystems}
@@ -104,7 +317,6 @@ Example response:
   "id": 1,
   "result": [
     {
-      "core": 0,
       "nqn": "nqn.2014-08.org.nvmexpress.discovery",
       "subtype": "Discovery"
       "listen_addresses": [],
@@ -112,7 +324,6 @@ Example response:
       "allow_any_host": true
     },
     {
-      "core": 5,
       "nqn": "nqn.2016-06.io.spdk:cnode1",
       "subtype": "NVMe",
       "listen_addresses": [
@@ -145,13 +356,13 @@ Construct an NVMe over Fabrics target subsystem.
 
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
-core                    | Optional | number      | Core to run the subsystem's poller on. Default: Automatically assign a core.
 nqn                     | Required | string      | Subsystem NQN
-listen_addresses        | Required | array       | Array of @ref rpc_construct_nvmf_subsystem_listen_address objects
+listen_addresses        | Optional | array       | Array of @ref rpc_construct_nvmf_subsystem_listen_address objects
 hosts                   | Optional | array       | Array of strings containing allowed host NQNs. Default: No hosts allowed.
 allow_any_host          | Optional | boolean     | Allow any host (`true`) or enforce allowed host whitelist (`false`). Default: `false`.
 serial_number           | Required | string      | Serial number of virtual controller
 namespaces              | Optional | array       | Array of @ref rpc_construct_nvmf_subsystem_namespace objects. Default: No namespaces.
+max_namespaces          | Optional | number      | Maximum number of namespaces that can be attached to the subsystem. Default: 0 (Unlimited)
 
 ### listen_address {#rpc_construct_nvmf_subsystem_listen_address}
 
@@ -168,6 +379,9 @@ Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 nsid                    | Optional | number      | Namespace ID between 1 and 4294967294, inclusive. Default: Automatically assign NSID.
 bdev_name               | Required | string      | Name of bdev to expose as a namespace.
+nguid                   | Optional | string      | 16-byte namespace globally unique identifier in hexadecimal (e.g. "ABCDEF0123456789ABCDEF0123456789")
+eui64                   | Optional | string      | 8-byte namespace EUI-64 in hexadecimal (e.g. "ABCDEF0123456789")
+uuid                    | Optional | string      | RFC 4122 UUID (e.g. "ceccf520-691e-4b46-9546-34af789907c5")
 
 ### Example
 
@@ -179,7 +393,6 @@ Example request:
   "id": 1,
   "method": "construct_nvmf_subsystem",
   "params": {
-    "core": 5,
     "nqn": "nqn.2016-06.io.spdk:cnode1",
     "listen_addresses": [
       {
@@ -234,6 +447,236 @@ Example request:
   "method": "delete_nvmf_subsystem",
   "params": {
     "nqn": "nqn.2016-06.io.spdk:cnode1"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## nvmf_subsystem_add_listener  method {#rpc_nvmf_subsystem_add_listener}
+
+Add a new listen address to an NVMe-oF subsystem.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+listen_address          | Required | object      | @ref rpc_construct_nvmf_subsystem_listen_address object
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_add_listener",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "listen_address": {
+      "trtype": "RDMA",
+      "adrfam": "IPv4",
+      "traddr": "192.168.0.123",
+      "trsvcid: "4420"
+    }
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## nvmf_subsystem_add_ns method {#rpc_nvmf_subsystem_add_ns}
+
+Add a namespace to a subsystem. The namespace ID is returned as the result.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+namespace               | Required | object      | @ref rpc_construct_nvmf_subsystem_namespace object
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_add_ns",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "namespace": {
+      "nsid": 3,
+      "bdev_name": "Nvme0n1"
+    }
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 3
+}
+~~~
+
+## nvmf_subsystem_remove_ns method {#rpc_nvmf_subsystem_remove_ns}
+
+Remove a namespace from a subsystem.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+nsid                    | Required | number      | Namespace ID
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_remove_ns",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "nsid": 1
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## nvmf_subsystem_add_host method {#rpc_nvmf_subsystem_add_host}
+
+Add a host NQN to the whitelist of allowed hosts.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+host                    | Required | string      | Host NQN to add to the list of allowed host NQNs
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_add_host",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "host": "nqn.2016-06.io.spdk:host1"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## nvmf_subsystem_remove_host method {#rpc_nvmf_subsystem_remove_host}
+
+Remove a host NQN from the whitelist of allowed hosts.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+host                    | Required | string      | Host NQN to remove from the list of allowed host NQNs
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_remove_host",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "host": "nqn.2016-06.io.spdk:host1"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## nvmf_subsystem_allow_any_host method {#rpc_nvmf_subsystem_allow_any_host}
+
+Configure a subsystem to allow any host to connect or to enforce the host NQN whitelist.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+allow_any_host          | Required | boolean     | Allow any host (`true`) or enforce allowed host whitelist (`false`).
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_allow_any_host",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "allow_any_host": true
   }
 }
 ~~~

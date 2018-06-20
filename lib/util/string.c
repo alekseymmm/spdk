@@ -327,18 +327,80 @@ spdk_str_chomp(char *s)
 	return removed;
 }
 
-int
+void
 spdk_strerror_r(int errnum, char *buf, size_t buflen)
 {
+	int rc;
+
 #if defined(__USE_GNU)
 	char *new_buffer;
 	new_buffer = strerror_r(errnum, buf, buflen);
 	if (new_buffer != NULL) {
 		snprintf(buf, buflen, "%s", new_buffer);
-		return 0;
+		rc = 0;
+	} else {
+		rc = 1;
 	}
-	return 0;
 #else
-	return strerror_r(errnum, buf, buflen);
+	rc = strerror_r(errnum, buf, buflen);
 #endif
+
+	if (rc != 0) {
+		snprintf(buf, buflen, "Unknown error %d", errnum);
+	}
+}
+
+int
+spdk_parse_capacity(const char *cap_str, uint64_t *cap, bool *has_prefix)
+{
+	int rc;
+	char bin_prefix;
+
+	rc = sscanf(cap_str, "%"SCNu64"%c", cap, &bin_prefix);
+	if (rc == 1) {
+		*has_prefix = false;
+		return 0;
+	} else if (rc == 0) {
+		if (errno == 0) {
+			/* No scanf matches - the string does not start with a digit */
+			return -EINVAL;
+		} else {
+			/* Parsing error */
+			return -errno;
+		}
+	}
+
+	*has_prefix = true;
+	switch (bin_prefix) {
+	case 'k':
+	case 'K':
+		*cap *= 1024;
+		break;
+	case 'm':
+	case 'M':
+		*cap *= 1024 * 1024;
+		break;
+	case 'g':
+	case 'G':
+		*cap *= 1024 * 1024 * 1024;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+bool
+spdk_mem_all_zero(const void *data, size_t size)
+{
+	const uint8_t *buf = data;
+
+	while (size--) {
+		if (*buf++ != 0) {
+			return false;
+		}
+	}
+
+	return true;
 }

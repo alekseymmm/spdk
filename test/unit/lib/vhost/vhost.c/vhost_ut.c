@@ -35,18 +35,49 @@
 
 #include "CUnit/Basic.h"
 #include "spdk_cunit.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk_internal/mock.h"
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
+#include "unit/lib/json_mock.c"
 
-#include "vhost.c"
+#include "vhost/vhost.c"
 
 DEFINE_STUB(rte_vhost_driver_unregister, int, (const char *path), 0);
 DEFINE_STUB(spdk_event_allocate, struct spdk_event *,
 	    (uint32_t lcore, spdk_event_fn fn, void *arg1, void *arg2), NULL);
 DEFINE_STUB(spdk_mem_register, int, (void *vaddr, size_t len), 0);
 DEFINE_STUB(spdk_mem_unregister, int, (void *vaddr, size_t len), 0);
-DEFINE_STUB(spdk_app_get_core_mask, uint64_t, (void), 0);
+
+static struct spdk_cpuset *g_app_core_mask;
+struct spdk_cpuset *spdk_app_get_core_mask(void)
+{
+	if (g_app_core_mask == NULL) {
+		g_app_core_mask = spdk_cpuset_alloc();
+		spdk_cpuset_set_cpu(g_app_core_mask, 0, true);
+	}
+	return g_app_core_mask;
+}
+
+int
+spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask)
+{
+	int ret;
+	struct spdk_cpuset *validmask;
+
+	ret = spdk_cpuset_parse(cpumask, mask);
+	if (ret < 0) {
+		return ret;
+	}
+
+	validmask = spdk_app_get_core_mask();
+	spdk_cpuset_and(cpumask, validmask);
+
+	return 0;
+}
+
+DEFINE_STUB(spdk_env_get_first_core, uint32_t, (void), 0);
+DEFINE_STUB(spdk_env_get_next_core, uint32_t, (uint32_t prev_core), 0);
+DEFINE_STUB(spdk_env_get_last_core, uint32_t, (void), 0);
 DEFINE_STUB_V(spdk_app_stop, (int rc));
 DEFINE_STUB_V(spdk_event_call, (struct spdk_event *event));
 DEFINE_STUB(spdk_poller_register, struct spdk_poller *, (spdk_poller_fn fn, void *arg,
@@ -67,11 +98,26 @@ DEFINE_STUB(rte_vhost_driver_callback_register, int,
 DEFINE_STUB(rte_vhost_driver_disable_features, int, (const char *path, uint64_t features), 0);
 DEFINE_STUB(rte_vhost_driver_set_features, int, (const char *path, uint64_t features), 0);
 DEFINE_STUB(rte_vhost_driver_register, int, (const char *path, uint64_t flags), 0);
+DEFINE_STUB_V(rte_vhost_log_used_vring, (int vid, uint16_t vring_idx, uint64_t offset,
+		uint64_t len));
+DEFINE_STUB_V(rte_vhost_log_write, (int vid, uint64_t addr, uint64_t len));
 DEFINE_STUB(spdk_vhost_scsi_controller_construct, int, (void), 0);
 DEFINE_STUB(spdk_vhost_blk_controller_construct, int, (void), 0);
+DEFINE_STUB(spdk_vhost_nvme_admin_passthrough, int, (int vid, void *cmd, void *cqe, void *buf), 0);
+DEFINE_STUB(spdk_vhost_nvme_set_cq_call, int, (int vid, uint16_t qid, int fd), 0);
+DEFINE_STUB(spdk_vhost_nvme_get_cap, int, (int vid, uint64_t *cap), 0);
+DEFINE_STUB(spdk_vhost_nvme_controller_construct, int, (void), 0);
 DEFINE_STUB(rte_vhost_set_vhost_vring_last_idx, int,
 	    (int vid, uint16_t vring_idx, uint16_t last_avail_idx, uint16_t last_used_idx), 0);
 DEFINE_STUB(spdk_env_get_current_core, uint32_t, (void), 0);
+
+void *
+spdk_call_unaffinitized(void *cb(void *arg), void *arg)
+{
+	return cb(arg);
+}
+
+static struct spdk_vhost_dev_backend g_vdev_backend;
 
 static int
 test_setup(void)
@@ -79,8 +125,8 @@ test_setup(void)
 	return 0;
 }
 
-static struct spdk_vhost_dev *
-alloc_vdev(void)
+static int
+alloc_vdev(struct spdk_vhost_dev **vdev_p, const char *name, const char *cpumask)
 {
 	struct spdk_vhost_dev *vdev = NULL;
 	int rc;
@@ -90,7 +136,22 @@ alloc_vdev(void)
 	CU_ASSERT(rc == 0);
 	SPDK_CU_ASSERT_FATAL(vdev != NULL);
 	memset(vdev, 0, sizeof(*vdev));
+	rc = spdk_vhost_dev_register(vdev, name, cpumask, &g_vdev_backend);
+	if (rc == 0) {
+		*vdev_p = vdev;
+	} else {
+		free(vdev);
+		*vdev_p = NULL;
+	}
 
+	return rc;
+}
+
+static void
+start_vdev(struct spdk_vhost_dev *vdev)
+{
+	vdev->vid = 0;
+	vdev->lcore = 0;
 	vdev->mem = calloc(1, sizeof(*vdev->mem) + 2 * sizeof(struct rte_vhost_mem_region));
 	SPDK_CU_ASSERT_FATAL(vdev->mem != NULL);
 	vdev->mem->nregions = 2;
@@ -100,16 +161,21 @@ alloc_vdev(void)
 	vdev->mem->regions[1].guest_phys_addr = 0x400000;
 	vdev->mem->regions[1].size = 0x400000; /* 4 MB */
 	vdev->mem->regions[1].host_user_addr = 0x2000000;
-	vdev->vid = 0x10;
-
-	return vdev;
 }
 
 static void
-free_vdev(struct spdk_vhost_dev *vdev)
+stop_vdev(struct spdk_vhost_dev *vdev)
 {
-	free(vdev->name);
 	free(vdev->mem);
+	vdev->mem = NULL;
+	vdev->vid = -1;
+}
+
+static void
+cleanup_vdev(struct spdk_vhost_dev *vdev)
+{
+	stop_vdev(vdev);
+	spdk_vhost_dev_unregister(vdev);
 	free(vdev);
 }
 
@@ -122,7 +188,9 @@ desc_to_iov_test(void)
 	struct vring_desc desc;
 	int rc;
 
-	vdev = alloc_vdev();
+	rc = alloc_vdev(&vdev, "vdev_name_0", "0x1");
+	SPDK_CU_ASSERT_FATAL(rc == 0 && vdev);
+	start_vdev(vdev);
 
 	/* Test simple case where iov falls fully within a 2MB page. */
 	desc.addr = 0x110000;
@@ -160,31 +228,18 @@ desc_to_iov_test(void)
 	iov_index = 0;
 	rc = spdk_vhost_vring_desc_to_iov(vdev, iov, &iov_index, &desc);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(iov_index == 2);
+	CU_ASSERT(iov_index == 1);
 	CU_ASSERT(iov[0].iov_base == (void *)0x11F0000);
-	CU_ASSERT(iov[0].iov_len == 0x10000);
-	CU_ASSERT(iov[1].iov_base == (void *)0x1200000);
-	CU_ASSERT(iov[1].iov_len == 0x10000);
+	CU_ASSERT(iov[0].iov_len == 0x20000);
 	memset(iov, 0, sizeof(iov));
 
 	/* Same test, but ensure it respects the non-zero starting iov_index. */
-	iov_index = SPDK_VHOST_IOVS_MAX - 2;
+	iov_index = SPDK_VHOST_IOVS_MAX - 1;
 	rc = spdk_vhost_vring_desc_to_iov(vdev, iov, &iov_index, &desc);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(iov_index == SPDK_VHOST_IOVS_MAX);
-	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 2].iov_base == (void *)0x11F0000);
-	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 2].iov_len == 0x10000);
-	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 1].iov_base == (void *)0x1200000);
-	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 1].iov_len == 0x10000);
-	memset(iov, 0, sizeof(iov));
-
-	/*
-	 * This test should fail.  The first part of the descriptor will fit in the last
-	 * iov, but the part after the 2MB boundary would overflow.
-	 */
-	iov_index = SPDK_VHOST_IOVS_MAX - 1;
-	rc = spdk_vhost_vring_desc_to_iov(vdev, iov, &iov_index, &desc);
-	CU_ASSERT(rc != 0);
+	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 1].iov_base == (void *)0x11F0000);
+	CU_ASSERT(iov[SPDK_VHOST_IOVS_MAX - 1].iov_len == 0x20000);
 	memset(iov, 0, sizeof(iov));
 
 	/* Test case where iov spans a vhost memory region. */
@@ -200,7 +255,7 @@ desc_to_iov_test(void)
 	CU_ASSERT(iov[1].iov_len == 0x10000);
 	memset(iov, 0, sizeof(iov));
 
-	free_vdev(vdev);
+	cleanup_vdev(vdev);
 
 	CU_ASSERT(true);
 }
@@ -208,109 +263,70 @@ desc_to_iov_test(void)
 static void
 create_controller_test(void)
 {
-	struct spdk_vhost_dev *vdev;
+	struct spdk_vhost_dev *vdev, *vdev2;
 	int ret;
-	unsigned ctrlr_num;
 	char long_name[PATH_MAX];
-	struct spdk_vhost_dev_backend backend;
 
-	MOCK_SET(spdk_app_get_core_mask, uint64_t, 1);
+	/* NOTE: spdk_app_get_core_mask stub always sets coremask 0x01 */
 
 	/* Create device with no name */
-	vdev = alloc_vdev();
-	ret = spdk_vhost_dev_construct(vdev, NULL, "0x1", SPDK_VHOST_DEV_T_BLK, &backend);
+	ret = alloc_vdev(&vdev, NULL, "0x1");
 	CU_ASSERT(ret != 0);
 
 	/* Create device with incorrect cpumask */
-	ret = spdk_vhost_dev_construct(vdev, "vdev_name_0", "0x2", SPDK_VHOST_DEV_T_BLK, &backend);
+	ret = alloc_vdev(&vdev, "vdev_name_0", "0x2");
 	CU_ASSERT(ret != 0);
 
 	/* Create device with too long name and path */
 	memset(long_name, 'x', sizeof(long_name));
 	long_name[PATH_MAX - 1] = 0;
 	snprintf(dev_dirname, sizeof(dev_dirname), "some_path/");
-	ret = spdk_vhost_dev_construct(vdev, long_name, "0x1", SPDK_VHOST_DEV_T_BLK, &backend);
+	ret = alloc_vdev(&vdev, long_name, "0x1");
 	CU_ASSERT(ret != 0);
 	dev_dirname[0] = 0;
 
 	/* Create device when device name is already taken */
-	vdev->name = strdup("vdev_name_0");
-	g_spdk_vhost_devices[0] = vdev;
-	ret = spdk_vhost_dev_construct(vdev, "vdev_name_0", "0x1", SPDK_VHOST_DEV_T_BLK, &backend);
+	ret = alloc_vdev(&vdev, "vdev_name_0", "0x1");
+	SPDK_CU_ASSERT_FATAL(ret == 0 && vdev);
+	ret = alloc_vdev(&vdev2, "vdev_name_0", "0x1");
 	CU_ASSERT(ret != 0);
-
-	/* Create device when max number of devices is reached */
-	for (ctrlr_num = 0; ctrlr_num < MAX_VHOST_DEVICES; ctrlr_num ++) {
-		g_spdk_vhost_devices[ctrlr_num] = vdev;
-	}
-
-	ret = spdk_vhost_dev_construct(vdev, "vdev_name_1", "0x1", SPDK_VHOST_DEV_T_BLK, &backend);
-	CU_ASSERT(ret != 0);
-
-	free_vdev(vdev);
-	for (ctrlr_num = 0; ctrlr_num < MAX_VHOST_DEVICES; ctrlr_num++) {
-		g_spdk_vhost_devices[ctrlr_num] = NULL;
-	}
+	cleanup_vdev(vdev);
 }
 
 static void
 dev_find_by_vid_test(void)
 {
-	struct spdk_vhost_dev *vdev;
+	struct spdk_vhost_dev *vdev, *tmp;
+	int rc;
 
-	g_spdk_vhost_devices[0] = alloc_vdev();
-	vdev = spdk_vhost_dev_find_by_vid(0x10);
-	CU_ASSERT(vdev != NULL);
+	rc = alloc_vdev(&vdev, "vdev_name_0", "0x1");
+	SPDK_CU_ASSERT_FATAL(rc == 0 && vdev);
+
+	tmp = spdk_vhost_dev_find_by_vid(vdev->vid);
+	CU_ASSERT(tmp == vdev);
 
 	/* Search for a device with incorrect vid */
-	vdev = spdk_vhost_dev_find_by_vid(0xFF);
-	CU_ASSERT(vdev == NULL);
+	tmp = spdk_vhost_dev_find_by_vid(vdev->vid + 0xFF);
+	CU_ASSERT(tmp == NULL);
 
-	free_vdev(g_spdk_vhost_devices[0]);
-	g_spdk_vhost_devices[0] = NULL;
+	cleanup_vdev(vdev);
 }
 
 static void
 remove_controller_test(void)
 {
 	struct spdk_vhost_dev *vdev;
-	char long_name[PATH_MAX];
 	int ret;
 
-	vdev = alloc_vdev();
-	vdev->lcore = 0;
-	vdev->name = strdup("vdev_name_0");
+	ret = alloc_vdev(&vdev, "vdev_name_0", "0x1");
+	SPDK_CU_ASSERT_FATAL(ret == 0 && vdev);
 
 	/* Remove device when controller is in use */
-	ret = spdk_vhost_dev_remove(vdev);
+	start_vdev(vdev);
+	ret = spdk_vhost_dev_unregister(vdev);
 	CU_ASSERT(ret != 0);
-	if (ret == 0) {
-		vdev->name = strdup("vdev_name_0");
-	}
 
-	/* Remove nonexistent device */
-	vdev->lcore = -1;
-	ret = spdk_vhost_dev_remove(vdev);
-	CU_ASSERT(ret != 0);
-	if (ret != 0) {
-		free(vdev->name);
-	}
-
-	/* Remove device with too long name and path */
-	memset(long_name, 'x', sizeof(long_name));
-	long_name[PATH_MAX - 1] = 0;
-	snprintf(dev_dirname, sizeof(dev_dirname), "some_path/");
-	vdev->name = strdup(long_name);
-	g_spdk_vhost_devices[0] = vdev;
-	ret = spdk_vhost_dev_remove(vdev);
-	CU_ASSERT(ret != 0);
-	if (ret == 0) {
-		vdev->name = NULL;
-	}
-
-	free_vdev(vdev);
-	g_spdk_vhost_devices[0] = NULL;
-	dev_dirname[0] = 0;
+	cleanup_vdev(vdev);
 }
 
 int

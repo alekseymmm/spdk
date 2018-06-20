@@ -33,22 +33,29 @@
 
 #include "spdk_cunit.h"
 
-#include "lib/test_env.c"
-#include "lib/ut_multithread.c"
+#include "common/lib/test_env.c"
+#include "common/lib/ut_multithread.c"
+#include "unit/lib/json_mock.c"
 
 /* HACK: disable VTune integration so the unit test doesn't need VTune headers and libs to build */
 #undef SPDK_CONFIG_VTUNE
 
-#include "bdev.c"
+#include "bdev/bdev.c"
 
 #define BDEV_UT_NUM_THREADS 3
 
 DEFINE_STUB_V(spdk_scsi_nvme_translate, (const struct spdk_bdev_io *bdev_io,
 		int *sc, int *sk, int *asc, int *ascq));
 
+DEFINE_STUB(spdk_conf_find_section, struct spdk_conf_section *, (struct spdk_conf *cp,
+		const char *name), NULL);
+DEFINE_STUB(spdk_conf_section_get_nmval, char *,
+	    (struct spdk_conf_section *sp, const char *key, int idx1, int idx2), NULL);
+DEFINE_STUB(spdk_conf_section_get_intval, int, (struct spdk_conf_section *sp, const char *key), -1);
+
 struct ut_bdev {
 	struct spdk_bdev	bdev;
-	int			io_target;
+	void			*io_target;
 };
 
 struct ut_bdev_channel {
@@ -57,14 +64,22 @@ struct ut_bdev_channel {
 	uint32_t			avail_cnt;
 };
 
+int g_io_device;
 struct ut_bdev g_bdev;
 struct spdk_bdev_desc *g_desc;
 bool g_teardown_done = false;
+bool g_get_io_channel = true;
+bool g_create_ch = true;
+bool g_init_complete_called = false;
 
 static int
 stub_create_ch(void *io_device, void *ctx_buf)
 {
 	struct ut_bdev_channel *ch = ctx_buf;
+
+	if (g_create_ch == false) {
+		return -1;
+	}
 
 	TAILQ_INIT(&ch->outstanding_io);
 	ch->outstanding_cnt = 0;
@@ -86,7 +101,13 @@ stub_destroy_ch(void *io_device, void *ctx_buf)
 static struct spdk_io_channel *
 stub_get_io_channel(void *ctx)
 {
-	return spdk_get_io_channel(&g_bdev.io_target);
+	struct ut_bdev *ut_bdev = ctx;
+
+	if (g_get_io_channel == true) {
+		return spdk_get_io_channel(ut_bdev->io_target);
+	} else {
+		return NULL;
+	}
 }
 
 static int
@@ -122,9 +143,9 @@ stub_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 }
 
 static uint32_t
-stub_complete_io(uint32_t num_to_complete)
+stub_complete_io(void *io_target, uint32_t num_to_complete)
 {
-	struct spdk_io_channel *_ch = spdk_get_io_channel(&g_bdev.io_target);
+	struct spdk_io_channel *_ch = spdk_get_io_channel(io_target);
 	struct ut_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct spdk_bdev_io *io;
 	bool complete_all = (num_to_complete == 0);
@@ -163,30 +184,43 @@ module_fini(void)
 {
 }
 
-SPDK_BDEV_MODULE_REGISTER(bdev_ut, module_init, module_fini, NULL, NULL, NULL)
+static void
+init_complete(void)
+{
+	g_init_complete_called = true;
+}
+
+struct spdk_bdev_module bdev_ut_if = {
+	.name = "bdev_ut",
+	.module_init = module_init,
+	.module_fini = module_fini,
+	.init_complete = init_complete,
+};
+
+SPDK_BDEV_MODULE_REGISTER(&bdev_ut_if)
 
 static void
-register_bdev(void)
+register_bdev(struct ut_bdev *ut_bdev, char *name, void *io_target)
 {
-	g_bdev.bdev.name = "bdev_ut";
-	g_bdev.bdev.fn_table = &fn_table;
-	g_bdev.bdev.module = SPDK_GET_BDEV_MODULE(bdev_ut);
-	g_bdev.bdev.blocklen = 4096;
-	g_bdev.bdev.blockcnt = 1024;
+	memset(ut_bdev, 0, sizeof(*ut_bdev));
 
-	spdk_io_device_register(&g_bdev.io_target, stub_create_ch, stub_destroy_ch,
-				sizeof(struct ut_bdev_channel));
-	spdk_bdev_register(&g_bdev.bdev);
+	ut_bdev->io_target = io_target;
+	ut_bdev->bdev.ctxt = ut_bdev;
+	ut_bdev->bdev.name = name;
+	ut_bdev->bdev.fn_table = &fn_table;
+	ut_bdev->bdev.module = &bdev_ut_if;
+	ut_bdev->bdev.blocklen = 4096;
+	ut_bdev->bdev.blockcnt = 1024;
+
+	spdk_bdev_register(&ut_bdev->bdev);
 }
 
 static void
-unregister_bdev(void)
+unregister_bdev(struct ut_bdev *ut_bdev)
 {
 	/* Handle any deferred messages. */
 	poll_threads();
-	spdk_bdev_unregister(&g_bdev.bdev, NULL, NULL);
-	spdk_io_device_unregister(&g_bdev.io_target, NULL);
-	memset(&g_bdev, 0, sizeof(g_bdev));
+	spdk_bdev_unregister(&ut_bdev->bdev, NULL, NULL);
 }
 
 static void
@@ -203,7 +237,9 @@ setup_test(void)
 
 	allocate_threads(BDEV_UT_NUM_THREADS);
 	spdk_bdev_initialize(bdev_init_cb, &done);
-	register_bdev();
+	spdk_io_device_register(&g_io_device, stub_create_ch, stub_destroy_ch,
+				sizeof(struct ut_bdev_channel));
+	register_bdev(&g_bdev, "ut_bdev", &g_io_device);
 	spdk_bdev_open(&g_bdev.bdev, true, NULL, NULL, &g_desc);
 }
 
@@ -219,23 +255,140 @@ teardown_test(void)
 	g_teardown_done = false;
 	spdk_bdev_close(g_desc);
 	g_desc = NULL;
-	unregister_bdev();
+	unregister_bdev(&g_bdev);
+	spdk_io_device_unregister(&g_io_device, NULL);
 	spdk_bdev_finish(finish_cb, NULL);
 	poll_threads();
+	memset(&g_bdev, 0, sizeof(g_bdev));
 	CU_ASSERT(g_teardown_done == true);
 	g_teardown_done = false;
 	free_threads();
 }
 
+static uint32_t
+bdev_io_tailq_cnt(bdev_io_tailq_t *tailq)
+{
+	struct spdk_bdev_io *io;
+	uint32_t cnt = 0;
+
+	TAILQ_FOREACH(io, tailq, link) {
+		cnt++;
+	}
+
+	return cnt;
+}
+
 static void
 basic(void)
 {
+	g_init_complete_called = false;
 	setup_test();
+	CU_ASSERT(g_init_complete_called == true);
 
 	set_thread(0);
 
+	g_get_io_channel = false;
 	g_ut_threads[0].ch = spdk_bdev_get_io_channel(g_desc);
+	CU_ASSERT(g_ut_threads[0].ch == NULL);
+
+	g_get_io_channel = true;
+	g_create_ch = false;
+	g_ut_threads[0].ch = spdk_bdev_get_io_channel(g_desc);
+	CU_ASSERT(g_ut_threads[0].ch == NULL);
+
+	g_get_io_channel = true;
+	g_create_ch = true;
+	g_ut_threads[0].ch = spdk_bdev_get_io_channel(g_desc);
+	CU_ASSERT(g_ut_threads[0].ch != NULL);
 	spdk_put_io_channel(g_ut_threads[0].ch);
+
+	teardown_test();
+}
+
+static int
+poller_run_done(void *ctx)
+{
+	bool	*poller_run = ctx;
+
+	*poller_run = true;
+
+	return -1;
+}
+
+static int
+poller_run_times_done(void *ctx)
+{
+	int	*poller_run_times = ctx;
+
+	(*poller_run_times)++;
+
+	return -1;
+}
+
+static void
+basic_poller(void)
+{
+	struct spdk_poller	*poller = NULL;
+	bool			poller_run = false;
+	int			poller_run_times = 0;
+
+	setup_test();
+
+	set_thread(0);
+	reset_time();
+	/* Register a poller with no-wait time and test execution */
+	poller = spdk_poller_register(poller_run_done, &poller_run, 0);
+	CU_ASSERT(poller != NULL);
+
+	poll_threads();
+	CU_ASSERT(poller_run == true);
+
+	spdk_poller_unregister(&poller);
+	CU_ASSERT(poller == NULL);
+
+	/* Register a poller with 1000us wait time and test single execution */
+	poller_run = false;
+	poller = spdk_poller_register(poller_run_done, &poller_run, 1000);
+	CU_ASSERT(poller != NULL);
+
+	poll_threads();
+	CU_ASSERT(poller_run == false);
+
+	increment_time(1000);
+	poll_threads();
+	CU_ASSERT(poller_run == true);
+
+	reset_time();
+	poller_run = false;
+	poll_threads();
+	CU_ASSERT(poller_run == false);
+
+	increment_time(1000);
+	poll_threads();
+	CU_ASSERT(poller_run == true);
+
+	spdk_poller_unregister(&poller);
+	CU_ASSERT(poller == NULL);
+
+	reset_time();
+	/* Register a poller with 1000us wait time and test multiple execution */
+	poller = spdk_poller_register(poller_run_times_done, &poller_run_times, 1000);
+	CU_ASSERT(poller != NULL);
+
+	poll_threads();
+	CU_ASSERT(poller_run_times == 0);
+
+	increment_time(1000);
+	poll_threads();
+	CU_ASSERT(poller_run_times == 1);
+
+	poller_run_times = 0;
+	increment_time(2000);
+	poll_threads();
+	CU_ASSERT(poller_run_times == 2);
+
+	spdk_poller_unregister(&poller);
+	CU_ASSERT(poller == NULL);
 
 	teardown_test();
 }
@@ -270,7 +423,7 @@ put_channel_during_reset(void)
 	spdk_bdev_reset(g_desc, io_ch, reset_done, &done);
 	spdk_put_io_channel(io_ch);
 	poll_threads();
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
 
 	teardown_test();
 }
@@ -331,7 +484,7 @@ aborted_reset(void)
 	 */
 	set_thread(0);
 	spdk_put_io_channel(io_ch[0]);
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
 	poll_threads();
 	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_SUCCESS);
 	CU_ASSERT(g_bdev.bdev.reset_in_progress == NULL);
@@ -340,7 +493,7 @@ aborted_reset(void)
 }
 
 static void
-io_during_reset_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+io_during_io_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	enum spdk_bdev_io_status *status = cb_arg;
 
@@ -367,7 +520,7 @@ io_during_reset(void)
 	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
 	CU_ASSERT(bdev_ch[0]->flags == 0);
 	status0 = SPDK_BDEV_IO_STATUS_PENDING;
-	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_reset_done, &status0);
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &status0);
 	CU_ASSERT(rc == 0);
 
 	set_thread(1);
@@ -375,7 +528,7 @@ io_during_reset(void)
 	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
 	CU_ASSERT(bdev_ch[1]->flags == 0);
 	status1 = SPDK_BDEV_IO_STATUS_PENDING;
-	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_reset_done, &status1);
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &status1);
 	CU_ASSERT(rc == 0);
 
 	poll_threads();
@@ -383,21 +536,21 @@ io_during_reset(void)
 	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_PENDING);
 
 	set_thread(0);
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
 	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_SUCCESS);
 
 	set_thread(1);
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
 	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_SUCCESS);
 
 	/*
-	 * Now submit a reset, and leave it pending while we submit I?O on two different
+	 * Now submit a reset, and leave it pending while we submit I/O on two different
 	 *  channels.  These I/O should be failed by the bdev layer since the reset is in
 	 *  progress.
 	 */
 	set_thread(0);
 	status_reset = SPDK_BDEV_IO_STATUS_PENDING;
-	rc = spdk_bdev_reset(g_desc, io_ch[0], io_during_reset_done, &status_reset);
+	rc = spdk_bdev_reset(g_desc, io_ch[0], io_during_io_done, &status_reset);
 	CU_ASSERT(rc == 0);
 
 	CU_ASSERT(bdev_ch[0]->flags == 0);
@@ -408,12 +561,12 @@ io_during_reset(void)
 
 	set_thread(0);
 	status0 = SPDK_BDEV_IO_STATUS_PENDING;
-	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_reset_done, &status0);
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &status0);
 	CU_ASSERT(rc == 0);
 
 	set_thread(1);
 	status1 = SPDK_BDEV_IO_STATUS_PENDING;
-	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_reset_done, &status1);
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &status1);
 	CU_ASSERT(rc == 0);
 
 	/*
@@ -425,13 +578,301 @@ io_during_reset(void)
 	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_FAILED);
 	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_FAILED);
 
+	/*
+	 * Complete the reset
+	 */
 	set_thread(0);
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
+
+	/*
+	 * Only poll thread 0. We should not get a completion.
+	 */
+	poll_thread(0);
+	CU_ASSERT(status_reset == SPDK_BDEV_IO_STATUS_PENDING);
+
+	/*
+	 * Poll both thread 0 and 1 so the messages can propagate and we
+	 * get a completion.
+	 */
+	poll_threads();
+	CU_ASSERT(status_reset == SPDK_BDEV_IO_STATUS_SUCCESS);
+
 	spdk_put_io_channel(io_ch[0]);
 	set_thread(1);
 	spdk_put_io_channel(io_ch[1]);
 	poll_threads();
-	CU_ASSERT(status_reset == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	teardown_test();
+}
+
+static void
+basic_qos(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	struct spdk_bdev_channel *bdev_ch[2];
+	struct spdk_bdev *bdev;
+	enum spdk_bdev_io_status status;
+	int rc;
+
+	setup_test();
+
+	/* Enable QoS */
+	bdev = &g_bdev.bdev;
+	bdev->qos = calloc(1, sizeof(*bdev->qos));
+	SPDK_CU_ASSERT_FATAL(bdev->qos != NULL);
+	TAILQ_INIT(&bdev->qos->queued);
+	/*
+	 * Enable both IOPS and bandwidth rate limits.
+	 * In this case, both rate limits will take equal effect.
+	 */
+	bdev->qos->iops_rate_limit = 2000; /* 2 I/O per millisecond */
+	bdev->qos->byte_rate_limit = 8192000; /* 8K byte per millisecond with 4K block size */
+
+	g_get_io_channel = true;
+
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
+	CU_ASSERT(bdev_ch[0]->flags == BDEV_CH_QOS_ENABLED);
+
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
+	CU_ASSERT(bdev_ch[1]->flags == BDEV_CH_QOS_ENABLED);
+
+	/*
+	 * Send an I/O on thread 0, which is where the QoS thread is running.
+	 */
+	set_thread(0);
+	status = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &status);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(status == SPDK_BDEV_IO_STATUS_PENDING);
+	poll_threads();
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(status == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	/* Send an I/O on thread 1. The QoS thread is not running here. */
+	status = SPDK_BDEV_IO_STATUS_PENDING;
+	set_thread(1);
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &status);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(status == SPDK_BDEV_IO_STATUS_PENDING);
+	poll_threads();
+	/* Complete I/O on thread 1. This should not complete the I/O we submitted */
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(status == SPDK_BDEV_IO_STATUS_PENDING);
+	/* Now complete I/O on thread 0 */
+	set_thread(0);
+	poll_threads();
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(status == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	/* Tear down the channels */
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	poll_threads();
+	set_thread(0);
+
+	/* Close the descriptor, which should stop the qos channel */
+	spdk_bdev_close(g_desc);
+	poll_threads();
+	CU_ASSERT(bdev->qos->ch == NULL);
+
+	spdk_bdev_open(bdev, true, NULL, NULL, &g_desc);
+
+	/* Create the channels in reverse order. */
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
+	CU_ASSERT(bdev_ch[1]->flags == BDEV_CH_QOS_ENABLED);
+
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
+	CU_ASSERT(bdev_ch[0]->flags == BDEV_CH_QOS_ENABLED);
+
+	/* Confirm that the qos thread is now thread 1 */
+	CU_ASSERT(bdev->qos->ch == bdev_ch[1]);
+
+	/* Tear down the channels */
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	poll_threads();
+
+	set_thread(0);
+
+	teardown_test();
+}
+
+static void
+io_during_qos_queue(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	struct spdk_bdev_channel *bdev_ch[2];
+	struct spdk_bdev *bdev;
+	enum spdk_bdev_io_status status0, status1;
+	int rc;
+
+	setup_test();
+	reset_time();
+
+	/* Enable QoS */
+	bdev = &g_bdev.bdev;
+	bdev->qos = calloc(1, sizeof(*bdev->qos));
+	SPDK_CU_ASSERT_FATAL(bdev->qos != NULL);
+	TAILQ_INIT(&bdev->qos->queued);
+	/*
+	 * Enable both IOPS and bandwidth rate limits.
+	 * In this case, IOPS rate limit will take effect first.
+	 */
+	bdev->qos->iops_rate_limit = 1000; /* 1000 I/O per second, or 1 per millisecond */
+	bdev->qos->byte_rate_limit = 8192000; /* 8K byte per millisecond with 4K block size */
+
+	g_get_io_channel = true;
+
+	/* Create channels */
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
+	CU_ASSERT(bdev_ch[0]->flags == BDEV_CH_QOS_ENABLED);
+
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
+	CU_ASSERT(bdev_ch[1]->flags == BDEV_CH_QOS_ENABLED);
+
+	/* Send two I/O */
+	status1 = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &status1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_PENDING);
+	set_thread(0);
+	status0 = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &status0);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_PENDING);
+
+	/* Complete any I/O that arrived at the disk */
+	poll_threads();
+	set_thread(1);
+	stub_complete_io(g_bdev.io_target, 0);
+	set_thread(0);
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+
+	/* Only one of the I/O should complete. (logical XOR) */
+	if (status0 == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_PENDING);
+	} else {
+		CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_SUCCESS);
+	}
+
+	/* Advance in time by a millisecond */
+	increment_time(1000);
+
+	/* Complete more I/O */
+	poll_threads();
+	set_thread(1);
+	stub_complete_io(g_bdev.io_target, 0);
+	set_thread(0);
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+
+	/* Now the second I/O should be done */
+	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	/* Tear down the channels */
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	poll_threads();
+
+	teardown_test();
+}
+
+static void
+io_during_qos_reset(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	struct spdk_bdev_channel *bdev_ch[2];
+	struct spdk_bdev *bdev;
+	enum spdk_bdev_io_status status0, status1, reset_status;
+	int rc;
+
+	setup_test();
+	reset_time();
+
+	/* Enable QoS */
+	bdev = &g_bdev.bdev;
+	bdev->qos = calloc(1, sizeof(*bdev->qos));
+	SPDK_CU_ASSERT_FATAL(bdev->qos != NULL);
+	TAILQ_INIT(&bdev->qos->queued);
+	/*
+	 * Enable both IOPS and bandwidth rate limits.
+	 * In this case, bandwidth rate limit will take effect first.
+	 */
+	bdev->qos->iops_rate_limit = 2000; /* 2000 I/O per second, or 2 per millisecond */
+	bdev->qos->byte_rate_limit = 4096000; /* 4K byte per millisecond with 4K block size */
+
+	g_get_io_channel = true;
+
+	/* Create channels */
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
+	CU_ASSERT(bdev_ch[0]->flags == BDEV_CH_QOS_ENABLED);
+
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
+	CU_ASSERT(bdev_ch[1]->flags == BDEV_CH_QOS_ENABLED);
+
+	/* Send two I/O. One of these gets queued by QoS. The other is sitting at the disk. */
+	status1 = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &status1);
+	CU_ASSERT(rc == 0);
+	set_thread(0);
+	status0 = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &status0);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_PENDING);
+	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_PENDING);
+
+	/* Reset the bdev. */
+	reset_status = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_reset(g_desc, io_ch[0], io_during_io_done, &reset_status);
+	CU_ASSERT(rc == 0);
+
+	/* Complete any I/O that arrived at the disk */
+	poll_threads();
+	set_thread(1);
+	stub_complete_io(g_bdev.io_target, 0);
+	set_thread(0);
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+
+	CU_ASSERT(reset_status == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(status0 == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_FAILED);
+
+	/* Tear down the channels */
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	poll_threads();
 
 	teardown_test();
 }
@@ -445,24 +886,12 @@ enomem_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_bdev_free_io(bdev_io);
 }
 
-static uint32_t
-bdev_io_tailq_cnt(bdev_io_tailq_t *tailq)
-{
-	struct spdk_bdev_io *io;
-	uint32_t cnt = 0;
-
-	TAILQ_FOREACH(io, tailq, link) {
-		cnt++;
-	}
-
-	return cnt;
-}
-
 static void
 enomem(void)
 {
 	struct spdk_io_channel *io_ch;
 	struct spdk_bdev_channel *bdev_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
 	struct ut_bdev_channel *ut_ch;
 	const uint32_t IO_ARRAY_SIZE = 64;
 	const uint32_t AVAIL = 20;
@@ -476,6 +905,7 @@ enomem(void)
 	set_thread(0);
 	io_ch = spdk_bdev_get_io_channel(g_desc);
 	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	shared_resource = bdev_ch->shared_resource;
 	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
 	ut_ch->avail_cnt = AVAIL;
 
@@ -485,7 +915,7 @@ enomem(void)
 		rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[i]);
 		CU_ASSERT(rc == 0);
 	}
-	CU_ASSERT(TAILQ_EMPTY(&bdev_ch->nomem_io));
+	CU_ASSERT(TAILQ_EMPTY(&shared_resource->nomem_io));
 
 	/*
 	 * Next, submit one additional I/O.  This one should fail with ENOMEM and then go onto
@@ -494,8 +924,8 @@ enomem(void)
 	status[AVAIL] = SPDK_BDEV_IO_STATUS_PENDING;
 	rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[AVAIL]);
 	CU_ASSERT(rc == 0);
-	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&bdev_ch->nomem_io));
-	first_io = TAILQ_FIRST(&bdev_ch->nomem_io);
+	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&shared_resource->nomem_io));
+	first_io = TAILQ_FIRST(&shared_resource->nomem_io);
 
 	/*
 	 * Now submit a bunch more I/O.  These should all fail with ENOMEM and get queued behind
@@ -508,30 +938,30 @@ enomem(void)
 	}
 
 	/* Assert that first_io is still at the head of the list. */
-	CU_ASSERT(TAILQ_FIRST(&bdev_ch->nomem_io) == first_io);
-	CU_ASSERT(bdev_io_tailq_cnt(&bdev_ch->nomem_io) == (IO_ARRAY_SIZE - AVAIL));
-	nomem_cnt = bdev_io_tailq_cnt(&bdev_ch->nomem_io);
-	CU_ASSERT(bdev_ch->nomem_threshold == (AVAIL - NOMEM_THRESHOLD_COUNT));
+	CU_ASSERT(TAILQ_FIRST(&shared_resource->nomem_io) == first_io);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == (IO_ARRAY_SIZE - AVAIL));
+	nomem_cnt = bdev_io_tailq_cnt(&shared_resource->nomem_io);
+	CU_ASSERT(shared_resource->nomem_threshold == (AVAIL - NOMEM_THRESHOLD_COUNT));
 
 	/*
 	 * Complete 1 I/O only.  The key check here is bdev_io_tailq_cnt - this should not have
 	 *  changed since completing just 1 I/O should not trigger retrying the queued nomem_io
 	 *  list.
 	 */
-	stub_complete_io(1);
-	CU_ASSERT(bdev_io_tailq_cnt(&bdev_ch->nomem_io) == nomem_cnt);
+	stub_complete_io(g_bdev.io_target, 1);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == nomem_cnt);
 
 	/*
 	 * Complete enough I/O to hit the nomem_theshold.  This should trigger retrying nomem_io,
 	 *  and we should see I/O get resubmitted to the test bdev module.
 	 */
-	stub_complete_io(NOMEM_THRESHOLD_COUNT - 1);
-	CU_ASSERT(bdev_io_tailq_cnt(&bdev_ch->nomem_io) < nomem_cnt);
-	nomem_cnt = bdev_io_tailq_cnt(&bdev_ch->nomem_io);
+	stub_complete_io(g_bdev.io_target, NOMEM_THRESHOLD_COUNT - 1);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) < nomem_cnt);
+	nomem_cnt = bdev_io_tailq_cnt(&shared_resource->nomem_io);
 
 	/* Complete 1 I/O only.  This should not trigger retrying the queued nomem_io. */
-	stub_complete_io(1);
-	CU_ASSERT(bdev_io_tailq_cnt(&bdev_ch->nomem_io) == nomem_cnt);
+	stub_complete_io(g_bdev.io_target, 1);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == nomem_cnt);
 
 	/*
 	 * Send a reset and confirm that all I/O are completed, including the ones that
@@ -542,13 +972,271 @@ enomem(void)
 	poll_threads();
 	CU_ASSERT(rc == 0);
 	/* This will complete the reset. */
-	stub_complete_io(0);
+	stub_complete_io(g_bdev.io_target, 0);
 
-	CU_ASSERT(bdev_io_tailq_cnt(&bdev_ch->nomem_io) == 0);
-	CU_ASSERT(bdev_ch->io_outstanding == 0);
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == 0);
+	CU_ASSERT(shared_resource->io_outstanding == 0);
 
 	spdk_put_io_channel(io_ch);
 	poll_threads();
+	teardown_test();
+}
+
+static void
+enomem_multi_bdev(void)
+{
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *bdev_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
+	struct ut_bdev_channel *ut_ch;
+	const uint32_t IO_ARRAY_SIZE = 64;
+	const uint32_t AVAIL = 20;
+	enum spdk_bdev_io_status status[IO_ARRAY_SIZE];
+	uint32_t i;
+	struct ut_bdev *second_bdev;
+	struct spdk_bdev_desc *second_desc;
+	struct spdk_bdev_channel *second_bdev_ch;
+	struct spdk_io_channel *second_ch;
+	int rc;
+
+	setup_test();
+
+	/* Register second bdev with the same io_target  */
+	second_bdev = calloc(1, sizeof(*second_bdev));
+	SPDK_CU_ASSERT_FATAL(second_bdev != NULL);
+	register_bdev(second_bdev, "ut_bdev2", g_bdev.io_target);
+	spdk_bdev_open(&second_bdev->bdev, true, NULL, NULL, &second_desc);
+
+	set_thread(0);
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	shared_resource = bdev_ch->shared_resource;
+	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
+	ut_ch->avail_cnt = AVAIL;
+
+	second_ch = spdk_bdev_get_io_channel(second_desc);
+	second_bdev_ch = spdk_io_channel_get_ctx(second_ch);
+	SPDK_CU_ASSERT_FATAL(shared_resource == second_bdev_ch->shared_resource);
+
+	/* Saturate io_target through bdev A. */
+	for (i = 0; i < AVAIL; i++) {
+		status[i] = SPDK_BDEV_IO_STATUS_PENDING;
+		rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[i]);
+		CU_ASSERT(rc == 0);
+	}
+	CU_ASSERT(TAILQ_EMPTY(&shared_resource->nomem_io));
+
+	/*
+	 * Now submit I/O through the second bdev. This should fail with ENOMEM
+	 * and then go onto the nomem_io list.
+	 */
+	status[AVAIL] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(second_desc, second_ch, NULL, 0, 1, enomem_done, &status[AVAIL]);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&shared_resource->nomem_io));
+
+	/* Complete first bdev's I/O. This should retry sending second bdev's nomem_io */
+	stub_complete_io(g_bdev.io_target, AVAIL);
+
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&shared_resource->nomem_io));
+	CU_ASSERT(shared_resource->io_outstanding == 1);
+
+	/* Now complete our retried I/O  */
+	stub_complete_io(g_bdev.io_target, 1);
+	SPDK_CU_ASSERT_FATAL(shared_resource->io_outstanding == 0);
+
+	spdk_put_io_channel(io_ch);
+	spdk_put_io_channel(second_ch);
+	spdk_bdev_close(second_desc);
+	unregister_bdev(second_bdev);
+	poll_threads();
+	free(second_bdev);
+	teardown_test();
+}
+
+
+static void
+enomem_multi_io_target(void)
+{
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *bdev_ch;
+	struct ut_bdev_channel *ut_ch;
+	const uint32_t IO_ARRAY_SIZE = 64;
+	const uint32_t AVAIL = 20;
+	enum spdk_bdev_io_status status[IO_ARRAY_SIZE];
+	uint32_t i;
+	int new_io_device;
+	struct ut_bdev *second_bdev;
+	struct spdk_bdev_desc *second_desc;
+	struct spdk_bdev_channel *second_bdev_ch;
+	struct spdk_io_channel *second_ch;
+	int rc;
+
+	setup_test();
+
+	/* Create new io_target and a second bdev using it */
+	spdk_io_device_register(&new_io_device, stub_create_ch, stub_destroy_ch,
+				sizeof(struct ut_bdev_channel));
+	second_bdev = calloc(1, sizeof(*second_bdev));
+	SPDK_CU_ASSERT_FATAL(second_bdev != NULL);
+	register_bdev(second_bdev, "ut_bdev2", &new_io_device);
+	spdk_bdev_open(&second_bdev->bdev, true, NULL, NULL, &second_desc);
+
+	set_thread(0);
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
+	ut_ch->avail_cnt = AVAIL;
+
+	/* Different io_target should imply a different shared_resource */
+	second_ch = spdk_bdev_get_io_channel(second_desc);
+	second_bdev_ch = spdk_io_channel_get_ctx(second_ch);
+	SPDK_CU_ASSERT_FATAL(bdev_ch->shared_resource != second_bdev_ch->shared_resource);
+
+	/* Saturate io_target through bdev A. */
+	for (i = 0; i < AVAIL; i++) {
+		status[i] = SPDK_BDEV_IO_STATUS_PENDING;
+		rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[i]);
+		CU_ASSERT(rc == 0);
+	}
+	CU_ASSERT(TAILQ_EMPTY(&bdev_ch->shared_resource->nomem_io));
+
+	/* Issue one more I/O to fill ENOMEM list. */
+	status[AVAIL] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[AVAIL]);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&bdev_ch->shared_resource->nomem_io));
+
+	/*
+	 * Now submit I/O through the second bdev. This should go through and complete
+	 * successfully because we're using a different io_device underneath.
+	 */
+	status[AVAIL] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(second_desc, second_ch, NULL, 0, 1, enomem_done, &status[AVAIL]);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&second_bdev_ch->shared_resource->nomem_io));
+	stub_complete_io(second_bdev->io_target, 1);
+
+	/* Cleanup; Complete outstanding I/O. */
+	stub_complete_io(g_bdev.io_target, AVAIL);
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&bdev_ch->shared_resource->nomem_io));
+	/* Complete the ENOMEM I/O */
+	stub_complete_io(g_bdev.io_target, 1);
+	CU_ASSERT(bdev_ch->shared_resource->io_outstanding == 0);
+
+	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&bdev_ch->shared_resource->nomem_io));
+	CU_ASSERT(bdev_ch->shared_resource->io_outstanding == 0);
+	spdk_put_io_channel(io_ch);
+	spdk_put_io_channel(second_ch);
+	spdk_bdev_close(second_desc);
+	unregister_bdev(second_bdev);
+	spdk_io_device_unregister(&new_io_device, NULL);
+	poll_threads();
+	free(second_bdev);
+	teardown_test();
+}
+
+static void
+qos_dynamic_enable_done(void *cb_arg, int status)
+{
+	int *rc = cb_arg;
+	*rc = status;
+}
+
+static void
+qos_dynamic_enable(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	struct spdk_bdev_channel *bdev_ch[2];
+	struct spdk_bdev *bdev;
+	int status, second_status;
+
+	setup_test();
+	reset_time();
+
+	bdev = &g_bdev.bdev;
+
+	g_get_io_channel = true;
+
+	/* Create channels */
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[0] = spdk_io_channel_get_ctx(io_ch[0]);
+	CU_ASSERT(bdev_ch[0]->flags == 0);
+
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch[1] = spdk_io_channel_get_ctx(io_ch[1]);
+	CU_ASSERT(bdev_ch[1]->flags == 0);
+
+	set_thread(0);
+
+	/* Enable QoS */
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 10000, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) != 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) != 0);
+
+	/* Disable QoS */
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 0, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) == 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) == 0);
+
+	/* Disable QoS again */
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 0, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0); /* This should succeed */
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) == 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) == 0);
+
+	/* Enable QoS on thread 0 */
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 10000, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) != 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) != 0);
+
+	/* Disable QoS on thread 1 */
+	set_thread(1);
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 0, qos_dynamic_enable_done, &status);
+	/* Don't poll yet. This should leave the channels with QoS enabled */
+	CU_ASSERT(status == -1);
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) != 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) != 0);
+
+	/* Enable QoS. This should immediately fail because the previous disable QoS hasn't completed. */
+	second_status = 0;
+	spdk_bdev_set_qos_limit_iops(bdev, 10000, qos_dynamic_enable_done, &second_status);
+	poll_threads();
+	CU_ASSERT(status == 0); /* The disable should succeed */
+	CU_ASSERT(second_status < 0); /* The enable should fail */
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) == 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) == 0);
+
+	/* Enable QoS on thread 1. This should succeed now that the disable has completed. */
+	status = -1;
+	spdk_bdev_set_qos_limit_iops(bdev, 10000, qos_dynamic_enable_done, &status);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) != 0);
+	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) != 0);
+
+	/* Tear down the channels */
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	poll_threads();
+
+	set_thread(0);
 	teardown_test();
 }
 
@@ -570,10 +1258,17 @@ main(int argc, char **argv)
 
 	if (
 		CU_add_test(suite, "basic", basic) == NULL ||
+		CU_add_test(suite, "basic_poller", basic_poller) == NULL ||
+		CU_add_test(suite, "basic_qos", basic_qos) == NULL ||
 		CU_add_test(suite, "put_channel_during_reset", put_channel_during_reset) == NULL ||
 		CU_add_test(suite, "aborted_reset", aborted_reset) == NULL ||
 		CU_add_test(suite, "io_during_reset", io_during_reset) == NULL ||
-		CU_add_test(suite, "enomem", enomem) == NULL
+		CU_add_test(suite, "io_during_qos_queue", io_during_qos_queue) == NULL ||
+		CU_add_test(suite, "io_during_qos_reset", io_during_qos_reset) == NULL ||
+		CU_add_test(suite, "enomem", enomem) == NULL ||
+		CU_add_test(suite, "enomem_multi_bdev", enomem_multi_bdev) == NULL ||
+		CU_add_test(suite, "enomem_multi_io_target", enomem_multi_io_target) == NULL ||
+		CU_add_test(suite, "qos_dynamic_enable", qos_dynamic_enable) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

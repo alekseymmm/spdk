@@ -16,6 +16,10 @@ Some configuration calls may also be validated by use of
 "get_*" RPC calls, which provide additional information for verifying
 results.
 
+Tests with thin provisioned lvol bdevs, snapshots and clones are using nbd devices.
+Before writing/reading to lvol bdev, bdev is installed with rpc start_nbd_disk.
+After finishing writing/reading, rpc stop_nbd_disk is used.
+
 ## Tests
 
 ### construct_lvol_store  - positive tests
@@ -69,6 +73,7 @@ Steps:
   because of lvol metadata)
 - repeat the previous step three more times
 - delete lvol bdevs
+- create and delete four lvol bdevs again from steps above
 - destroy lvol store
 - delete malloc bdev
 
@@ -341,11 +346,13 @@ Positive test for removing lvol store persistently
 Steps:
 - construct_lvol_store on NVMe bdev
 - destroy lvol store
-- restart vhost
+- delete NVMe bdev
+- add NVMe bdev
 - check if destroyed lvol store does not exist on NVMe bdev
 
 Expected result:
-- get_lvol_stores should not report any existsing lvol stores in configuration after restarting Vhost instance
+- get_lvol_stores should not report any existsing lvol stores in configuration
+  after deleting and adding NVMe bdev
 - no other operation fails
 
 ### destroy_lvol_store - negative tests
@@ -537,18 +544,19 @@ Expected result:
 
 #### TEST CASE 601 - Name: construct_lvol_store_with_cluster_size_min
 Negative test for constructing a new lvol store.
-Call construct_lvol_store with cluster size = 0.
+Call construct_lvol_store with cluster size smaller than minimal value of 8192.
 Steps:
 - create a malloc bdev
-- construct_lvol_store on correct, exisitng malloc bdev and cluster size 0
+- try construct lvol store on malloc bdev with cluster size 8191
+- verify that lvol store was not created
 
 Expected result:
-- return code != 0
+- construct lvol store return code != 0
 - Error code response printed to stdout
 
 ### logical volume tasting tests
 
-#### TEST CASE 650 - Name: tasting_positive
+#### TEST CASE 700 - Name: tasting_positive
 Positive test for tasting a multi lvol bdev configuration.
 Create a lvol store with some lvol bdevs on NVMe drive and restart vhost app.
 After restarting configuration should be automatically loaded and should be exactly
@@ -559,7 +567,7 @@ Steps:
 - construct lvol store on NVMe bdev
 - using get_lvol_stores command verify lvol store was correctly created
 - construct five lvol bdevs on previously created lvol store;
-  each lvol bdev size is approximately equal to 10% of total lvol store size
+  each lvol bdev size is approximately equal to 2% of total lvol store size
   (approximately because of the lvol metadata which consumes some of the space)
 - using get_bdevs command verify lvol bdevs were correctly created
 - shutdown vhost application by sending SIGTERM signal
@@ -590,13 +598,13 @@ Expected results:
 - all RPC configuration calls successful, return code = 0
 - no other operation fails
 
-#### TEST CASE 651 - Name: tasting_lvol_store_positive
+#### TEST CASE 701 - Name: tasting_lvol_store_positive
 Positive test for tasting lvol store.
 Steps:
 - run vhost app with NVMe bdev
 - construct lvol store on NVMe bdev
-- stop vhost
-- start vhost
+- delete NVMe bdev
+- add NVMe bdev
 - check if lvol store still exists in vhost configuration
 - destroy lvol store from NVMe bdev
 
@@ -604,9 +612,210 @@ Expected result:
 - calls successful (lvol store should be tasted correctly), return code = 0
 - no other operation fails
 
+### snapshot and clone
+
+#### TEST CASE 750 - Name: snapshot_readonly
+- constrcut malloc bdev
+- construct lvol store on malloc bdev
+- construct lvol bdev
+- fill lvol bdev with 100% of its space using write operation
+- create snapshot of created lvol bdev
+- check if created snapshot has readonly status
+- try to perform write operation on created snapshot
+- check if write failed
+- destroy lvol bdev
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- no other operation fails
+
+#### TEST CASE 751 - Name: snapshot_compare_with_lvol_bdev
+- construct malloc bdev
+- construct lvol store on malloc bdev
+- construct thin provisioned lvol bdev with size less than 25% of lvs
+- construct thick provisioned lvol bdev with size less than 25% of lvs
+- fill first lvol bdev with 50% of its space
+- fill second lvol bdev with 100% of their space
+- create snapshots of created lvol bdevs and check that they are readonly
+- check using cmp program if data on corresponding lvol bdevs
+  and snapshots are the same
+- fill lvol bdev again with 50% of its space using write operation
+- compare thin provisioned bdev clusters with snapshot clusters
+  and check that 50% of data are the same and 50% are different
+- destroy lvol bdevs
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- removing snapshot should always end with success
+- no other operation fails
+
+#### TEST CASE 752 - Name: snapshot_during_io_traffic
+- construct malloc bdev
+- construct lvol store on malloc bdev
+- construct thin provisioned lvol bdev
+- perform write operation with verification to created lvol bdev
+- during write operation create snapshot of created lvol bdev
+- check that snapshot has been created successfully and check that it is readonly
+- check that write operation ended with success
+- destroy lvol bdev
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- no other operation fails
+
+#### TEST CASE 753 - Name: snapshot_of_snapshot
+- construct malloc bdev
+- construct lvol store on malloc bdev
+- construct thick provisioned lvol bdev
+- create snapshot of created lvol bdev and check that it is readonly
+- create snapshot of previously created snapshot
+- check if operation fails
+- destroy lvol bdev
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- creating snapshot of snapshot should fail
+- no other operation fails
+
+#### TEST CASE 754 - Name: clone_bdev_only
+- construct malloc bdev
+- construct lvol store on malloc
+- construct thick provisioned lvol bdev
+- create clone of created lvol bdev
+- check if operation fails
+- create snapshot of lvol bdev and check that it is readonly
+- create clone of created lvol bdev
+- check if operation failed
+- create clone of snapshot on the same lvs
+  where snaphot was created
+- check if operation ends with success
+- check if clone is not readonly
+- check that clone is thin provisioned
+- destroy lvol bdev
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- cloning thick provisioned lvol bdev should fail
+- no other operation fails
+
+#### TEST CASE 755 - Name: clone_writing_to_clone
+- construct with malloc bdev
+- construct lvol store on malloc bdev
+- construct thick provisioned lvol bdev
+- fill lvol bdev with 100% of its space
+- create snapshot of thick provisioned lvol bdev
+- create two clones of created snapshot
+- perform write operation to first clone
+  and verify that data were written correctly
+- check that operation ended with success
+- compare second clone with snapshot and check
+  that data on both bdevs are the same
+- destroy lvol bdev
+- destroy lvol store
+- destroy malloc bdev
+
+Expected result:
+- calls successful, return code = 0
+- no other operation fails
+
+### logical volume rename tests
+
+#### TEST CASE 800 - Name: rename_positive
+Positive test for lvol store and lvol bdev rename.
+Steps:
+- create malloc bdev
+- construct lvol store on malloc bdev
+- create 4 lvol bdevs on top of previously created lvol store
+- rename lvol store; verify that lvol store friendly name was
+  updated in get_lvol_stores output; verify that prefix in lvol bdevs
+  friendly names were also updated
+- rename lvol bdevs; use lvols UUID's to point which lvol bdev name to change;
+  verify that all bdev names were successfully updated
+- rename lvol bdevs; use lvols alias name to point which lvol bdev
+  name to change; verify that all bdev names were successfully updated
+- clean running configuration: delete lvol bdevs, destroy lvol store,
+  delete malloc bdev; use lvol store and lvol bdev friendly names for delete
+  and destroy commands to check if new names can be correctly used for performing
+  other RPC operations;
+
+Expected results:
+- lvol store and lvol bdevs correctly created
+- lvol store and lvol bdevs names updated after renaming operation
+- lvol store and lvol bdevs possible to delete using new names
+- no other operation fails
+
+#### TEST CASE 801 - Name: rename_lvs_nonexistent
+Negative test case for lvol store rename.
+Check that error is returned when trying to rename not existing lvol store.
+
+Steps:
+- call rename_lvol_store with name pointing to not existing lvol store
+
+Expected results:
+- rename_lvol_store return code != 0
+- no other operation fails
+
+#### TEST CASE 802 - Name: rename_lvs_EEXIST
+Negative test case for lvol store rename.
+Check that error is returned when trying to rename to a name which is already
+used by another lvol store.
+
+Steps:
+- create 2 malloc bdevs
+- construct lvol store on each malloc bdev
+- on each lvol store create 4 lvol bdevs
+- call rename_lvol_store on first lvol store and try to change its name to
+  the same name as used by second lvol store
+- verify that both lvol stores still have the same names as before
+- verify that lvol bdev have the same aliases as before
+
+Expected results:
+- rename_lvol_store return code != 0; not possible to rename to already
+  used name
+- no other operation fails
+
+#### TEST CASE 803 - Name: rename_lvol_bdev_nonexistent
+Negative test case for lvol bdev rename.
+Check that error is returned when trying to rename not existing lvol bdev.
+
+Steps:
+- call rename_lvol_bdev with name pointing to not existing lvol bdev
+
+Expected results:
+- rename_lvol_bdev return code != 0
+- no other operation fails
+
+#### TEST CASE 804 - Name: rename_lvol_bdev_EEXIST
+Negative test case for lvol bdev rename.
+Check that error is returned when trying to rename to a name which is already
+used by another lvol bdev.
+
+Steps:
+- create malloc bdev
+- construct lvol store on malloc bdev
+- construct 2 lvol bdevs on lvol store
+- call rename_lvol_bdev on first lvol bdev and try to change its name to
+  the same name as used by second lvol bdev
+- verify that both lvol bdev still have the same names as before
+
+Expected results:
+- rename_lvol_bdev return code != 0; not possible to rename to already
+  used name
+- no other operation fails
+
 ### SIGTERM
 
-#### TEST CASE 700 - Name: SIGTERM
+#### TEST CASE 10000 - Name: SIGTERM
 Call CTRL+C (SIGTERM) occurs after creating lvol store
 Steps:
 - create a malloc bdev

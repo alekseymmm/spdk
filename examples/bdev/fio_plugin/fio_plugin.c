@@ -37,7 +37,7 @@
 #include "spdk/copy_engine.h"
 #include "spdk/conf.h"
 #include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/queue.h"
@@ -50,6 +50,7 @@ struct spdk_fio_options {
 	void *pad;
 	char *conf;
 	unsigned mem_mb;
+	bool mem_single_seg;
 };
 
 /* Used to pass messages between fio threads */
@@ -94,6 +95,7 @@ struct spdk_fio_thread {
 };
 
 static struct spdk_fio_thread *g_init_thread = NULL;
+static pthread_t g_init_thread_id = 0;
 static bool g_spdk_env_initialized = false;
 
 static int spdk_fio_init(struct thread_data *td);
@@ -127,7 +129,7 @@ spdk_fio_bdev_init_done(void *cb_arg, int rc)
 
 static struct spdk_poller *
 spdk_fio_start_poller(void *thread_ctx,
-		      spdk_thread_fn fn,
+		      spdk_poller_fn fn,
 		      void *arg,
 		      uint64_t period_microseconds)
 {
@@ -206,6 +208,36 @@ spdk_fio_init_thread(struct thread_data *td)
 	return 0;
 }
 
+static void *
+spdk_init_thread_poll(void *arg)
+{
+	struct spdk_fio_thread *thread = arg;
+	int oldstate;
+	int rc;
+
+	/* Loop until the thread is cancelled */
+	while (true) {
+		rc = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to set cancel state disabled on g_init_thread (%d): %s\n",
+				    rc, spdk_strerror(rc));
+		}
+
+		spdk_fio_poll_thread(thread);
+
+		rc = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to set cancel state enabled on g_init_thread (%d): %s\n",
+				    rc, spdk_strerror(rc));
+		}
+
+		/* This is a pthread cancellation point and cannot be removed. */
+		sleep(1);
+	}
+
+	return NULL;
+}
+
 static int
 spdk_fio_init_env(struct thread_data *td)
 {
@@ -250,8 +282,13 @@ spdk_fio_init_env(struct thread_data *td)
 	if (eo->mem_mb) {
 		opts.mem_size = eo->mem_mb;
 	}
+	opts.hugepage_single_segments = eo->mem_single_seg;
 
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		SPDK_ERRLOG("Unable to initialize SPDK env\n");
+		spdk_conf_free(config);
+		return -1;
+	}
 	spdk_unaffinitize_thread();
 
 	/* Create an SPDK thread temporarily */
@@ -269,10 +306,28 @@ spdk_fio_init_env(struct thread_data *td)
 	/* Initialize the bdev layer */
 	spdk_bdev_initialize(spdk_fio_bdev_init_done, &done);
 
+	/* First, poll until initialization is done. */
 	do {
-		/* Handle init and all cleanup events */
+		spdk_fio_poll_thread(fio_thread);
+	} while (!done);
+
+	/*
+	 * Continue polling until there are no more events.
+	 * This handles any final events posted by pollers.
+	 */
+	do {
 		count = spdk_fio_poll_thread(fio_thread);
-	} while (!done || count > 0);
+	} while (count > 0);
+
+	/*
+	 * Spawn a thread to continue polling this thread
+	 * occasionally.
+	 */
+
+	rc = pthread_create(&g_init_thread_id, NULL, &spdk_init_thread_poll, fio_thread);
+	if (rc != 0) {
+		SPDK_ERRLOG("Unable to spawn thread to poll admin queue. It won't be polled.\n");
+	}
 
 	return 0;
 }
@@ -469,12 +524,19 @@ spdk_fio_completion_cb(struct spdk_bdev_io *bdev_io,
 	struct spdk_fio_thread		*fio_thread = td->io_ops_data;
 
 	assert(fio_thread->iocq_count < fio_thread->iocq_size);
+	fio_req->io->error = success ? 0 : EIO;
 	fio_thread->iocq[fio_thread->iocq_count++] = fio_req->io;
 
 	spdk_bdev_free_io(bdev_io);
 }
 
-static int
+#if FIO_IOOPS_VERSION >= 24
+typedef enum fio_q_status fio_q_status_t;
+#else
+typedef int fio_q_status_t;
+#endif
+
+static fio_q_status_t
 spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 {
 	int rc = 1;
@@ -485,7 +547,8 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 
 	if (!target) {
 		SPDK_ERRLOG("Unable to look up correct I/O target.\n");
-		return -1;
+		fio_req->io->error = ENODEV;
+		return FIO_Q_COMPLETED;
 	}
 
 	switch (io_u->ddir) {
@@ -514,7 +577,8 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (rc != 0) {
-		return -abs(rc);
+		fio_req->io->error = abs(rc);
+		return FIO_Q_COMPLETED;
 	}
 
 	return FIO_Q_QUEUED;
@@ -600,7 +664,7 @@ static struct fio_option options[] = {
 		.lname		= "SPDK configuration file",
 		.type		= FIO_OPT_STR_STORE,
 		.off1		= offsetof(struct spdk_fio_options, conf),
-		.help 		= "An SPDK configuration file",
+		.help		= "An SPDK configuration file",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},
@@ -609,7 +673,16 @@ static struct fio_option options[] = {
 		.lname		= "SPDK memory in MB",
 		.type		= FIO_OPT_INT,
 		.off1		= offsetof(struct spdk_fio_options, mem_mb),
-		.help 		= "Amount of memory in MB to allocate for SPDK",
+		.help		= "Amount of memory in MB to allocate for SPDK",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "spdk_single_seg",
+		.lname		= "SPDK switch to create just a single hugetlbfs file",
+		.type		= FIO_OPT_BOOL,
+		.off1		= offsetof(struct spdk_fio_options, mem_single_seg),
+		.help		= "If set to 1, SPDK will use just a single hugetlbfs file",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},
@@ -668,18 +741,30 @@ spdk_fio_finish_env(void)
 	/* the same thread that called spdk_fio_init_env */
 	fio_thread = g_init_thread;
 
+	if (pthread_cancel(g_init_thread_id) == 0) {
+		pthread_join(g_init_thread_id, NULL);
+	}
+
 	spdk_bdev_finish(spdk_fio_module_finish_done, &done);
 
 	do {
+		spdk_fio_poll_thread(fio_thread);
+	} while (!done);
+
+	do {
 		count = spdk_fio_poll_thread(fio_thread);
-	} while (!done || count > 0);
+	} while (count > 0);
 
 	done = false;
 	spdk_copy_engine_finish(spdk_fio_module_finish_done, &done);
 
 	do {
+		spdk_fio_poll_thread(fio_thread);
+	} while (!done);
+
+	do {
 		count = spdk_fio_poll_thread(fio_thread);
-	} while (!done || count > 0);
+	} while (count > 0);
 
 	spdk_fio_cleanup_thread(fio_thread);
 }

@@ -57,7 +57,7 @@ nvme_transport_unknown(enum spdk_nvme_transport_type trtype)
 #define TRANSPORT_FABRICS_RDMA(func_name, args)	case SPDK_NVME_TRANSPORT_RDMA: SPDK_UNREACHABLE();
 #define TRANSPORT_RDMA_AVAILABLE		false
 #endif
-#define NVME_TRANSPORT_CALL(trtype, func_name, args) 	\
+#define NVME_TRANSPORT_CALL(trtype, func_name, args)		\
 	do {							\
 		switch (trtype) {				\
 		TRANSPORT_PCIE(func_name, args)			\
@@ -144,6 +144,18 @@ uint16_t
 nvme_transport_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr)
 {
 	NVME_TRANSPORT_CALL(ctrlr->trid.trtype, ctrlr_get_max_sges, (ctrlr));
+}
+
+void *
+nvme_transport_ctrlr_alloc_cmb_io_buffer(struct spdk_nvme_ctrlr *ctrlr, size_t size)
+{
+	NVME_TRANSPORT_CALL(ctrlr->trid.trtype, ctrlr_alloc_cmb_io_buffer, (ctrlr, size));
+}
+
+int
+nvme_transport_ctrlr_free_cmb_io_buffer(struct spdk_nvme_ctrlr *ctrlr, void *buf, size_t size)
+{
+	NVME_TRANSPORT_CALL(ctrlr->trid.trtype, ctrlr_free_cmb_io_buffer, (ctrlr, buf, size));
 }
 
 struct spdk_nvme_qpair *

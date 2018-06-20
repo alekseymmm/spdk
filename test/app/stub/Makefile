@@ -37,11 +37,9 @@ include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 APP = stub
 
-CFLAGS += $(ENV_CFLAGS)
-
 C_SRCS := stub.c
 
-SPDK_LIB_LIST = event conf nvme util log trace rpc jsonrpc json
+SPDK_LIB_LIST = event conf nvme log trace rpc jsonrpc json thread util
 
 LIBS += $(SPDK_LIB_LINKER_ARGS)
 LIBS += $(ENV_LINKER_ARGS)
@@ -51,6 +49,7 @@ LIBS += -libverbs -lrdmacm
 endif
 
 all : $(APP)
+	@:
 
 $(APP) : $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
 	$(LINK_C)

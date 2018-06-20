@@ -35,17 +35,18 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/bdev.h"
+#include "spdk/conf.h"
 
 #include "spdk/env.h"
 #include "spdk/event.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/likely.h"
 #include "spdk/queue.h"
 #include "spdk/nvme_spec.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/util.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 #include "spdk/string.h"
 
@@ -55,13 +56,26 @@
 int __itt_init_ittlib(const char *, __itt_group_id);
 #endif
 
-#define SPDK_BDEV_IO_POOL_SIZE	(64 * 1024)
-#define BUF_SMALL_POOL_SIZE	8192
-#define BUF_LARGE_POOL_SIZE	1024
-#define NOMEM_THRESHOLD_COUNT	8
-#define ZERO_BUFFER_SIZE	0x100000
+#define SPDK_BDEV_IO_POOL_SIZE			(64 * 1024)
+#define SPDK_BDEV_IO_CACHE_SIZE			256
+#define BUF_SMALL_POOL_SIZE			8192
+#define BUF_LARGE_POOL_SIZE			1024
+#define NOMEM_THRESHOLD_COUNT			8
+#define ZERO_BUFFER_SIZE			0x100000
+#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC		1000
+#define SPDK_BDEV_SEC_TO_USEC			1000000ULL
+#define SPDK_BDEV_QOS_MIN_IO_PER_TIMESLICE	1
+#define SPDK_BDEV_QOS_MIN_BYTE_PER_TIMESLICE	512
+#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC		10000
+#define SPDK_BDEV_QOS_MIN_BW_IN_MB_PER_SEC	10
 
-typedef TAILQ_HEAD(, spdk_bdev_io) bdev_io_tailq_t;
+enum spdk_bdev_qos_type {
+	SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT = 0,
+	SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT,
+	SPDK_BDEV_QOS_NUM_TYPES /* Keep last */
+};
+
+static const char *qos_type_str[SPDK_BDEV_QOS_NUM_TYPES] = {"Limit_IOPS", "Limit_BWPS"};
 
 struct spdk_bdev_mgr {
 	struct spdk_mempool *bdev_io_pool;
@@ -71,7 +85,7 @@ struct spdk_bdev_mgr {
 
 	void *zero_buffer;
 
-	TAILQ_HEAD(, spdk_bdev_module_if) bdev_modules;
+	TAILQ_HEAD(, spdk_bdev_module) bdev_modules;
 
 	TAILQ_HEAD(, spdk_bdev) bdevs;
 
@@ -90,6 +104,11 @@ static struct spdk_bdev_mgr g_bdev_mgr = {
 	.module_init_complete = false,
 };
 
+static struct spdk_bdev_opts	g_bdev_opts = {
+	.bdev_io_pool_size = SPDK_BDEV_IO_POOL_SIZE,
+	.bdev_io_cache_size = SPDK_BDEV_IO_CACHE_SIZE,
+};
+
 static spdk_bdev_init_cb	g_init_cb_fn = NULL;
 static void			*g_init_cb_arg = NULL;
 
@@ -97,40 +116,72 @@ static spdk_bdev_fini_cb	g_fini_cb_fn = NULL;
 static void			*g_fini_cb_arg = NULL;
 static struct spdk_thread	*g_fini_thread = NULL;
 
+struct spdk_bdev_qos {
+	/** Rate limit, in I/O per second */
+	uint64_t iops_rate_limit;
+
+	/** Rate limit, in byte per second */
+	uint64_t byte_rate_limit;
+
+	/** The channel that all I/O are funneled through */
+	struct spdk_bdev_channel *ch;
+
+	/** The thread on which the poller is running. */
+	struct spdk_thread *thread;
+
+	/** Queue of I/O waiting to be issued. */
+	bdev_io_tailq_t queued;
+
+	/** Maximum allowed IOs to be issued in one timeslice (e.g., 1ms) and
+	 *  only valid for the master channel which manages the outstanding IOs. */
+	uint64_t max_ios_per_timeslice;
+
+	/** Maximum allowed bytes to be issued in one timeslice (e.g., 1ms) and
+	 *  only valid for the master channel which manages the outstanding IOs. */
+	uint64_t max_byte_per_timeslice;
+
+	/** Submitted IO in one timeslice (e.g., 1ms) */
+	uint64_t io_submitted_this_timeslice;
+
+	/** Submitted byte in one timeslice (e.g., 1ms) */
+	uint64_t byte_submitted_this_timeslice;
+
+	/** Polller that processes queued I/O commands each time slice. */
+	struct spdk_poller *poller;
+};
 
 struct spdk_bdev_mgmt_channel {
-	bdev_io_tailq_t need_buf_small;
-	bdev_io_tailq_t need_buf_large;
+	bdev_io_stailq_t need_buf_small;
+	bdev_io_stailq_t need_buf_large;
+
+	/*
+	 * Each thread keeps a cache of bdev_io - this allows
+	 *  bdev threads which are *not* DPDK threads to still
+	 *  benefit from a per-thread bdev_io cache.  Without
+	 *  this, non-DPDK threads fetching from the mempool
+	 *  incur a cmpxchg on get and put.
+	 */
+	bdev_io_stailq_t per_thread_cache;
+	uint32_t	per_thread_cache_count;
+	uint32_t	bdev_io_cache_size;
+
+	TAILQ_HEAD(, spdk_bdev_shared_resource) shared_resources;
 };
 
-struct spdk_bdev_desc {
-	struct spdk_bdev		*bdev;
-	spdk_bdev_remove_cb_t		remove_cb;
-	void				*remove_ctx;
-	bool				write;
-	TAILQ_ENTRY(spdk_bdev_desc)	link;
-};
-
-#define BDEV_CH_RESET_IN_PROGRESS	(1 << 0)
-
-struct spdk_bdev_channel {
-	struct spdk_bdev	*bdev;
-
-	/* The channel for the underlying device */
-	struct spdk_io_channel	*channel;
-
-	/* Channel for the bdev manager */
-	struct spdk_io_channel *mgmt_channel;
-
-	struct spdk_bdev_io_stat stat;
+/*
+ * Per-module (or per-io_device) data. Multiple bdevs built on the same io_device
+ * will queue here their IO that awaits retry. It makes it posible to retry sending
+ * IO to one bdev after IO from other bdev completes.
+ */
+struct spdk_bdev_shared_resource {
+	/* The bdev management channel */
+	struct spdk_bdev_mgmt_channel *mgmt_ch;
 
 	/*
 	 * Count of I/O submitted to bdev module and waiting for completion.
 	 * Incremented before submit_request() is called on an spdk_bdev_io.
 	 */
 	uint64_t		io_outstanding;
-
-	bdev_io_tailq_t		queued_resets;
 
 	/*
 	 * Queue of IO awaiting retry because of a previous NOMEM status returned
@@ -143,17 +194,96 @@ struct spdk_bdev_channel {
 	 */
 	uint64_t		nomem_threshold;
 
+	/* I/O channel allocated by a bdev module */
+	struct spdk_io_channel	*shared_ch;
+
+	/* Refcount of bdev channels using this resource */
+	uint32_t		ref;
+
+	TAILQ_ENTRY(spdk_bdev_shared_resource) link;
+};
+
+#define BDEV_CH_RESET_IN_PROGRESS	(1 << 0)
+#define BDEV_CH_QOS_ENABLED		(1 << 1)
+
+struct spdk_bdev_channel {
+	struct spdk_bdev	*bdev;
+
+	/* The channel for the underlying device */
+	struct spdk_io_channel	*channel;
+
+	/* Per io_device per thread data */
+	struct spdk_bdev_shared_resource *shared_resource;
+
+	struct spdk_bdev_io_stat stat;
+
+	/*
+	 * Count of I/O submitted through this channel and waiting for completion.
+	 * Incremented before submit_request() is called on an spdk_bdev_io.
+	 */
+	uint64_t		io_outstanding;
+
+	bdev_io_tailq_t		queued_resets;
+
 	uint32_t		flags;
 
 #ifdef SPDK_CONFIG_VTUNE
 	uint64_t		start_tsc;
 	uint64_t		interval_tsc;
 	__itt_string_handle	*handle;
+	struct spdk_bdev_io_stat prev_stat;
 #endif
 
 };
 
+struct spdk_bdev_desc {
+	struct spdk_bdev		*bdev;
+	spdk_bdev_remove_cb_t		remove_cb;
+	void				*remove_ctx;
+	bool				remove_scheduled;
+	bool				write;
+	TAILQ_ENTRY(spdk_bdev_desc)	link;
+};
+
+struct spdk_bdev_iostat_ctx {
+	struct spdk_bdev_io_stat *stat;
+	spdk_bdev_get_device_stat_cb cb;
+	void *cb_arg;
+};
+
+#define __bdev_to_io_dev(bdev)		(((char *)bdev) + 1)
+#define __bdev_from_io_dev(io_dev)	((struct spdk_bdev *)(((char *)io_dev) - 1))
+
 static void spdk_bdev_write_zeroes_split(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+
+void
+spdk_bdev_get_opts(struct spdk_bdev_opts *opts)
+{
+	*opts = g_bdev_opts;
+}
+
+int
+spdk_bdev_set_opts(struct spdk_bdev_opts *opts)
+{
+	uint32_t min_pool_size;
+
+	/*
+	 * Add 1 to the thread count to account for the extra mgmt_ch that gets created during subsystem
+	 *  initialization.  A second mgmt_ch will be created on the same thread when the application starts
+	 *  but before the deferred put_io_channel event is executed for the first mgmt_ch.
+	 */
+	min_pool_size = opts->bdev_io_cache_size * (spdk_thread_get_count() + 1);
+	if (opts->bdev_io_pool_size < min_pool_size) {
+		SPDK_ERRLOG("bdev_io_pool_size %" PRIu32 " is not compatible with bdev_io_cache_size %" PRIu32
+			    " and %" PRIu32 " threads\n", opts->bdev_io_pool_size, opts->bdev_io_cache_size,
+			    spdk_thread_get_count());
+		SPDK_ERRLOG("bdev_io_pool_size must be at least %" PRIu32 "\n", min_pool_size);
+		return -1;
+	}
+
+	g_bdev_opts = *opts;
+	return 0;
+}
 
 struct spdk_bdev *
 spdk_bdev_first(void)
@@ -162,7 +292,7 @@ spdk_bdev_first(void)
 
 	bdev = TAILQ_FIRST(&g_bdev_mgr.bdevs);
 	if (bdev) {
-		SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Starting bdev iteration at %s\n", bdev->name);
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Starting bdev iteration at %s\n", bdev->name);
 	}
 
 	return bdev;
@@ -175,7 +305,7 @@ spdk_bdev_next(struct spdk_bdev *prev)
 
 	bdev = TAILQ_NEXT(prev, link);
 	if (bdev) {
-		SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Continuing bdev iteration at %s\n", bdev->name);
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Continuing bdev iteration at %s\n", bdev->name);
 	}
 
 	return bdev;
@@ -185,7 +315,7 @@ static struct spdk_bdev *
 _bdev_next_leaf(struct spdk_bdev *bdev)
 {
 	while (bdev != NULL) {
-		if (TAILQ_EMPTY(&bdev->vbdevs)) {
+		if (bdev->claim_module == NULL) {
 			return bdev;
 		} else {
 			bdev = TAILQ_NEXT(bdev, link);
@@ -203,7 +333,7 @@ spdk_bdev_first_leaf(void)
 	bdev = _bdev_next_leaf(TAILQ_FIRST(&g_bdev_mgr.bdevs));
 
 	if (bdev) {
-		SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Starting bdev iteration at %s\n", bdev->name);
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Starting bdev iteration at %s\n", bdev->name);
 	}
 
 	return bdev;
@@ -217,7 +347,7 @@ spdk_bdev_next_leaf(struct spdk_bdev *prev)
 	bdev = _bdev_next_leaf(TAILQ_NEXT(prev, link));
 
 	if (bdev) {
-		SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Continuing bdev iteration at %s\n", bdev->name);
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Continuing bdev iteration at %s\n", bdev->name);
 	}
 
 	return bdev;
@@ -226,12 +356,20 @@ spdk_bdev_next_leaf(struct spdk_bdev *prev)
 struct spdk_bdev *
 spdk_bdev_get_by_name(const char *bdev_name)
 {
+	struct spdk_bdev_alias *tmp;
 	struct spdk_bdev *bdev = spdk_bdev_first();
 
 	while (bdev != NULL) {
 		if (strcmp(bdev_name, bdev->name) == 0) {
 			return bdev;
 		}
+
+		TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
+			if (strcmp(bdev_name, tmp->alias) == 0) {
+				return bdev;
+			}
+		}
+
 		bdev = spdk_bdev_next(bdev);
 	}
 
@@ -257,27 +395,27 @@ spdk_bdev_io_put_buf(struct spdk_bdev_io *bdev_io)
 	struct spdk_mempool *pool;
 	struct spdk_bdev_io *tmp;
 	void *buf;
-	bdev_io_tailq_t *tailq;
+	bdev_io_stailq_t *stailq;
 	struct spdk_bdev_mgmt_channel *ch;
 
 	assert(bdev_io->u.bdev.iovcnt == 1);
 
 	buf = bdev_io->buf;
-	ch = spdk_io_channel_get_ctx(bdev_io->ch->mgmt_channel);
+	ch = bdev_io->ch->shared_resource->mgmt_ch;
 
 	if (bdev_io->buf_len <= SPDK_BDEV_SMALL_BUF_MAX_SIZE) {
 		pool = g_bdev_mgr.buf_small_pool;
-		tailq = &ch->need_buf_small;
+		stailq = &ch->need_buf_small;
 	} else {
 		pool = g_bdev_mgr.buf_large_pool;
-		tailq = &ch->need_buf_large;
+		stailq = &ch->need_buf_large;
 	}
 
-	if (TAILQ_EMPTY(tailq)) {
+	if (STAILQ_EMPTY(stailq)) {
 		spdk_mempool_put(pool, buf);
 	} else {
-		tmp = TAILQ_FIRST(tailq);
-		TAILQ_REMOVE(tailq, tmp, buf_link);
+		tmp = STAILQ_FIRST(stailq);
+		STAILQ_REMOVE_HEAD(stailq, internal.buf_link);
 		spdk_bdev_io_set_buf(tmp, buf);
 	}
 }
@@ -286,9 +424,9 @@ void
 spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, uint64_t len)
 {
 	struct spdk_mempool *pool;
-	bdev_io_tailq_t *tailq;
+	bdev_io_stailq_t *stailq;
 	void *buf = NULL;
-	struct spdk_bdev_mgmt_channel *ch;
+	struct spdk_bdev_mgmt_channel *mgmt_ch;
 
 	assert(cb != NULL);
 	assert(bdev_io->u.bdev.iovs != NULL);
@@ -300,22 +438,22 @@ spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, u
 	}
 
 	assert(len <= SPDK_BDEV_LARGE_BUF_MAX_SIZE);
-	ch = spdk_io_channel_get_ctx(bdev_io->ch->mgmt_channel);
+	mgmt_ch = bdev_io->ch->shared_resource->mgmt_ch;
 
 	bdev_io->buf_len = len;
 	bdev_io->get_buf_cb = cb;
 	if (len <= SPDK_BDEV_SMALL_BUF_MAX_SIZE) {
 		pool = g_bdev_mgr.buf_small_pool;
-		tailq = &ch->need_buf_small;
+		stailq = &mgmt_ch->need_buf_small;
 	} else {
 		pool = g_bdev_mgr.buf_large_pool;
-		tailq = &ch->need_buf_large;
+		stailq = &mgmt_ch->need_buf_large;
 	}
 
 	buf = spdk_mempool_get(pool);
 
 	if (!buf) {
-		TAILQ_INSERT_TAIL(tailq, bdev_io, buf_link);
+		STAILQ_INSERT_TAIL(stailq, bdev_io, internal.buf_link);
 	} else {
 		spdk_bdev_io_set_buf(bdev_io, buf);
 	}
@@ -324,7 +462,7 @@ spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, u
 static int
 spdk_bdev_module_get_max_ctx_size(void)
 {
-	struct spdk_bdev_module_if *bdev_module;
+	struct spdk_bdev_module *bdev_module;
 	int max_bdev_module_size = 0;
 
 	TAILQ_FOREACH(bdev_module, &g_bdev_mgr.bdev_modules, tailq) {
@@ -339,7 +477,7 @@ spdk_bdev_module_get_max_ctx_size(void)
 void
 spdk_bdev_config_text(FILE *fp)
 {
-	struct spdk_bdev_module_if *bdev_module;
+	struct spdk_bdev_module *bdev_module;
 
 	TAILQ_FOREACH(bdev_module, &g_bdev_mgr.bdev_modules, tailq) {
 		if (bdev_module->config_text) {
@@ -348,13 +486,61 @@ spdk_bdev_config_text(FILE *fp)
 	}
 }
 
+void
+spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w)
+{
+	struct spdk_bdev_module *bdev_module;
+	struct spdk_bdev *bdev;
+
+	assert(w != NULL);
+
+	spdk_json_write_array_begin(w);
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "set_bdev_options");
+	spdk_json_write_name(w, "params");
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "bdev_io_pool_size", g_bdev_opts.bdev_io_pool_size);
+	spdk_json_write_named_uint32(w, "bdev_io_cache_size", g_bdev_opts.bdev_io_cache_size);
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+
+	TAILQ_FOREACH(bdev_module, &g_bdev_mgr.bdev_modules, tailq) {
+		if (bdev_module->config_json) {
+			bdev_module->config_json(w);
+		}
+	}
+
+	TAILQ_FOREACH(bdev, &g_bdev_mgr.bdevs, link) {
+		spdk_bdev_config_json(bdev, w);
+	}
+
+	spdk_json_write_array_end(w);
+}
+
 static int
 spdk_bdev_mgmt_channel_create(void *io_device, void *ctx_buf)
 {
 	struct spdk_bdev_mgmt_channel *ch = ctx_buf;
+	struct spdk_bdev_io *bdev_io;
+	uint32_t i;
 
-	TAILQ_INIT(&ch->need_buf_small);
-	TAILQ_INIT(&ch->need_buf_large);
+	STAILQ_INIT(&ch->need_buf_small);
+	STAILQ_INIT(&ch->need_buf_large);
+
+	STAILQ_INIT(&ch->per_thread_cache);
+	ch->bdev_io_cache_size = g_bdev_opts.bdev_io_cache_size;
+
+	/* Pre-populate bdev_io cache to ensure this thread cannot be starved. */
+	ch->per_thread_cache_count = 0;
+	for (i = 0; i < ch->bdev_io_cache_size; i++) {
+		bdev_io = spdk_mempool_get(g_bdev_mgr.bdev_io_pool);
+		assert(bdev_io != NULL);
+		ch->per_thread_cache_count++;
+		STAILQ_INSERT_TAIL(&ch->per_thread_cache, bdev_io, internal.buf_link);
+	}
+
+	TAILQ_INIT(&ch->shared_resources);
 
 	return 0;
 }
@@ -363,10 +549,24 @@ static void
 spdk_bdev_mgmt_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bdev_mgmt_channel *ch = ctx_buf;
+	struct spdk_bdev_io *bdev_io;
 
-	if (!TAILQ_EMPTY(&ch->need_buf_small) || !TAILQ_EMPTY(&ch->need_buf_large)) {
-		SPDK_ERRLOG("Pending I/O list wasn't empty on channel destruction\n");
+	if (!STAILQ_EMPTY(&ch->need_buf_small) || !STAILQ_EMPTY(&ch->need_buf_large)) {
+		SPDK_ERRLOG("Pending I/O list wasn't empty on mgmt channel free\n");
 	}
+
+	if (!TAILQ_EMPTY(&ch->shared_resources)) {
+		SPDK_ERRLOG("Module channel list wasn't empty on mgmt channel free\n");
+	}
+
+	while (!STAILQ_EMPTY(&ch->per_thread_cache)) {
+		bdev_io = STAILQ_FIRST(&ch->per_thread_cache);
+		STAILQ_REMOVE_HEAD(&ch->per_thread_cache, internal.buf_link);
+		ch->per_thread_cache_count--;
+		spdk_mempool_put(g_bdev_mgr.bdev_io_pool, (void *)bdev_io);
+	}
+
+	assert(ch->per_thread_cache_count == 0);
 }
 
 static void
@@ -374,10 +574,21 @@ spdk_bdev_init_complete(int rc)
 {
 	spdk_bdev_init_cb cb_fn = g_init_cb_fn;
 	void *cb_arg = g_init_cb_arg;
+	struct spdk_bdev_module *m;
 
 	g_bdev_mgr.init_complete = true;
 	g_init_cb_fn = NULL;
 	g_init_cb_arg = NULL;
+
+	/*
+	 * For modules that need to know when subsystem init is complete,
+	 * inform them now.
+	 */
+	TAILQ_FOREACH(m, &g_bdev_mgr.bdev_modules, tailq) {
+		if (m->init_complete) {
+			m->init_complete();
+		}
+	}
 
 	cb_fn(cb_arg, rc);
 }
@@ -385,7 +596,7 @@ spdk_bdev_init_complete(int rc)
 static void
 spdk_bdev_module_action_complete(void)
 {
-	struct spdk_bdev_module_if *m;
+	struct spdk_bdev_module *m;
 
 	/*
 	 * Don't finish bdev subsystem initialization if
@@ -416,7 +627,7 @@ spdk_bdev_module_action_complete(void)
 }
 
 static void
-spdk_bdev_module_action_done(struct spdk_bdev_module_if *module)
+spdk_bdev_module_action_done(struct spdk_bdev_module *module)
 {
 	assert(module->action_in_progress > 0);
 	module->action_in_progress--;
@@ -424,13 +635,13 @@ spdk_bdev_module_action_done(struct spdk_bdev_module_if *module)
 }
 
 void
-spdk_bdev_module_init_done(struct spdk_bdev_module_if *module)
+spdk_bdev_module_init_done(struct spdk_bdev_module *module)
 {
 	spdk_bdev_module_action_done(module);
 }
 
 void
-spdk_bdev_module_examine_done(struct spdk_bdev_module_if *module)
+spdk_bdev_module_examine_done(struct spdk_bdev_module *module)
 {
 	spdk_bdev_module_action_done(module);
 }
@@ -438,7 +649,7 @@ spdk_bdev_module_examine_done(struct spdk_bdev_module_if *module)
 static int
 spdk_bdev_modules_init(void)
 {
-	struct spdk_bdev_module_if *module;
+	struct spdk_bdev_module *module;
 	int rc = 0;
 
 	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, tailq) {
@@ -451,14 +662,40 @@ spdk_bdev_modules_init(void)
 	g_bdev_mgr.module_init_complete = true;
 	return rc;
 }
+
 void
 spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 {
+	struct spdk_conf_section *sp;
+	struct spdk_bdev_opts bdev_opts;
+	int32_t bdev_io_pool_size, bdev_io_cache_size;
 	int cache_size;
 	int rc = 0;
 	char mempool_name[32];
 
 	assert(cb_fn != NULL);
+
+	sp = spdk_conf_find_section(NULL, "Bdev");
+	if (sp != NULL) {
+		spdk_bdev_get_opts(&bdev_opts);
+
+		bdev_io_pool_size = spdk_conf_section_get_intval(sp, "BdevIoPoolSize");
+		if (bdev_io_pool_size >= 0) {
+			bdev_opts.bdev_io_pool_size = bdev_io_pool_size;
+		}
+
+		bdev_io_cache_size = spdk_conf_section_get_intval(sp, "BdevIoCacheSize");
+		if (bdev_io_cache_size >= 0) {
+			bdev_opts.bdev_io_cache_size = bdev_io_cache_size;
+		}
+
+		if (spdk_bdev_set_opts(&bdev_opts)) {
+			spdk_bdev_init_complete(-1);
+			return;
+		}
+
+		assert(memcmp(&bdev_opts, &g_bdev_opts, sizeof(bdev_opts)) == 0);
+	}
 
 	g_init_cb_fn = cb_fn;
 	g_init_cb_arg = cb_arg;
@@ -466,10 +703,10 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 	snprintf(mempool_name, sizeof(mempool_name), "bdev_io_%d", getpid());
 
 	g_bdev_mgr.bdev_io_pool = spdk_mempool_create(mempool_name,
-				  SPDK_BDEV_IO_POOL_SIZE,
+				  g_bdev_opts.bdev_io_pool_size,
 				  sizeof(struct spdk_bdev_io) +
 				  spdk_bdev_module_get_max_ctx_size(),
-				  64,
+				  0,
 				  SPDK_ENV_SOCKET_ID_ANY);
 
 	if (g_bdev_mgr.bdev_io_pool == NULL) {
@@ -480,10 +717,10 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 
 	/**
 	 * Ensure no more than half of the total buffers end up local caches, by
-	 *   using spdk_env_get_core_count() to determine how many local caches we need
+	 *   using spdk_thread_get_count() to determine how many local caches we need
 	 *   to account for.
 	 */
-	cache_size = BUF_SMALL_POOL_SIZE / (2 * spdk_env_get_core_count());
+	cache_size = BUF_SMALL_POOL_SIZE / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_small_pool_%d", getpid());
 
 	g_bdev_mgr.buf_small_pool = spdk_mempool_create(mempool_name,
@@ -497,7 +734,7 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		return;
 	}
 
-	cache_size = BUF_LARGE_POOL_SIZE / (2 * spdk_env_get_core_count());
+	cache_size = BUF_LARGE_POOL_SIZE / (2 * spdk_thread_get_count());
 	snprintf(mempool_name, sizeof(mempool_name), "buf_large_pool_%d", getpid());
 
 	g_bdev_mgr.buf_large_pool = spdk_mempool_create(mempool_name,
@@ -538,22 +775,14 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 }
 
 static void
-spdk_bdev_module_finish_cb(void *io_device)
+spdk_bdev_mgr_unregister_cb(void *io_device)
 {
 	spdk_bdev_fini_cb cb_fn = g_fini_cb_fn;
 
-	cb_fn(g_fini_cb_arg);
-	g_fini_cb_fn = NULL;
-	g_fini_cb_arg = NULL;
-}
-
-static void
-spdk_bdev_module_finish_complete(void)
-{
-	if (spdk_mempool_count(g_bdev_mgr.bdev_io_pool) != SPDK_BDEV_IO_POOL_SIZE) {
+	if (spdk_mempool_count(g_bdev_mgr.bdev_io_pool) != g_bdev_opts.bdev_io_pool_size) {
 		SPDK_ERRLOG("bdev IO pool count is %zu but should be %u\n",
 			    spdk_mempool_count(g_bdev_mgr.bdev_io_pool),
-			    SPDK_BDEV_IO_POOL_SIZE);
+			    g_bdev_opts.bdev_io_pool_size);
 	}
 
 	if (spdk_mempool_count(g_bdev_mgr.buf_small_pool) != BUF_SMALL_POOL_SIZE) {
@@ -575,22 +804,23 @@ spdk_bdev_module_finish_complete(void)
 	spdk_mempool_free(g_bdev_mgr.buf_large_pool);
 	spdk_dma_free(g_bdev_mgr.zero_buffer);
 
-	spdk_io_device_unregister(&g_bdev_mgr, spdk_bdev_module_finish_cb);
+	cb_fn(g_fini_cb_arg);
+	g_fini_cb_fn = NULL;
+	g_fini_cb_arg = NULL;
 }
+
+static struct spdk_bdev_module *g_resume_bdev_module = NULL;
 
 static void
 spdk_bdev_module_finish_iter(void *arg)
 {
-	/* Notice that this variable is static. It is saved between calls to
-	 * this function. */
-	static struct spdk_bdev_module_if *resume_bdev_module = NULL;
-	struct spdk_bdev_module_if *bdev_module;
+	struct spdk_bdev_module *bdev_module;
 
 	/* Start iterating from the last touched module */
-	if (!resume_bdev_module) {
+	if (!g_resume_bdev_module) {
 		bdev_module = TAILQ_FIRST(&g_bdev_mgr.bdev_modules);
 	} else {
-		bdev_module = TAILQ_NEXT(resume_bdev_module, tailq);
+		bdev_module = TAILQ_NEXT(g_resume_bdev_module, tailq);
 	}
 
 	while (bdev_module) {
@@ -600,7 +830,7 @@ spdk_bdev_module_finish_iter(void *arg)
 			 * below, because in some cases the module may immediately
 			 * call spdk_bdev_module_finish_done() and re-enter
 			 * this function to continue iterating. */
-			resume_bdev_module = bdev_module;
+			g_resume_bdev_module = bdev_module;
 		}
 
 		if (bdev_module->module_fini) {
@@ -614,8 +844,8 @@ spdk_bdev_module_finish_iter(void *arg)
 		bdev_module = TAILQ_NEXT(bdev_module, tailq);
 	}
 
-	resume_bdev_module = NULL;
-	spdk_bdev_module_finish_complete();
+	g_resume_bdev_module = NULL;
+	spdk_io_device_unregister(&g_bdev_mgr, spdk_bdev_mgr_unregister_cb);
 }
 
 void
@@ -628,6 +858,49 @@ spdk_bdev_module_finish_done(void)
 	}
 }
 
+static void
+_spdk_bdev_finish_unregister_bdevs_iter(void *cb_arg, int bdeverrno)
+{
+	struct spdk_bdev *bdev = cb_arg;
+
+	if (bdeverrno && bdev) {
+		SPDK_WARNLOG("Unable to unregister bdev '%s' during spdk_bdev_finish()\n",
+			     bdev->name);
+
+		/*
+		 * Since the call to spdk_bdev_unregister() failed, we have no way to free this
+		 *  bdev; try to continue by manually removing this bdev from the list and continue
+		 *  with the next bdev in the list.
+		 */
+		TAILQ_REMOVE(&g_bdev_mgr.bdevs, bdev, link);
+	}
+
+	if (TAILQ_EMPTY(&g_bdev_mgr.bdevs)) {
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Done unregistering bdevs\n");
+		/*
+		 * Bdev module finish need to be deffered as we might be in the middle of some context
+		 * (like bdev part free) that will use this bdev (or private bdev driver ctx data)
+		 * after returning.
+		 */
+		spdk_thread_send_msg(spdk_get_thread(), spdk_bdev_module_finish_iter, NULL);
+		return;
+	}
+
+	/*
+	 * Unregister the first bdev in the list.
+	 *
+	 * spdk_bdev_unregister() will handle the case where the bdev has open descriptors by
+	 *  calling the remove_cb of the descriptors first.
+	 *
+	 * Once this bdev and all of its open descriptors have been cleaned up, this function
+	 *  will be called again via the unregister completion callback to continue the cleanup
+	 *  process with the next bdev.
+	 */
+	bdev = TAILQ_FIRST(&g_bdev_mgr.bdevs);
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Unregistering bdev '%s'\n", bdev->name);
+	spdk_bdev_unregister(bdev, _spdk_bdev_finish_unregister_bdevs_iter, bdev);
+}
+
 void
 spdk_bdev_finish(spdk_bdev_fini_cb cb_fn, void *cb_arg)
 {
@@ -638,60 +911,153 @@ spdk_bdev_finish(spdk_bdev_fini_cb cb_fn, void *cb_arg)
 	g_fini_cb_fn = cb_fn;
 	g_fini_cb_arg = cb_arg;
 
-	spdk_bdev_module_finish_iter(NULL);
+	_spdk_bdev_finish_unregister_bdevs_iter(NULL, 0);
 }
 
-struct spdk_bdev_io *
-spdk_bdev_get_io(void)
+static struct spdk_bdev_io *
+spdk_bdev_get_io(struct spdk_bdev_channel *channel)
 {
+	struct spdk_bdev_mgmt_channel *ch = channel->shared_resource->mgmt_ch;
 	struct spdk_bdev_io *bdev_io;
 
-	bdev_io = spdk_mempool_get(g_bdev_mgr.bdev_io_pool);
-	if (!bdev_io) {
-		SPDK_ERRLOG("Unable to get spdk_bdev_io\n");
-		abort();
+	if (ch->per_thread_cache_count > 0) {
+		bdev_io = STAILQ_FIRST(&ch->per_thread_cache);
+		STAILQ_REMOVE_HEAD(&ch->per_thread_cache, internal.buf_link);
+		ch->per_thread_cache_count--;
+	} else {
+		bdev_io = spdk_mempool_get(g_bdev_mgr.bdev_io_pool);
+		if (!bdev_io) {
+			SPDK_ERRLOG("Unable to get spdk_bdev_io\n");
+			return NULL;
+		}
 	}
-
-	memset(bdev_io, 0, offsetof(struct spdk_bdev_io, u));
 
 	return bdev_io;
 }
 
-static void
-spdk_bdev_put_io(struct spdk_bdev_io *bdev_io)
+void
+spdk_bdev_free_io(struct spdk_bdev_io *bdev_io)
 {
+	struct spdk_bdev_mgmt_channel *ch = bdev_io->ch->shared_resource->mgmt_ch;
+
+	assert(bdev_io != NULL);
+	assert(bdev_io->status != SPDK_BDEV_IO_STATUS_PENDING);
+
 	if (bdev_io->buf != NULL) {
 		spdk_bdev_io_put_buf(bdev_io);
 	}
 
-	spdk_mempool_put(g_bdev_mgr.bdev_io_pool, (void *)bdev_io);
+	if (ch->per_thread_cache_count < ch->bdev_io_cache_size) {
+		ch->per_thread_cache_count++;
+		STAILQ_INSERT_TAIL(&ch->per_thread_cache, bdev_io, internal.buf_link);
+	} else {
+		spdk_mempool_put(g_bdev_mgr.bdev_io_pool, (void *)bdev_io);
+	}
+}
+
+static uint64_t
+_spdk_bdev_get_io_size_in_byte(struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_bdev	*bdev = bdev_io->bdev;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+		return bdev_io->u.nvme_passthru.nbytes;
+	case SPDK_BDEV_IO_TYPE_READ:
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		return bdev_io->u.bdev.num_blocks * bdev->blocklen;
+	default:
+		return 0;
+	}
+}
+
+static void
+_spdk_bdev_qos_io_submit(struct spdk_bdev_channel *ch)
+{
+	struct spdk_bdev_io		*bdev_io = NULL;
+	struct spdk_bdev		*bdev = ch->bdev;
+	struct spdk_bdev_qos		*qos = bdev->qos;
+	struct spdk_bdev_shared_resource *shared_resource = ch->shared_resource;
+
+	while (!TAILQ_EMPTY(&qos->queued)) {
+		if (qos->max_ios_per_timeslice > 0 &&
+		    qos->io_submitted_this_timeslice >= qos->max_ios_per_timeslice) {
+			break;
+		}
+
+		if (qos->max_byte_per_timeslice > 0 &&
+		    qos->byte_submitted_this_timeslice >= qos->max_byte_per_timeslice) {
+			break;
+		}
+
+		bdev_io = TAILQ_FIRST(&qos->queued);
+		TAILQ_REMOVE(&qos->queued, bdev_io, link);
+		qos->io_submitted_this_timeslice++;
+		qos->byte_submitted_this_timeslice += _spdk_bdev_get_io_size_in_byte(bdev_io);
+		ch->io_outstanding++;
+		shared_resource->io_outstanding++;
+		bdev->fn_table->submit_request(ch->channel, bdev_io);
+	}
+}
+
+static void
+_spdk_bdev_io_submit(void *ctx)
+{
+	struct spdk_bdev_io *bdev_io = ctx;
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_bdev_channel *bdev_ch = bdev_io->ch;
+	struct spdk_io_channel *ch = bdev_ch->channel;
+	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
+
+	bdev_io->submit_tsc = spdk_get_ticks();
+	bdev_ch->io_outstanding++;
+	shared_resource->io_outstanding++;
+	bdev_io->in_submit_request = true;
+	if (spdk_likely(bdev_ch->flags == 0)) {
+		if (spdk_likely(TAILQ_EMPTY(&shared_resource->nomem_io))) {
+			bdev->fn_table->submit_request(ch, bdev_io);
+		} else {
+			bdev_ch->io_outstanding--;
+			shared_resource->io_outstanding--;
+			TAILQ_INSERT_TAIL(&shared_resource->nomem_io, bdev_io, link);
+		}
+	} else if (bdev_ch->flags & BDEV_CH_RESET_IN_PROGRESS) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	} else if (bdev_ch->flags & BDEV_CH_QOS_ENABLED) {
+		bdev_ch->io_outstanding--;
+		shared_resource->io_outstanding--;
+		TAILQ_INSERT_TAIL(&bdev->qos->queued, bdev_io, link);
+		_spdk_bdev_qos_io_submit(bdev_ch);
+	} else {
+		SPDK_ERRLOG("unknown bdev_ch flag %x found\n", bdev_ch->flags);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+	bdev_io->in_submit_request = false;
 }
 
 static void
 spdk_bdev_io_submit(struct spdk_bdev_io *bdev_io)
 {
 	struct spdk_bdev *bdev = bdev_io->bdev;
-	struct spdk_bdev_channel *bdev_ch = bdev_io->ch;
-	struct spdk_io_channel *ch = bdev_ch->channel;
+	struct spdk_thread *thread = spdk_io_channel_get_thread(bdev_io->ch->channel);
 
 	assert(bdev_io->status == SPDK_BDEV_IO_STATUS_PENDING);
 
-	bdev_ch->io_outstanding++;
-	bdev_io->in_submit_request = true;
-	if (spdk_likely(bdev_ch->flags == 0)) {
-		if (spdk_likely(TAILQ_EMPTY(&bdev_ch->nomem_io))) {
-			bdev->fn_table->submit_request(ch, bdev_io);
+	if (bdev_io->ch->flags & BDEV_CH_QOS_ENABLED) {
+		if (thread == bdev->qos->thread) {
+			_spdk_bdev_io_submit(bdev_io);
 		} else {
-			bdev_ch->io_outstanding--;
-			TAILQ_INSERT_TAIL(&bdev_ch->nomem_io, bdev_io, link);
+			bdev_io->io_submit_ch = bdev_io->ch;
+			bdev_io->ch = bdev->qos->ch;
+			spdk_thread_send_msg(bdev->qos->thread, _spdk_bdev_io_submit, bdev_io);
 		}
-	} else if (bdev_ch->flags & BDEV_CH_RESET_IN_PROGRESS) {
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	} else {
-		SPDK_ERRLOG("unknown bdev_ch flag %x found\n", bdev_ch->flags);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		_spdk_bdev_io_submit(bdev_io);
 	}
-	bdev_io->in_submit_request = false;
 }
 
 static void
@@ -718,6 +1084,8 @@ spdk_bdev_io_init(struct spdk_bdev_io *bdev_io,
 	bdev_io->cb = cb;
 	bdev_io->status = SPDK_BDEV_IO_STATUS_PENDING;
 	bdev_io->in_submit_request = false;
+	bdev_io->buf = NULL;
+	bdev_io->io_submit_ch = NULL;
 }
 
 bool
@@ -727,10 +1095,126 @@ spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type io_ty
 }
 
 int
-spdk_bdev_dump_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+spdk_bdev_dump_info_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
-	if (bdev->fn_table->dump_config_json) {
-		return bdev->fn_table->dump_config_json(bdev->ctxt, w);
+	if (bdev->fn_table->dump_info_json) {
+		return bdev->fn_table->dump_info_json(bdev->ctxt, w);
+	}
+
+	return 0;
+}
+
+void
+spdk_bdev_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	assert(bdev != NULL);
+	assert(w != NULL);
+
+	if (bdev->fn_table->write_config_json) {
+		bdev->fn_table->write_config_json(bdev, w);
+	} else {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "name", bdev->name);
+		spdk_json_write_object_end(w);
+	}
+}
+
+static void
+spdk_bdev_qos_update_max_quota_per_timeslice(struct spdk_bdev_qos *qos)
+{
+	uint64_t max_ios_per_timeslice = 0, max_byte_per_timeslice = 0;
+
+	if (qos->iops_rate_limit > 0) {
+		max_ios_per_timeslice = qos->iops_rate_limit * SPDK_BDEV_QOS_TIMESLICE_IN_USEC /
+					SPDK_BDEV_SEC_TO_USEC;
+		qos->max_ios_per_timeslice = spdk_max(max_ios_per_timeslice,
+						      SPDK_BDEV_QOS_MIN_IO_PER_TIMESLICE);
+	}
+
+	if (qos->byte_rate_limit > 0) {
+		max_byte_per_timeslice = qos->byte_rate_limit * SPDK_BDEV_QOS_TIMESLICE_IN_USEC /
+					 SPDK_BDEV_SEC_TO_USEC;
+		qos->max_byte_per_timeslice = spdk_max(max_byte_per_timeslice,
+						       SPDK_BDEV_QOS_MIN_BYTE_PER_TIMESLICE);
+	}
+}
+
+static int
+spdk_bdev_channel_poll_qos(void *arg)
+{
+	struct spdk_bdev_qos *qos = arg;
+
+	/* Reset for next round of rate limiting */
+	qos->io_submitted_this_timeslice = 0;
+	qos->byte_submitted_this_timeslice = 0;
+
+	_spdk_bdev_qos_io_submit(qos->ch);
+
+	return -1;
+}
+
+static void
+_spdk_bdev_channel_destroy_resource(struct spdk_bdev_channel *ch)
+{
+	struct spdk_bdev_shared_resource *shared_resource;
+
+	if (!ch) {
+		return;
+	}
+
+	if (ch->channel) {
+		spdk_put_io_channel(ch->channel);
+	}
+
+	assert(ch->io_outstanding == 0);
+
+	shared_resource = ch->shared_resource;
+	if (shared_resource) {
+		assert(ch->io_outstanding == 0);
+		assert(shared_resource->ref > 0);
+		shared_resource->ref--;
+		if (shared_resource->ref == 0) {
+			assert(shared_resource->io_outstanding == 0);
+			TAILQ_REMOVE(&shared_resource->mgmt_ch->shared_resources, shared_resource, link);
+			spdk_put_io_channel(spdk_io_channel_from_ctx(shared_resource->mgmt_ch));
+			free(shared_resource);
+		}
+	}
+}
+
+/* Caller must hold bdev->mutex. */
+static int
+_spdk_bdev_enable_qos(struct spdk_bdev *bdev, struct spdk_bdev_channel *ch)
+{
+	struct spdk_bdev_qos *qos = bdev->qos;
+
+	/* Rate limiting on this bdev enabled */
+	if (qos) {
+		if (qos->ch == NULL) {
+			struct spdk_io_channel *io_ch;
+
+			SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Selecting channel %p as QoS channel for bdev %s on thread %p\n", ch,
+				      bdev->name, spdk_get_thread());
+
+			/* No qos channel has been selected, so set one up */
+
+			/* Take another reference to ch */
+			io_ch = spdk_get_io_channel(__bdev_to_io_dev(bdev));
+			qos->ch = ch;
+
+			qos->thread = spdk_io_channel_get_thread(io_ch);
+
+			TAILQ_INIT(&qos->queued);
+			spdk_bdev_qos_update_max_quota_per_timeslice(qos);
+			qos->io_submitted_this_timeslice = 0;
+			qos->byte_submitted_this_timeslice = 0;
+
+			qos->poller = spdk_poller_register(spdk_bdev_channel_poll_qos,
+							   qos,
+							   SPDK_BDEV_QOS_TIMESLICE_IN_USEC);
+		}
+
+		ch->flags |= BDEV_CH_QOS_ENABLED;
 	}
 
 	return 0;
@@ -739,27 +1223,54 @@ spdk_bdev_dump_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 static int
 spdk_bdev_channel_create(void *io_device, void *ctx_buf)
 {
-	struct spdk_bdev		*bdev = io_device;
+	struct spdk_bdev		*bdev = __bdev_from_io_dev(io_device);
 	struct spdk_bdev_channel	*ch = ctx_buf;
+	struct spdk_io_channel		*mgmt_io_ch;
+	struct spdk_bdev_mgmt_channel	*mgmt_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
 
-	ch->bdev = io_device;
+	ch->bdev = bdev;
 	ch->channel = bdev->fn_table->get_io_channel(bdev->ctxt);
 	if (!ch->channel) {
 		return -1;
 	}
 
-	ch->mgmt_channel = spdk_get_io_channel(&g_bdev_mgr);
-	if (!ch->mgmt_channel) {
-		spdk_put_io_channel(ch->channel);
+	mgmt_io_ch = spdk_get_io_channel(&g_bdev_mgr);
+	if (!mgmt_io_ch) {
 		return -1;
 	}
 
+	mgmt_ch = spdk_io_channel_get_ctx(mgmt_io_ch);
+	TAILQ_FOREACH(shared_resource, &mgmt_ch->shared_resources, link) {
+		if (shared_resource->shared_ch == ch->channel) {
+			spdk_put_io_channel(mgmt_io_ch);
+			shared_resource->ref++;
+			break;
+		}
+	}
+
+	if (shared_resource == NULL) {
+		shared_resource = calloc(1, sizeof(*shared_resource));
+		if (shared_resource == NULL) {
+			spdk_put_io_channel(mgmt_io_ch);
+			return -1;
+		}
+
+		shared_resource->mgmt_ch = mgmt_ch;
+		shared_resource->io_outstanding = 0;
+		TAILQ_INIT(&shared_resource->nomem_io);
+		shared_resource->nomem_threshold = 0;
+		shared_resource->shared_ch = ch->channel;
+		shared_resource->ref = 1;
+		TAILQ_INSERT_TAIL(&mgmt_ch->shared_resources, shared_resource, link);
+	}
+
 	memset(&ch->stat, 0, sizeof(ch->stat));
+	ch->stat.ticks_rate = spdk_get_ticks_hz();
 	ch->io_outstanding = 0;
 	TAILQ_INIT(&ch->queued_resets);
-	TAILQ_INIT(&ch->nomem_io);
-	ch->nomem_threshold = 0;
 	ch->flags = 0;
+	ch->shared_resource = shared_resource;
 
 #ifdef SPDK_CONFIG_VTUNE
 	{
@@ -767,35 +1278,53 @@ spdk_bdev_channel_create(void *io_device, void *ctx_buf)
 		__itt_init_ittlib(NULL, 0);
 		name = spdk_sprintf_alloc("spdk_bdev_%s_%p", ch->bdev->name, ch);
 		if (!name) {
-			spdk_put_io_channel(ch->channel);
-			spdk_put_io_channel(ch->mgmt_channel);
+			_spdk_bdev_channel_destroy_resource(ch);
 			return -1;
 		}
 		ch->handle = __itt_string_handle_create(name);
 		free(name);
 		ch->start_tsc = spdk_get_ticks();
 		ch->interval_tsc = spdk_get_ticks_hz() / 100;
+		memset(&ch->prev_stat, 0, sizeof(ch->prev_stat));
 	}
 #endif
+
+	pthread_mutex_lock(&bdev->mutex);
+
+	if (_spdk_bdev_enable_qos(bdev, ch)) {
+		_spdk_bdev_channel_destroy_resource(ch);
+		pthread_mutex_unlock(&bdev->mutex);
+		return -1;
+	}
+
+	pthread_mutex_unlock(&bdev->mutex);
 
 	return 0;
 }
 
 /*
  * Abort I/O that are waiting on a data buffer.  These types of I/O are
- *  linked using the spdk_bdev_io buf_link TAILQ_ENTRY.
+ *  linked using the spdk_bdev_io internal.buf_link TAILQ_ENTRY.
  */
 static void
-_spdk_bdev_abort_buf_io(bdev_io_tailq_t *queue, struct spdk_bdev_channel *ch)
+_spdk_bdev_abort_buf_io(bdev_io_stailq_t *queue, struct spdk_bdev_channel *ch)
 {
-	struct spdk_bdev_io *bdev_io, *tmp;
+	bdev_io_stailq_t tmp;
+	struct spdk_bdev_io *bdev_io;
 
-	TAILQ_FOREACH_SAFE(bdev_io, queue, buf_link, tmp) {
+	STAILQ_INIT(&tmp);
+
+	while (!STAILQ_EMPTY(queue)) {
+		bdev_io = STAILQ_FIRST(queue);
+		STAILQ_REMOVE_HEAD(queue, internal.buf_link);
 		if (bdev_io->ch == ch) {
-			TAILQ_REMOVE(queue, bdev_io, buf_link);
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		} else {
+			STAILQ_INSERT_TAIL(&tmp, bdev_io, internal.buf_link);
 		}
 	}
+
+	STAILQ_SWAP(&tmp, queue, spdk_bdev_io);
 }
 
 /*
@@ -818,6 +1347,7 @@ _spdk_bdev_abort_queued_io(bdev_io_tailq_t *queue, struct spdk_bdev_channel *ch)
 			 */
 			if (bdev_io->type != SPDK_BDEV_IO_TYPE_RESET) {
 				ch->io_outstanding++;
+				ch->shared_resource->io_outstanding++;
 			}
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		}
@@ -825,27 +1355,142 @@ _spdk_bdev_abort_queued_io(bdev_io_tailq_t *queue, struct spdk_bdev_channel *ch)
 }
 
 static void
+spdk_bdev_qos_channel_destroy(void *cb_arg)
+{
+	struct spdk_bdev_qos *qos = cb_arg;
+
+	spdk_put_io_channel(spdk_io_channel_from_ctx(qos->ch));
+	spdk_poller_unregister(&qos->poller);
+
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Free QoS %p.\n", qos);
+
+	free(qos);
+}
+
+static int
+spdk_bdev_qos_destroy(struct spdk_bdev *bdev)
+{
+	/*
+	 * Cleanly shutting down the QoS poller is tricky, because
+	 * during the asynchronous operation the user could open
+	 * a new descriptor and create a new channel, spawning
+	 * a new QoS poller.
+	 *
+	 * The strategy is to create a new QoS structure here and swap it
+	 * in. The shutdown path then continues to refer to the old one
+	 * until it completes and then releases it.
+	 */
+	struct spdk_bdev_qos *new_qos, *old_qos;
+
+	old_qos = bdev->qos;
+
+	new_qos = calloc(1, sizeof(*new_qos));
+	if (!new_qos) {
+		SPDK_ERRLOG("Unable to allocate memory to shut down QoS.\n");
+		return -ENOMEM;
+	}
+
+	/* Copy the old QoS data into the newly allocated structure */
+	memcpy(new_qos, old_qos, sizeof(*new_qos));
+
+	/* Zero out the key parts of the QoS structure */
+	new_qos->ch = NULL;
+	new_qos->thread = NULL;
+	new_qos->max_ios_per_timeslice = 0;
+	new_qos->max_byte_per_timeslice = 0;
+	new_qos->io_submitted_this_timeslice = 0;
+	new_qos->byte_submitted_this_timeslice = 0;
+	new_qos->poller = NULL;
+	TAILQ_INIT(&new_qos->queued);
+
+	bdev->qos = new_qos;
+
+	spdk_thread_send_msg(old_qos->thread, spdk_bdev_qos_channel_destroy,
+			     old_qos);
+
+	/* It is safe to continue with destroying the bdev even though the QoS channel hasn't
+	 * been destroyed yet. The destruction path will end up waiting for the final
+	 * channel to be put before it releases resources. */
+
+	return 0;
+}
+
+static void
 spdk_bdev_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bdev_channel	*ch = ctx_buf;
-	struct spdk_bdev_mgmt_channel	*mgmt_channel;
+	struct spdk_bdev_mgmt_channel	*mgmt_ch;
+	struct spdk_bdev_shared_resource *shared_resource = ch->shared_resource;
 
-	mgmt_channel = spdk_io_channel_get_ctx(ch->mgmt_channel);
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Destroying channel %p for bdev %s on thread %p\n", ch, ch->bdev->name,
+		      spdk_get_thread());
+
+	mgmt_ch = shared_resource->mgmt_ch;
 
 	_spdk_bdev_abort_queued_io(&ch->queued_resets, ch);
-	_spdk_bdev_abort_queued_io(&ch->nomem_io, ch);
-	_spdk_bdev_abort_buf_io(&mgmt_channel->need_buf_small, ch);
-	_spdk_bdev_abort_buf_io(&mgmt_channel->need_buf_large, ch);
+	_spdk_bdev_abort_queued_io(&shared_resource->nomem_io, ch);
+	_spdk_bdev_abort_buf_io(&mgmt_ch->need_buf_small, ch);
+	_spdk_bdev_abort_buf_io(&mgmt_ch->need_buf_large, ch);
 
-	spdk_put_io_channel(ch->channel);
-	spdk_put_io_channel(ch->mgmt_channel);
-	assert(ch->io_outstanding == 0);
+	_spdk_bdev_channel_destroy_resource(ch);
+}
+
+int
+spdk_bdev_alias_add(struct spdk_bdev *bdev, const char *alias)
+{
+	struct spdk_bdev_alias *tmp;
+
+	if (alias == NULL) {
+		SPDK_ERRLOG("Empty alias passed\n");
+		return -EINVAL;
+	}
+
+	if (spdk_bdev_get_by_name(alias)) {
+		SPDK_ERRLOG("Bdev name/alias: %s already exists\n", alias);
+		return -EEXIST;
+	}
+
+	tmp = calloc(1, sizeof(*tmp));
+	if (tmp == NULL) {
+		SPDK_ERRLOG("Unable to allocate alias\n");
+		return -ENOMEM;
+	}
+
+	tmp->alias = strdup(alias);
+	if (tmp->alias == NULL) {
+		free(tmp);
+		SPDK_ERRLOG("Unable to allocate alias\n");
+		return -ENOMEM;
+	}
+
+	TAILQ_INSERT_TAIL(&bdev->aliases, tmp, tailq);
+
+	return 0;
+}
+
+int
+spdk_bdev_alias_del(struct spdk_bdev *bdev, const char *alias)
+{
+	struct spdk_bdev_alias *tmp;
+
+	TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
+		if (strcmp(alias, tmp->alias) == 0) {
+			TAILQ_REMOVE(&bdev->aliases, tmp, tailq);
+			free(tmp->alias);
+			free(tmp);
+			return 0;
+		}
+	}
+
+	SPDK_INFOLOG(SPDK_LOG_BDEV, "Alias %s does not exists\n", alias);
+
+	return -ENOENT;
 }
 
 struct spdk_io_channel *
 spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 {
-	return spdk_get_io_channel(desc->bdev);
+	return spdk_get_io_channel(__bdev_to_io_dev(desc->bdev));
 }
 
 const char *
@@ -860,6 +1505,12 @@ spdk_bdev_get_product_name(const struct spdk_bdev *bdev)
 	return bdev->product_name;
 }
 
+const struct spdk_bdev_aliases_list *
+spdk_bdev_get_aliases(const struct spdk_bdev *bdev)
+{
+	return &bdev->aliases;
+}
+
 uint32_t
 spdk_bdev_get_block_size(const struct spdk_bdev *bdev)
 {
@@ -870,6 +1521,20 @@ uint64_t
 spdk_bdev_get_num_blocks(const struct spdk_bdev *bdev)
 {
 	return bdev->blockcnt;
+}
+
+uint64_t
+spdk_bdev_get_qos_ios_per_sec(struct spdk_bdev *bdev)
+{
+	uint64_t iops_rate_limit = 0;
+
+	pthread_mutex_lock(&bdev->mutex);
+	if (bdev->qos) {
+		iops_rate_limit = bdev->qos->iops_rate_limit;
+	}
+	pthread_mutex_unlock(&bdev->mutex);
+
+	return iops_rate_limit;
 }
 
 size_t
@@ -893,6 +1558,33 @@ bool
 spdk_bdev_has_write_cache(const struct spdk_bdev *bdev)
 {
 	return bdev->write_cache;
+}
+
+const struct spdk_uuid *
+spdk_bdev_get_uuid(const struct spdk_bdev *bdev)
+{
+	return &bdev->uuid;
+}
+
+int
+spdk_bdev_notify_blockcnt_change(struct spdk_bdev *bdev, uint64_t size)
+{
+	int ret;
+
+	pthread_mutex_lock(&bdev->mutex);
+
+	/* bdev has open descriptors */
+	if (!TAILQ_EMPTY(&bdev->open_descs) &&
+	    bdev->blockcnt > size) {
+		ret = -EBUSY;
+	} else {
+		bdev->blockcnt = size;
+		ret = 0;
+	}
+
+	pthread_mutex_unlock(&bdev->mutex);
+
+	return ret;
 }
 
 /*
@@ -956,7 +1648,7 @@ spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("spdk_bdev_io memory allocation failed duing read\n");
 		return -ENOMEM;
@@ -1004,7 +1696,7 @@ int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("spdk_bdev_io memory allocation failed duing read\n");
 		return -ENOMEM;
@@ -1053,7 +1745,7 @@ spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing write\n");
 		return -ENOMEM;
@@ -1106,7 +1798,7 @@ spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing writev\n");
 		return -ENOMEM;
@@ -1149,16 +1841,15 @@ spdk_bdev_write_zeroes_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channe
 	uint64_t len;
 	bool split_request = false;
 
-	if (num_blocks > UINT64_MAX / spdk_bdev_get_block_size(bdev)) {
-		SPDK_ERRLOG("length argument out of range in write_zeroes\n");
-		return -ERANGE;
+	if (!desc->write) {
+		return -EBADF;
 	}
 
 	if (!spdk_bdev_io_valid_blocks(bdev, offset_blocks, num_blocks)) {
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing write_zeroes\n");
@@ -1190,12 +1881,12 @@ spdk_bdev_write_zeroes_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channe
 		bdev_io->u.bdev.iovs = &bdev_io->u.bdev.iov;
 		bdev_io->u.bdev.iovcnt = 1;
 		bdev_io->u.bdev.num_blocks = len / spdk_bdev_get_block_size(bdev);
-		bdev_io->split_remaining_num_blocks = num_blocks - bdev_io->u.bdev.num_blocks;
-		bdev_io->split_current_offset_blocks = offset_blocks + bdev_io->u.bdev.num_blocks;
+		bdev_io->u.bdev.split_remaining_num_blocks = num_blocks - bdev_io->u.bdev.num_blocks;
+		bdev_io->u.bdev.split_current_offset_blocks = offset_blocks + bdev_io->u.bdev.num_blocks;
 	}
 
 	if (split_request) {
-		bdev_io->stored_user_cb = cb;
+		bdev_io->u.bdev.stored_user_cb = cb;
 		spdk_bdev_io_init(bdev_io, bdev, cb_arg, spdk_bdev_write_zeroes_split);
 	} else {
 		spdk_bdev_io_init(bdev_io, bdev, cb_arg, cb);
@@ -1240,7 +1931,7 @@ spdk_bdev_unmap_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing unmap\n");
 		return -ENOMEM;
@@ -1291,7 +1982,7 @@ spdk_bdev_flush_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		return -EINVAL;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing flush\n");
 		return -ENOMEM;
@@ -1310,9 +2001,9 @@ spdk_bdev_flush_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 }
 
 static void
-_spdk_bdev_reset_dev(void *io_device, void *ctx, int status)
+_spdk_bdev_reset_dev(struct spdk_io_channel_iter *i, int status)
 {
-	struct spdk_bdev_channel *ch = ctx;
+	struct spdk_bdev_channel *ch = spdk_io_channel_iter_get_ctx(i);
 	struct spdk_bdev_io *bdev_io;
 
 	bdev_io = TAILQ_FIRST(&ch->queued_resets);
@@ -1320,23 +2011,42 @@ _spdk_bdev_reset_dev(void *io_device, void *ctx, int status)
 	spdk_bdev_io_submit_reset(bdev_io);
 }
 
-static int
-_spdk_bdev_reset_abort_channel(void *io_device, struct spdk_io_channel *ch,
-			       void *ctx)
+static void
+_spdk_bdev_reset_freeze_channel(struct spdk_io_channel_iter *i)
 {
+	struct spdk_io_channel		*ch;
 	struct spdk_bdev_channel	*channel;
 	struct spdk_bdev_mgmt_channel	*mgmt_channel;
+	struct spdk_bdev_shared_resource *shared_resource;
+	bdev_io_tailq_t			tmp_queued;
 
+	TAILQ_INIT(&tmp_queued);
+
+	ch = spdk_io_channel_iter_get_channel(i);
 	channel = spdk_io_channel_get_ctx(ch);
-	mgmt_channel = spdk_io_channel_get_ctx(channel->mgmt_channel);
+	shared_resource = channel->shared_resource;
+	mgmt_channel = shared_resource->mgmt_ch;
 
 	channel->flags |= BDEV_CH_RESET_IN_PROGRESS;
 
-	_spdk_bdev_abort_queued_io(&channel->nomem_io, channel);
+	if ((channel->flags & BDEV_CH_QOS_ENABLED) != 0) {
+		/* The QoS object is always valid and readable while
+		 * the channel flag is set, so the lock here should not
+		 * be necessary. We're not in the fast path though, so
+		 * just take it anyway. */
+		pthread_mutex_lock(&channel->bdev->mutex);
+		if (channel->bdev->qos->ch == channel) {
+			TAILQ_SWAP(&channel->bdev->qos->queued, &tmp_queued, spdk_bdev_io, link);
+		}
+		pthread_mutex_unlock(&channel->bdev->mutex);
+	}
+
+	_spdk_bdev_abort_queued_io(&shared_resource->nomem_io, channel);
 	_spdk_bdev_abort_buf_io(&mgmt_channel->need_buf_small, channel);
 	_spdk_bdev_abort_buf_io(&mgmt_channel->need_buf_large, channel);
+	_spdk_bdev_abort_queued_io(&tmp_queued, channel);
 
-	return 0;
+	spdk_for_each_channel_continue(i, 0);
 }
 
 static void
@@ -1344,7 +2054,7 @@ _spdk_bdev_start_reset(void *ctx)
 {
 	struct spdk_bdev_channel *ch = ctx;
 
-	spdk_for_each_channel(ch->bdev, _spdk_bdev_reset_abort_channel,
+	spdk_for_each_channel(__bdev_to_io_dev(ch->bdev), _spdk_bdev_reset_freeze_channel,
 			      ch, _spdk_bdev_reset_dev);
 }
 
@@ -1365,23 +2075,10 @@ _spdk_bdev_channel_start_reset(struct spdk_bdev_channel *ch)
 		 *  progress.  We will release the reference when this reset is
 		 *  completed.
 		 */
-		bdev->reset_in_progress->u.reset.ch_ref = spdk_get_io_channel(bdev);
+		bdev->reset_in_progress->u.reset.ch_ref = spdk_get_io_channel(__bdev_to_io_dev(bdev));
 		_spdk_bdev_start_reset(ch);
 	}
 	pthread_mutex_unlock(&bdev->mutex);
-}
-
-static int
-_spdk_bdev_complete_reset_channel(void *io_device, struct spdk_io_channel *_ch, void *ctx)
-{
-	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
-
-	ch->flags &= ~BDEV_CH_RESET_IN_PROGRESS;
-	if (!TAILQ_EMPTY(&ch->queued_resets)) {
-		_spdk_bdev_channel_start_reset(ch);
-	}
-
-	return 0;
 }
 
 int
@@ -1392,7 +2089,7 @@ spdk_bdev_reset(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed duing reset\n");
 		return -ENOMEM;
@@ -1416,16 +2113,62 @@ void
 spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 		      struct spdk_bdev_io_stat *stat)
 {
-#ifdef SPDK_CONFIG_VTUNE
-	SPDK_ERRLOG("Calling spdk_bdev_get_io_stat is not allowed when VTune integration is enabled.\n");
-	memset(stat, 0, sizeof(*stat));
-	return;
-#endif
-
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
 
 	*stat = channel->stat;
-	memset(&channel->stat, 0, sizeof(channel->stat));
+}
+
+static void
+_spdk_bdev_get_device_stat_done(struct spdk_io_channel_iter *i, int status)
+{
+	void *io_device = spdk_io_channel_iter_get_io_device(i);
+	struct spdk_bdev_iostat_ctx *bdev_iostat_ctx = spdk_io_channel_iter_get_ctx(i);
+
+	bdev_iostat_ctx->cb(__bdev_from_io_dev(io_device), bdev_iostat_ctx->stat,
+			    bdev_iostat_ctx->cb_arg, 0);
+	free(bdev_iostat_ctx);
+}
+
+static void
+_spdk_bdev_get_each_channel_stat(struct spdk_io_channel_iter *i)
+{
+	struct spdk_bdev_iostat_ctx *bdev_iostat_ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	bdev_iostat_ctx->stat->bytes_read += channel->stat.bytes_read;
+	bdev_iostat_ctx->stat->num_read_ops += channel->stat.num_read_ops;
+	bdev_iostat_ctx->stat->bytes_written += channel->stat.bytes_written;
+	bdev_iostat_ctx->stat->num_write_ops += channel->stat.num_write_ops;
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+void
+spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat,
+			  spdk_bdev_get_device_stat_cb cb, void *cb_arg)
+{
+	struct spdk_bdev_iostat_ctx *bdev_iostat_ctx;
+
+	assert(bdev != NULL);
+	assert(stat != NULL);
+	assert(cb != NULL);
+
+	bdev_iostat_ctx = calloc(1, sizeof(struct spdk_bdev_iostat_ctx));
+	if (bdev_iostat_ctx == NULL) {
+		SPDK_ERRLOG("Unable to allocate memory for spdk_bdev_iostat_ctx\n");
+		cb(bdev, stat, cb_arg, -ENOMEM);
+		return;
+	}
+
+	bdev_iostat_ctx->stat = stat;
+	bdev_iostat_ctx->cb = cb;
+	bdev_iostat_ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(__bdev_to_io_dev(bdev),
+			      _spdk_bdev_get_each_channel_stat,
+			      bdev_iostat_ctx,
+			      _spdk_bdev_get_device_stat_done);
 }
 
 int
@@ -1441,7 +2184,7 @@ spdk_bdev_nvme_admin_passthru(struct spdk_bdev_desc *desc, struct spdk_io_channe
 		return -EBADF;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed during nvme_admin_passthru\n");
 		return -ENOMEM;
@@ -1479,7 +2222,7 @@ spdk_bdev_nvme_io_passthru(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 		return -EBADF;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed during nvme_admin_passthru\n");
 		return -ENOMEM;
@@ -1517,7 +2260,7 @@ spdk_bdev_nvme_io_passthru_md(struct spdk_bdev_desc *desc, struct spdk_io_channe
 		return -EBADF;
 	}
 
-	bdev_io = spdk_bdev_get_io();
+	bdev_io = spdk_bdev_get_io(channel);
 	if (!bdev_io) {
 		SPDK_ERRLOG("bdev_io memory allocation failed during nvme_admin_passthru\n");
 		return -ENOMEM;
@@ -1537,32 +2280,14 @@ spdk_bdev_nvme_io_passthru_md(struct spdk_bdev_desc *desc, struct spdk_io_channe
 	return 0;
 }
 
-int
-spdk_bdev_free_io(struct spdk_bdev_io *bdev_io)
-{
-	if (!bdev_io) {
-		SPDK_ERRLOG("bdev_io is NULL\n");
-		return -1;
-	}
-
-	if (bdev_io->status == SPDK_BDEV_IO_STATUS_PENDING) {
-		SPDK_ERRLOG("bdev_io is in pending state\n");
-		assert(false);
-		return -1;
-	}
-
-	spdk_bdev_put_io(bdev_io);
-
-	return 0;
-}
-
 static void
 _spdk_bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch)
 {
 	struct spdk_bdev *bdev = bdev_ch->bdev;
+	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
 	struct spdk_bdev_io *bdev_io;
 
-	if (bdev_ch->io_outstanding > bdev_ch->nomem_threshold) {
+	if (shared_resource->io_outstanding > shared_resource->nomem_threshold) {
 		/*
 		 * Allow some more I/O to complete before retrying the nomem_io queue.
 		 *  Some drivers (such as nvme) cannot immediately take a new I/O in
@@ -1574,78 +2299,54 @@ _spdk_bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch)
 		return;
 	}
 
-	while (!TAILQ_EMPTY(&bdev_ch->nomem_io)) {
-		bdev_io = TAILQ_FIRST(&bdev_ch->nomem_io);
-		TAILQ_REMOVE(&bdev_ch->nomem_io, bdev_io, link);
-		bdev_ch->io_outstanding++;
+	while (!TAILQ_EMPTY(&shared_resource->nomem_io)) {
+		bdev_io = TAILQ_FIRST(&shared_resource->nomem_io);
+		TAILQ_REMOVE(&shared_resource->nomem_io, bdev_io, link);
+		bdev_io->ch->io_outstanding++;
+		shared_resource->io_outstanding++;
 		bdev_io->status = SPDK_BDEV_IO_STATUS_PENDING;
-		bdev->fn_table->submit_request(bdev_ch->channel, bdev_io);
+		bdev->fn_table->submit_request(bdev_io->ch->channel, bdev_io);
 		if (bdev_io->status == SPDK_BDEV_IO_STATUS_NOMEM) {
 			break;
 		}
 	}
 }
 
-static void
+static inline void
 _spdk_bdev_io_complete(void *ctx)
 {
 	struct spdk_bdev_io *bdev_io = ctx;
 
-	assert(bdev_io->cb != NULL);
-	bdev_io->cb(bdev_io, bdev_io->status == SPDK_BDEV_IO_STATUS_SUCCESS, bdev_io->caller_ctx);
-}
+	if (spdk_unlikely(bdev_io->in_submit_request || bdev_io->io_submit_ch)) {
+		/*
+		 * Send the completion to the thread that originally submitted the I/O,
+		 * which may not be the current thread in the case of QoS.
+		 */
+		if (bdev_io->io_submit_ch) {
+			bdev_io->ch = bdev_io->io_submit_ch;
+			bdev_io->io_submit_ch = NULL;
+		}
 
-void
-spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
-{
-	struct spdk_bdev *bdev = bdev_io->bdev;
-	struct spdk_bdev_channel *bdev_ch = bdev_io->ch;
-
-	bdev_io->status = status;
-
-	if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_RESET)) {
-		if (status == SPDK_BDEV_IO_STATUS_NOMEM) {
-			SPDK_ERRLOG("NOMEM returned for reset\n");
-		}
-		pthread_mutex_lock(&bdev->mutex);
-		if (bdev_io == bdev->reset_in_progress) {
-			bdev->reset_in_progress = NULL;
-		}
-		pthread_mutex_unlock(&bdev->mutex);
-		if (bdev_io->u.reset.ch_ref != NULL) {
-			spdk_put_io_channel(bdev_io->u.reset.ch_ref);
-		}
-		spdk_for_each_channel(bdev, _spdk_bdev_complete_reset_channel, NULL, NULL);
-	} else {
-		assert(bdev_ch->io_outstanding > 0);
-		bdev_ch->io_outstanding--;
-		if (spdk_likely(status != SPDK_BDEV_IO_STATUS_NOMEM)) {
-			if (spdk_unlikely(!TAILQ_EMPTY(&bdev_ch->nomem_io))) {
-				_spdk_bdev_ch_retry_io(bdev_ch);
-			}
-		} else {
-			TAILQ_INSERT_HEAD(&bdev_ch->nomem_io, bdev_io, link);
-			/*
-			 * Wait for some of the outstanding I/O to complete before we
-			 *  retry any of the nomem_io.  Normally we will wait for
-			 *  NOMEM_THRESHOLD_COUNT I/O to complete but for low queue
-			 *  depth channels we will instead wait for half to complete.
-			 */
-			bdev_ch->nomem_threshold = spdk_max(bdev_ch->io_outstanding / 2,
-							    bdev_ch->io_outstanding - NOMEM_THRESHOLD_COUNT);
-			return;
-		}
+		/*
+		 * Defer completion to avoid potential infinite recursion if the
+		 * user's completion callback issues a new I/O.
+		 */
+		spdk_thread_send_msg(spdk_io_channel_get_thread(bdev_io->ch->channel),
+				     _spdk_bdev_io_complete, bdev_io);
+		return;
 	}
 
-	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+	if (bdev_io->status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		switch (bdev_io->type) {
 		case SPDK_BDEV_IO_TYPE_READ:
-			bdev_ch->stat.bytes_read += bdev_io->u.bdev.num_blocks * bdev->blocklen;
-			bdev_ch->stat.num_read_ops++;
+			bdev_io->ch->stat.bytes_read += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+			bdev_io->ch->stat.num_read_ops++;
+			bdev_io->ch->stat.read_latency_ticks += (spdk_get_ticks() - bdev_io->submit_tsc);
 			break;
 		case SPDK_BDEV_IO_TYPE_WRITE:
-			bdev_ch->stat.bytes_written += bdev_io->u.bdev.num_blocks * bdev->blocklen;
-			bdev_ch->stat.num_write_ops++;
+			bdev_io->ch->stat.bytes_written += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+			bdev_io->ch->stat.num_write_ops++;
+			bdev_io->ch->stat.write_latency_ticks += (spdk_get_ticks() - bdev_io->submit_tsc);
 			break;
 		default:
 			break;
@@ -1654,34 +2355,110 @@ spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status sta
 
 #ifdef SPDK_CONFIG_VTUNE
 	uint64_t now_tsc = spdk_get_ticks();
-	if (now_tsc > (bdev_ch->start_tsc + bdev_ch->interval_tsc)) {
+	if (now_tsc > (bdev_io->ch->start_tsc + bdev_io->ch->interval_tsc)) {
 		uint64_t data[5];
 
-		data[0] = bdev_ch->stat.num_read_ops;
-		data[1] = bdev_ch->stat.bytes_read;
-		data[2] = bdev_ch->stat.num_write_ops;
-		data[3] = bdev_ch->stat.bytes_written;
-		data[4] = bdev->fn_table->get_spin_time ?
-			  bdev->fn_table->get_spin_time(bdev_ch->channel) : 0;
+		data[0] = bdev_io->ch->stat.num_read_ops - bdev_io->ch->prev_stat.num_read_ops;
+		data[1] = bdev_io->ch->stat.bytes_read - bdev_io->ch->prev_stat.bytes_read;
+		data[2] = bdev_io->ch->stat.num_write_ops - bdev_io->ch->prev_stat.num_write_ops;
+		data[3] = bdev_io->ch->stat.bytes_written - bdev_io->ch->prev_stat.bytes_written;
+		data[4] = bdev_io->bdev->fn_table->get_spin_time ?
+			  bdev_io->bdev->fn_table->get_spin_time(bdev_io->ch->channel) : 0;
 
-		__itt_metadata_add(g_bdev_mgr.domain, __itt_null, bdev_ch->handle,
+		__itt_metadata_add(g_bdev_mgr.domain, __itt_null, bdev_io->ch->handle,
 				   __itt_metadata_u64, 5, data);
 
-		memset(&bdev_ch->stat, 0, sizeof(bdev_ch->stat));
-		bdev_ch->start_tsc = now_tsc;
+		bdev_io->ch->prev_stat = bdev_io->ch->stat;
+		bdev_io->ch->start_tsc = now_tsc;
 	}
 #endif
 
-	if (bdev_io->in_submit_request || bdev_io->type == SPDK_BDEV_IO_TYPE_RESET) {
-		/*
-		 * Defer completion to avoid potential infinite recursion if the
-		 * user's completion callback issues a new I/O.
-		 */
-		spdk_thread_send_msg(spdk_io_channel_get_thread(bdev_ch->channel),
-				     _spdk_bdev_io_complete, bdev_io);
-	} else {
-		_spdk_bdev_io_complete(bdev_io);
+	assert(bdev_io->cb != NULL);
+	assert(spdk_get_thread() == spdk_io_channel_get_thread(bdev_io->ch->channel));
+
+	bdev_io->cb(bdev_io, bdev_io->status == SPDK_BDEV_IO_STATUS_SUCCESS,
+		    bdev_io->caller_ctx);
+}
+
+static void
+_spdk_bdev_reset_complete(struct spdk_io_channel_iter *i, int status)
+{
+	struct spdk_bdev_io *bdev_io = spdk_io_channel_iter_get_ctx(i);
+
+	if (bdev_io->u.reset.ch_ref != NULL) {
+		spdk_put_io_channel(bdev_io->u.reset.ch_ref);
+		bdev_io->u.reset.ch_ref = NULL;
 	}
+
+	_spdk_bdev_io_complete(bdev_io);
+}
+
+static void
+_spdk_bdev_unfreeze_channel(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+
+	ch->flags &= ~BDEV_CH_RESET_IN_PROGRESS;
+	if (!TAILQ_EMPTY(&ch->queued_resets)) {
+		_spdk_bdev_channel_start_reset(ch);
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+void
+spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_bdev_channel *bdev_ch = bdev_io->ch;
+	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
+
+	bdev_io->status = status;
+
+	if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_RESET)) {
+		bool unlock_channels = false;
+
+		if (status == SPDK_BDEV_IO_STATUS_NOMEM) {
+			SPDK_ERRLOG("NOMEM returned for reset\n");
+		}
+		pthread_mutex_lock(&bdev->mutex);
+		if (bdev_io == bdev->reset_in_progress) {
+			bdev->reset_in_progress = NULL;
+			unlock_channels = true;
+		}
+		pthread_mutex_unlock(&bdev->mutex);
+
+		if (unlock_channels) {
+			spdk_for_each_channel(__bdev_to_io_dev(bdev), _spdk_bdev_unfreeze_channel,
+					      bdev_io, _spdk_bdev_reset_complete);
+			return;
+		}
+	} else {
+		assert(bdev_ch->io_outstanding > 0);
+		assert(shared_resource->io_outstanding > 0);
+		bdev_ch->io_outstanding--;
+		shared_resource->io_outstanding--;
+
+		if (spdk_unlikely(status == SPDK_BDEV_IO_STATUS_NOMEM)) {
+			TAILQ_INSERT_HEAD(&shared_resource->nomem_io, bdev_io, link);
+			/*
+			 * Wait for some of the outstanding I/O to complete before we
+			 *  retry any of the nomem_io.  Normally we will wait for
+			 *  NOMEM_THRESHOLD_COUNT I/O to complete but for low queue
+			 *  depth channels we will instead wait for half to complete.
+			 */
+			shared_resource->nomem_threshold = spdk_max((int64_t)shared_resource->io_outstanding / 2,
+							   (int64_t)shared_resource->io_outstanding - NOMEM_THRESHOLD_COUNT);
+			return;
+		}
+
+		if (spdk_unlikely(!TAILQ_EMPTY(&shared_resource->nomem_io))) {
+			_spdk_bdev_ch_retry_io(bdev_ch);
+		}
+	}
+
+	_spdk_bdev_io_complete(bdev_io);
 }
 
 void
@@ -1773,11 +2550,100 @@ spdk_bdev_io_get_thread(struct spdk_bdev_io *bdev_io)
 	return spdk_io_channel_get_thread(bdev_io->ch->channel);
 }
 
-static int
-_spdk_bdev_register(struct spdk_bdev *bdev)
+static void
+_spdk_bdev_qos_config_type(struct spdk_bdev *bdev, uint64_t qos_set,
+			   enum spdk_bdev_qos_type qos_type)
 {
-	struct spdk_bdev_module_if *module;
+	uint64_t	min_qos_set = 0;
 
+	switch (qos_type) {
+	case SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT:
+		min_qos_set = SPDK_BDEV_QOS_MIN_IOS_PER_SEC;
+		break;
+	case SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT:
+		min_qos_set = SPDK_BDEV_QOS_MIN_BW_IN_MB_PER_SEC;
+		break;
+	default:
+		SPDK_ERRLOG("Unsupported QoS type.\n");
+		return;
+	}
+
+	if (qos_set % min_qos_set) {
+		SPDK_ERRLOG("Assigned QoS %" PRIu64 " on bdev %s is not multiple of %lu\n",
+			    qos_set, bdev->name, min_qos_set);
+		SPDK_ERRLOG("Failed to enable QoS on this bdev %s\n", bdev->name);
+		return;
+	}
+
+	if (!bdev->qos) {
+		bdev->qos = calloc(1, sizeof(*bdev->qos));
+		if (!bdev->qos) {
+			SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
+			return;
+		}
+	}
+
+	switch (qos_type) {
+	case SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT:
+		bdev->qos->iops_rate_limit = qos_set;
+		break;
+	case SPDK_BDEV_QOS_RW_BYTEPS_RATE_LIMIT:
+		bdev->qos->byte_rate_limit = qos_set * 1024 * 1024;
+		break;
+	default:
+		break;
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Bdev:%s QoS type:%d set:%lu\n",
+		      bdev->name, qos_type, qos_set);
+
+	return;
+}
+
+static void
+_spdk_bdev_qos_config(struct spdk_bdev *bdev)
+{
+	struct spdk_conf_section	*sp = NULL;
+	const char			*val = NULL;
+	uint64_t			qos_set = 0;
+	int				i = 0, j = 0;
+
+	sp = spdk_conf_find_section(NULL, "QoS");
+	if (!sp) {
+		return;
+	}
+
+	while (j < SPDK_BDEV_QOS_NUM_TYPES) {
+		i = 0;
+		while (true) {
+			val = spdk_conf_section_get_nmval(sp, qos_type_str[j], i, 0);
+			if (!val) {
+				break;
+			}
+
+			if (strcmp(bdev->name, val) != 0) {
+				i++;
+				continue;
+			}
+
+			val = spdk_conf_section_get_nmval(sp, qos_type_str[j], i, 1);
+			if (val) {
+				qos_set = strtoull(val, NULL, 10);
+				_spdk_bdev_qos_config_type(bdev, qos_set, j);
+			}
+
+			break;
+		}
+
+		j++;
+	}
+
+	return;
+}
+
+static int
+spdk_bdev_init(struct spdk_bdev *bdev)
+{
 	assert(bdev->module != NULL);
 
 	if (!bdev->name) {
@@ -1794,16 +2660,58 @@ _spdk_bdev_register(struct spdk_bdev *bdev)
 
 	TAILQ_INIT(&bdev->open_descs);
 
-	TAILQ_INIT(&bdev->vbdevs);
-	TAILQ_INIT(&bdev->base_bdevs);
+	TAILQ_INIT(&bdev->aliases);
 
 	bdev->reset_in_progress = NULL;
 
-	spdk_io_device_register(bdev, spdk_bdev_channel_create, spdk_bdev_channel_destroy,
+	_spdk_bdev_qos_config(bdev);
+
+	spdk_io_device_register(__bdev_to_io_dev(bdev),
+				spdk_bdev_channel_create, spdk_bdev_channel_destroy,
 				sizeof(struct spdk_bdev_channel));
 
 	pthread_mutex_init(&bdev->mutex, NULL);
-	SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Inserting bdev %s into list\n", bdev->name);
+	return 0;
+}
+
+static void
+spdk_bdev_destroy_cb(void *io_device)
+{
+	int			rc;
+	struct spdk_bdev	*bdev;
+	spdk_bdev_unregister_cb	cb_fn;
+	void			*cb_arg;
+
+	bdev = __bdev_from_io_dev(io_device);
+	cb_fn = bdev->unregister_cb;
+	cb_arg = bdev->unregister_ctx;
+
+	rc = bdev->fn_table->destruct(bdev->ctxt);
+	if (rc < 0) {
+		SPDK_ERRLOG("destruct failed\n");
+	}
+	if (rc <= 0 && cb_fn != NULL) {
+		cb_fn(cb_arg, rc);
+	}
+}
+
+
+static void
+spdk_bdev_fini(struct spdk_bdev *bdev)
+{
+	pthread_mutex_destroy(&bdev->mutex);
+
+	free(bdev->qos);
+
+	spdk_io_device_unregister(__bdev_to_io_dev(bdev), spdk_bdev_destroy_cb);
+}
+
+static void
+spdk_bdev_start(struct spdk_bdev *bdev)
+{
+	struct spdk_bdev_module *module;
+
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Inserting bdev %s into list\n", bdev->name);
 	TAILQ_INSERT_TAIL(&g_bdev_mgr.bdevs, bdev, link);
 
 	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, tailq) {
@@ -1812,53 +2720,169 @@ _spdk_bdev_register(struct spdk_bdev *bdev)
 			module->examine(bdev);
 		}
 	}
-
-	return 0;
 }
 
 int
 spdk_bdev_register(struct spdk_bdev *bdev)
 {
-	return _spdk_bdev_register(bdev);
-}
+	int rc = spdk_bdev_init(bdev);
 
-int
-spdk_vbdev_register(struct spdk_bdev *vbdev, struct spdk_bdev **base_bdevs, int base_bdev_count)
-{
-	int i, rc;
-
-	rc = _spdk_bdev_register(vbdev);
-	if (rc) {
-		return rc;
+	if (rc == 0) {
+		spdk_bdev_start(bdev);
 	}
 
-	for (i = 0; i < base_bdev_count; i++) {
-		assert(base_bdevs[i] != NULL);
-		TAILQ_INSERT_TAIL(&vbdev->base_bdevs, base_bdevs[i], base_bdev_link);
-		TAILQ_INSERT_TAIL(&base_bdevs[i]->vbdevs, vbdev, vbdev_link);
+	return rc;
+}
+
+static void
+spdk_vbdev_remove_base_bdevs(struct spdk_bdev *vbdev)
+{
+	struct spdk_bdev **bdevs;
+	struct spdk_bdev *base;
+	size_t i, j, k;
+	bool found;
+
+	/* Iterate over base bdevs to remove vbdev from them. */
+	for (i = 0; i < vbdev->base_bdevs_cnt; i++) {
+		found = false;
+		base = vbdev->base_bdevs[i];
+
+		for (j = 0; j < base->vbdevs_cnt; j++) {
+			if (base->vbdevs[j] != vbdev) {
+				continue;
+			}
+
+			for (k = j; k + 1 < base->vbdevs_cnt; k++) {
+				base->vbdevs[k] = base->vbdevs[k + 1];
+			}
+
+			base->vbdevs_cnt--;
+			if (base->vbdevs_cnt > 0) {
+				bdevs = realloc(base->vbdevs, base->vbdevs_cnt * sizeof(bdevs[0]));
+				/* It would be odd if shrinking memory block fail. */
+				assert(bdevs);
+				base->vbdevs = bdevs;
+			} else {
+				free(base->vbdevs);
+				base->vbdevs = NULL;
+			}
+
+			found = true;
+			break;
+		}
+
+		if (!found) {
+			SPDK_WARNLOG("Bdev '%s' is not base bdev of '%s'.\n", base->name, vbdev->name);
+		}
+	}
+
+	free(vbdev->base_bdevs);
+	vbdev->base_bdevs = NULL;
+	vbdev->base_bdevs_cnt = 0;
+}
+
+static int
+spdk_vbdev_set_base_bdevs(struct spdk_bdev *vbdev, struct spdk_bdev **base_bdevs, size_t cnt)
+{
+	struct spdk_bdev **vbdevs;
+	struct spdk_bdev *base;
+	size_t i;
+
+	/* Adding base bdevs isn't supported (yet?). */
+	assert(vbdev->base_bdevs_cnt == 0);
+
+	vbdev->base_bdevs = malloc(cnt * sizeof(vbdev->base_bdevs[0]));
+	if (!vbdev->base_bdevs) {
+		SPDK_ERRLOG("%s - realloc() failed\n", vbdev->name);
+		return -ENOMEM;
+	}
+
+	memcpy(vbdev->base_bdevs, base_bdevs, cnt * sizeof(vbdev->base_bdevs[0]));
+	vbdev->base_bdevs_cnt = cnt;
+
+	/* Iterate over base bdevs to add this vbdev to them. */
+	for (i = 0; i < cnt; i++) {
+		base = vbdev->base_bdevs[i];
+
+		assert(base != NULL);
+		assert(base->claim_module != NULL);
+
+		vbdevs = realloc(base->vbdevs, (base->vbdevs_cnt + 1) * sizeof(vbdevs[0]));
+		if (!vbdevs) {
+			SPDK_ERRLOG("%s - realloc() failed\n", base->name);
+			spdk_vbdev_remove_base_bdevs(vbdev);
+			return -ENOMEM;
+		}
+
+		vbdevs[base->vbdevs_cnt] = vbdev;
+		base->vbdevs = vbdevs;
+		base->vbdevs_cnt++;
 	}
 
 	return 0;
 }
 
+int
+spdk_vbdev_register(struct spdk_bdev *vbdev, struct spdk_bdev **base_bdevs, int base_bdev_count)
+{
+	int rc;
+
+	rc = spdk_bdev_init(vbdev);
+	if (rc) {
+		return rc;
+	}
+
+	if (base_bdev_count == 0) {
+		spdk_bdev_start(vbdev);
+		return 0;
+	}
+
+	rc = spdk_vbdev_set_base_bdevs(vbdev, base_bdevs, base_bdev_count);
+	if (rc) {
+		spdk_bdev_fini(vbdev);
+		return rc;
+	}
+
+	spdk_bdev_start(vbdev);
+	return 0;
+
+}
+
 void
-spdk_bdev_unregister_done(struct spdk_bdev *bdev, int bdeverrno)
+spdk_bdev_destruct_done(struct spdk_bdev *bdev, int bdeverrno)
 {
 	if (bdev->unregister_cb != NULL) {
 		bdev->unregister_cb(bdev->unregister_ctx, bdeverrno);
 	}
 }
 
+static void
+_remove_notify(void *arg)
+{
+	struct spdk_bdev_desc *desc = arg;
+
+	desc->remove_cb(desc->remove_ctx);
+}
+
 void
 spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
 {
 	struct spdk_bdev_desc	*desc, *tmp;
-	int			rc;
 	bool			do_destruct = true;
+	struct spdk_thread	*thread;
 
-	SPDK_DEBUGLOG(SPDK_TRACE_BDEV, "Removing bdev %s from list\n", bdev->name);
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Removing bdev %s from list\n", bdev->name);
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		/* The user called this from a non-SPDK thread. */
+		cb_fn(cb_arg, -ENOTSUP);
+		return;
+	}
 
 	pthread_mutex_lock(&bdev->mutex);
+
+	spdk_vbdev_remove_base_bdevs(bdev);
 
 	bdev->status = SPDK_BDEV_STATUS_REMOVING;
 	bdev->unregister_cb = cb_fn;
@@ -1866,10 +2890,18 @@ spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void
 
 	TAILQ_FOREACH_SAFE(desc, &bdev->open_descs, link, tmp) {
 		if (desc->remove_cb) {
-			pthread_mutex_unlock(&bdev->mutex);
 			do_destruct = false;
-			desc->remove_cb(desc->remove_ctx);
-			pthread_mutex_lock(&bdev->mutex);
+			/*
+			 * Defer invocation of the remove_cb to a separate message that will
+			 *  run later on this thread.  This ensures this context unwinds and
+			 *  we don't recursively unregister this bdev again if the remove_cb
+			 *  immediately closes its descriptor.
+			 */
+			if (!desc->remove_scheduled) {
+				/* Avoid scheduling removal of the same descriptor multiple times. */
+				desc->remove_scheduled = true;
+				spdk_thread_send_msg(thread, _remove_notify, desc);
+			}
 		}
 	}
 
@@ -1881,29 +2913,7 @@ spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void
 	TAILQ_REMOVE(&g_bdev_mgr.bdevs, bdev, link);
 	pthread_mutex_unlock(&bdev->mutex);
 
-	pthread_mutex_destroy(&bdev->mutex);
-
-	spdk_io_device_unregister(bdev, NULL);
-
-	rc = bdev->fn_table->destruct(bdev->ctxt);
-	if (rc < 0) {
-		SPDK_ERRLOG("destruct failed\n");
-	}
-	if (rc <= 0 && cb_fn != NULL) {
-		cb_fn(cb_arg, rc);
-	}
-}
-
-void
-spdk_vbdev_unregister(struct spdk_bdev *vbdev, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
-{
-	struct spdk_bdev *base_bdev;
-
-	assert(!TAILQ_EMPTY(&vbdev->base_bdevs));
-	TAILQ_FOREACH(base_bdev, &vbdev->base_bdevs, base_bdev_link) {
-		TAILQ_REMOVE(&base_bdev->vbdevs, vbdev, vbdev_link);
-	}
-	spdk_bdev_unregister(vbdev, cb_fn, cb_arg);
+	spdk_bdev_fini(bdev);
 }
 
 int
@@ -1918,10 +2928,13 @@ spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t remove_
 		return -ENOMEM;
 	}
 
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Opening descriptor %p for bdev %s on thread %p\n", desc, bdev->name,
+		      spdk_get_thread());
+
 	pthread_mutex_lock(&bdev->mutex);
 
 	if (write && bdev->claim_module) {
-		SPDK_INFOLOG(SPDK_TRACE_BDEV, "Could not open %s - already claimed\n", bdev->name);
+		SPDK_ERRLOG("Could not open %s - already claimed\n", bdev->name);
 		free(desc);
 		pthread_mutex_unlock(&bdev->mutex);
 		return -EPERM;
@@ -1946,10 +2959,26 @@ spdk_bdev_close(struct spdk_bdev_desc *desc)
 	struct spdk_bdev *bdev = desc->bdev;
 	bool do_unregister = false;
 
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Closing descriptor %p for bdev %s on thread %p\n", desc, bdev->name,
+		      spdk_get_thread());
+
 	pthread_mutex_lock(&bdev->mutex);
 
 	TAILQ_REMOVE(&bdev->open_descs, desc, link);
 	free(desc);
+
+	/* If no more descriptors, kill QoS channel */
+	if (bdev->qos && TAILQ_EMPTY(&bdev->open_descs)) {
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Closed last descriptor for bdev %s on thread %p. Stopping QoS.\n",
+			      bdev->name, spdk_get_thread());
+
+		if (spdk_bdev_qos_destroy(bdev)) {
+			/* There isn't anything we can do to recover here. Just let the
+			 * old QoS poller keep running. The QoS handling won't change
+			 * cores when the user allocates a new channel, but it won't break. */
+			SPDK_ERRLOG("Unable to shut down QoS poller. It will continue running on the current thread.\n");
+		}
+	}
 
 	if (bdev->status == SPDK_BDEV_STATUS_REMOVING && TAILQ_EMPTY(&bdev->open_descs)) {
 		do_unregister = true;
@@ -1963,7 +2992,7 @@ spdk_bdev_close(struct spdk_bdev_desc *desc)
 
 int
 spdk_bdev_module_claim_bdev(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
-			    struct spdk_bdev_module_if *module)
+			    struct spdk_bdev_module *module)
 {
 	if (bdev->claim_module != NULL) {
 		SPDK_ERRLOG("bdev %s already claimed by module %s\n", bdev->name,
@@ -2026,8 +3055,18 @@ spdk_bdev_io_get_iovec(struct spdk_bdev_io *bdev_io, struct iovec **iovp, int *i
 }
 
 void
-spdk_bdev_module_list_add(struct spdk_bdev_module_if *bdev_module)
+spdk_bdev_module_list_add(struct spdk_bdev_module *bdev_module)
 {
+
+	if (spdk_bdev_module_list_find(bdev_module->name)) {
+		SPDK_ERRLOG("ERROR: module '%s' already registered.\n", bdev_module->name);
+		assert(false);
+	}
+
+	if (bdev_module->async_init) {
+		bdev_module->action_in_progress = 1;
+	}
+
 	/*
 	 * Modules with examine callbacks must be initialized first, so they are
 	 *  ready to handle examine callbacks from later modules that will
@@ -2040,82 +3079,18 @@ spdk_bdev_module_list_add(struct spdk_bdev_module_if *bdev_module)
 	}
 }
 
-void
-spdk_bdev_part_base_free(struct spdk_bdev_part_base *base)
+struct spdk_bdev_module *
+spdk_bdev_module_list_find(const char *name)
 {
-	if (base->desc) {
-		spdk_bdev_close(base->desc);
-		base->desc = NULL;
-	}
-	base->base_free_fn(base);
-}
+	struct spdk_bdev_module *bdev_module;
 
-void
-spdk_bdev_part_free(struct spdk_bdev_part *part)
-{
-	struct spdk_bdev_part_base *base;
-
-	assert(part);
-	assert(part->base);
-
-	base = part->base;
-	spdk_io_device_unregister(&part->base, NULL);
-	TAILQ_REMOVE(base->tailq, part, tailq);
-	free(part->bdev.name);
-	free(part);
-
-	if (__sync_sub_and_fetch(&base->ref, 1) == 0) {
-		spdk_bdev_module_release_bdev(base->bdev);
-		spdk_bdev_part_base_free(base);
-	}
-}
-
-void
-spdk_bdev_part_tailq_fini(struct bdev_part_tailq *tailq)
-{
-	struct spdk_bdev_part *part, *tmp;
-
-	TAILQ_FOREACH_SAFE(part, tailq, tailq, tmp) {
-		spdk_bdev_part_free(part);
-	}
-}
-
-void
-spdk_bdev_part_base_hotremove(struct spdk_bdev *base_bdev, struct bdev_part_tailq *tailq)
-{
-	struct spdk_bdev_part *part, *tmp;
-
-	TAILQ_FOREACH_SAFE(part, tailq, tailq, tmp) {
-		if (part->base->bdev == base_bdev) {
-			spdk_vbdev_unregister(&part->bdev, NULL, NULL);
+	TAILQ_FOREACH(bdev_module, &g_bdev_mgr.bdev_modules, tailq) {
+		if (strcmp(name, bdev_module->name) == 0) {
+			break;
 		}
 	}
-}
 
-static bool
-spdk_bdev_part_io_type_supported(void *_part, enum spdk_bdev_io_type io_type)
-{
-	struct spdk_bdev_part *part = _part;
-
-	return part->base->bdev->fn_table->io_type_supported(part->base->bdev, io_type);
-}
-
-static struct spdk_io_channel *
-spdk_bdev_part_get_io_channel(void *_part)
-{
-	struct spdk_bdev_part *part = _part;
-
-	return spdk_get_io_channel(&part->base);
-}
-
-static void
-spdk_bdev_part_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
-{
-	struct spdk_bdev_io *part_io = cb_arg;
-	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
-
-	spdk_bdev_io_complete(part_io, status);
-	spdk_bdev_free_io(bdev_io);
+	return bdev_module;
 }
 
 static void
@@ -2124,189 +3099,197 @@ spdk_bdev_write_zeroes_split(struct spdk_bdev_io *bdev_io, bool success, void *c
 	uint64_t len;
 
 	if (!success) {
-		bdev_io->cb = bdev_io->stored_user_cb;
+		bdev_io->cb = bdev_io->u.bdev.stored_user_cb;
 		_spdk_bdev_io_complete(bdev_io);
 		return;
 	}
 
 	/* no need to perform the error checking from write_zeroes_blocks because this request already passed those checks. */
-	len = spdk_min(spdk_bdev_get_block_size(bdev_io->bdev) * bdev_io->split_remaining_num_blocks,
+	len = spdk_min(spdk_bdev_get_block_size(bdev_io->bdev) * bdev_io->u.bdev.split_remaining_num_blocks,
 		       ZERO_BUFFER_SIZE);
 
-	bdev_io->u.bdev.offset_blocks = bdev_io->split_current_offset_blocks;
+	bdev_io->u.bdev.offset_blocks = bdev_io->u.bdev.split_current_offset_blocks;
 	bdev_io->u.bdev.iov.iov_len = len;
 	bdev_io->u.bdev.num_blocks = len / spdk_bdev_get_block_size(bdev_io->bdev);
-	bdev_io->split_remaining_num_blocks -= bdev_io->u.bdev.num_blocks;
-	bdev_io->split_current_offset_blocks += bdev_io->u.bdev.num_blocks;
+	bdev_io->u.bdev.split_remaining_num_blocks -= bdev_io->u.bdev.num_blocks;
+	bdev_io->u.bdev.split_current_offset_blocks += bdev_io->u.bdev.num_blocks;
 
 	/* if this round completes the i/o, change the callback to be the original user callback */
-	if (bdev_io->split_remaining_num_blocks == 0) {
-		spdk_bdev_io_init(bdev_io, bdev_io->bdev, cb_arg, bdev_io->stored_user_cb);
+	if (bdev_io->u.bdev.split_remaining_num_blocks == 0) {
+		spdk_bdev_io_init(bdev_io, bdev_io->bdev, cb_arg, bdev_io->u.bdev.stored_user_cb);
 	} else {
 		spdk_bdev_io_init(bdev_io, bdev_io->bdev, cb_arg, spdk_bdev_write_zeroes_split);
 	}
 	spdk_bdev_io_submit(bdev_io);
 }
 
-void
-spdk_bdev_part_submit_request(struct spdk_bdev_part_channel *ch, struct spdk_bdev_io *bdev_io)
+struct set_qos_limit_ctx {
+	void (*cb_fn)(void *cb_arg, int status);
+	void *cb_arg;
+	struct spdk_bdev *bdev;
+};
+
+static void
+_spdk_bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 {
-	struct spdk_bdev_part *part = ch->part;
-	struct spdk_io_channel *base_ch = ch->base_ch;
-	struct spdk_bdev_desc *base_desc = part->base->desc;
-	uint64_t offset;
-	int rc = 0;
+	pthread_mutex_lock(&ctx->bdev->mutex);
+	ctx->bdev->qos_mod_in_progress = false;
+	pthread_mutex_unlock(&ctx->bdev->mutex);
 
-	/* Modify the I/O to adjust for the offset within the base bdev. */
-	switch (bdev_io->type) {
-	case SPDK_BDEV_IO_TYPE_READ:
-		offset = bdev_io->u.bdev.offset_blocks + part->offset_blocks;
-		rc = spdk_bdev_readv_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
-					    bdev_io->u.bdev.iovcnt, offset,
-					    bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
-					    bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE:
-		offset = bdev_io->u.bdev.offset_blocks + part->offset_blocks;
-		rc = spdk_bdev_writev_blocks(base_desc, base_ch, bdev_io->u.bdev.iovs,
-					     bdev_io->u.bdev.iovcnt, offset,
-					     bdev_io->u.bdev.num_blocks, spdk_bdev_part_complete_io,
-					     bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-		offset = bdev_io->u.bdev.offset_blocks + part->offset_blocks;
-		rc = spdk_bdev_write_zeroes_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-						   spdk_bdev_part_complete_io, bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_UNMAP:
-		offset = bdev_io->u.bdev.offset_blocks + part->offset_blocks;
-		rc = spdk_bdev_unmap_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-					    spdk_bdev_part_complete_io, bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-		offset = bdev_io->u.bdev.offset_blocks + part->offset_blocks;
-		rc = spdk_bdev_flush_blocks(base_desc, base_ch, offset, bdev_io->u.bdev.num_blocks,
-					    spdk_bdev_part_complete_io, bdev_io);
-		break;
-	case SPDK_BDEV_IO_TYPE_RESET:
-		rc = spdk_bdev_reset(base_desc, base_ch,
-				     spdk_bdev_part_complete_io, bdev_io);
-		break;
-	default:
-		SPDK_ERRLOG("split: unknown I/O type %d\n", bdev_io->type);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
-	if (rc != 0) {
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-	}
-}
-static int
-spdk_bdev_part_channel_create_cb(void *io_device, void *ctx_buf)
-{
-	struct spdk_bdev_part *part = SPDK_CONTAINEROF(io_device, struct spdk_bdev_part, base);
-	struct spdk_bdev_part_channel *ch = ctx_buf;
-
-	ch->part = part;
-	ch->base_ch = spdk_bdev_get_io_channel(part->base->desc);
-	if (ch->base_ch == NULL) {
-		return -1;
-	}
-
-	if (part->base->ch_create_cb) {
-		return part->base->ch_create_cb(io_device, ctx_buf);
-	} else {
-		return 0;
-	}
+	ctx->cb_fn(ctx->cb_arg, status);
+	free(ctx);
 }
 
 static void
-spdk_bdev_part_channel_destroy_cb(void *io_device, void *ctx_buf)
+_spdk_bdev_disable_qos_done(void *cb_arg)
 {
-	struct spdk_bdev_part *part = SPDK_CONTAINEROF(io_device, struct spdk_bdev_part, base);
-	struct spdk_bdev_part_channel *ch = ctx_buf;
+	struct set_qos_limit_ctx *ctx = cb_arg;
+	struct spdk_bdev *bdev = ctx->bdev;
+	struct spdk_bdev_qos *qos;
 
-	if (part->base->ch_destroy_cb) {
-		part->base->ch_destroy_cb(io_device, ctx_buf);
-	}
-	spdk_put_io_channel(ch->base_ch);
+	pthread_mutex_lock(&bdev->mutex);
+	qos = bdev->qos;
+	bdev->qos = NULL;
+	pthread_mutex_unlock(&bdev->mutex);
+
+	_spdk_bdev_abort_queued_io(&qos->queued, qos->ch);
+	spdk_put_io_channel(spdk_io_channel_from_ctx(qos->ch));
+	spdk_poller_unregister(&qos->poller);
+
+	free(qos);
+
+	_spdk_bdev_set_qos_limit_done(ctx, 0);
 }
 
-int
-spdk_bdev_part_base_construct(struct spdk_bdev_part_base *base, struct spdk_bdev *bdev,
-			      spdk_bdev_remove_cb_t remove_cb, struct spdk_bdev_module_if *module,
-			      struct spdk_bdev_fn_table *fn_table, struct bdev_part_tailq *tailq,
-			      spdk_bdev_part_base_free_fn free_fn,
-			      uint32_t channel_size, spdk_io_channel_create_cb ch_create_cb,
-			      spdk_io_channel_destroy_cb ch_destroy_cb)
+static void
+_spdk_bdev_disable_qos_msg_done(struct spdk_io_channel_iter *i, int status)
 {
+	void *io_device = spdk_io_channel_iter_get_io_device(i);
+	struct spdk_bdev *bdev = __bdev_from_io_dev(io_device);
+	struct set_qos_limit_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_thread *thread;
+
+	pthread_mutex_lock(&bdev->mutex);
+	thread = bdev->qos->thread;
+	pthread_mutex_unlock(&bdev->mutex);
+
+	spdk_thread_send_msg(thread, _spdk_bdev_disable_qos_done, ctx);
+}
+
+static void
+_spdk_bdev_disable_qos_msg(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *bdev_ch = spdk_io_channel_get_ctx(ch);
+
+	bdev_ch->flags &= ~BDEV_CH_QOS_ENABLED;
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+_spdk_bdev_update_qos_limit_iops_msg(void *cb_arg)
+{
+	struct set_qos_limit_ctx *ctx = cb_arg;
+	struct spdk_bdev *bdev = ctx->bdev;
+
+	pthread_mutex_lock(&bdev->mutex);
+	spdk_bdev_qos_update_max_quota_per_timeslice(bdev->qos);
+	pthread_mutex_unlock(&bdev->mutex);
+
+	_spdk_bdev_set_qos_limit_done(ctx, 0);
+}
+
+static void
+_spdk_bdev_enable_qos_msg(struct spdk_io_channel_iter *i)
+{
+	void *io_device = spdk_io_channel_iter_get_io_device(i);
+	struct spdk_bdev *bdev = __bdev_from_io_dev(io_device);
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *bdev_ch = spdk_io_channel_get_ctx(ch);
 	int rc;
 
-	fn_table->get_io_channel = spdk_bdev_part_get_io_channel;
-	fn_table->io_type_supported = spdk_bdev_part_io_type_supported;
-
-	base->bdev = bdev;
-	base->desc = NULL;
-	base->ref = 0;
-	base->module = module;
-	base->fn_table = fn_table;
-	base->tailq = tailq;
-	base->claimed = false;
-	base->channel_size = channel_size;
-	base->ch_create_cb = ch_create_cb;
-	base->ch_destroy_cb = ch_destroy_cb;
-	base->base_free_fn = free_fn;
-
-	rc = spdk_bdev_open(bdev, false, remove_cb, bdev, &base->desc);
-	if (rc) {
-		spdk_bdev_part_base_free(base);
-		SPDK_ERRLOG("could not open bdev %s\n", spdk_bdev_get_name(bdev));
-		return -1;
-	}
-
-	return 0;
+	pthread_mutex_lock(&bdev->mutex);
+	rc = _spdk_bdev_enable_qos(bdev, bdev_ch);
+	pthread_mutex_unlock(&bdev->mutex);
+	spdk_for_each_channel_continue(i, rc);
 }
 
-int
-spdk_bdev_part_construct(struct spdk_bdev_part *part, struct spdk_bdev_part_base *base,
-			 char *name, uint64_t offset_blocks, uint64_t num_blocks,
-			 char *product_name)
+static void
+_spdk_bdev_enable_qos_done(struct spdk_io_channel_iter *i, int status)
 {
-	part->bdev.name = name;
-	part->bdev.blocklen = base->bdev->blocklen;
-	part->bdev.blockcnt = num_blocks;
-	part->offset_blocks = offset_blocks;
+	struct set_qos_limit_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
 
-	part->bdev.write_cache = base->bdev->write_cache;
-	part->bdev.need_aligned_buffer = base->bdev->need_aligned_buffer;
-	part->bdev.product_name = product_name;
-	part->bdev.ctxt = part;
-	part->bdev.module = base->module;
-	part->bdev.fn_table = base->fn_table;
-
-	__sync_fetch_and_add(&base->ref, 1);
-	part->base = base;
-
-	if (!base->claimed) {
-		int rc;
-
-		rc = spdk_bdev_module_claim_bdev(base->bdev, base->desc, base->module);
-		if (rc) {
-			SPDK_ERRLOG("could not claim bdev %s\n", spdk_bdev_get_name(base->bdev));
-			free(part->bdev.name);
-			return -1;
-		}
-		base->claimed = true;
-	}
-
-	spdk_io_device_register(&part->base, spdk_bdev_part_channel_create_cb,
-				spdk_bdev_part_channel_destroy_cb,
-				base->channel_size);
-	spdk_vbdev_register(&part->bdev, &base->bdev, 1);
-	TAILQ_INSERT_TAIL(base->tailq, part, tailq);
-
-	return 0;
+	_spdk_bdev_set_qos_limit_done(ctx, status);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("bdev", SPDK_TRACE_BDEV)
+void
+spdk_bdev_set_qos_limit_iops(struct spdk_bdev *bdev, uint64_t ios_per_sec,
+			     void (*cb_fn)(void *cb_arg, int status), void *cb_arg)
+{
+	struct set_qos_limit_ctx *ctx;
+
+	if (ios_per_sec > 0 && ios_per_sec % SPDK_BDEV_QOS_MIN_IOS_PER_SEC) {
+		SPDK_ERRLOG("Requested ios_per_sec limit %" PRIu64 " is not a multiple of %u\n",
+			    ios_per_sec, SPDK_BDEV_QOS_MIN_IOS_PER_SEC);
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->bdev = bdev;
+
+	pthread_mutex_lock(&bdev->mutex);
+	if (bdev->qos_mod_in_progress) {
+		pthread_mutex_unlock(&bdev->mutex);
+		free(ctx);
+		cb_fn(cb_arg, -EAGAIN);
+		return;
+	}
+	bdev->qos_mod_in_progress = true;
+
+	if (ios_per_sec > 0) {
+		if (bdev->qos == NULL) {
+			/* Enabling */
+			bdev->qos = calloc(1, sizeof(*bdev->qos));
+			if (!bdev->qos) {
+				pthread_mutex_unlock(&bdev->mutex);
+				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
+				free(ctx);
+				cb_fn(cb_arg, -ENOMEM);
+				return;
+			}
+
+			bdev->qos->iops_rate_limit = ios_per_sec;
+			spdk_for_each_channel(__bdev_to_io_dev(bdev),
+					      _spdk_bdev_enable_qos_msg, ctx,
+					      _spdk_bdev_enable_qos_done);
+		} else {
+			/* Updating */
+			bdev->qos->iops_rate_limit = ios_per_sec;
+			spdk_thread_send_msg(bdev->qos->thread, _spdk_bdev_update_qos_limit_iops_msg, ctx);
+		}
+	} else {
+		if (bdev->qos != NULL) {
+			/* Disabling */
+			spdk_for_each_channel(__bdev_to_io_dev(bdev),
+					      _spdk_bdev_disable_qos_msg, ctx,
+					      _spdk_bdev_disable_qos_msg_done);
+		} else {
+			pthread_mutex_unlock(&bdev->mutex);
+			_spdk_bdev_set_qos_limit_done(ctx, 0);
+			return;
+		}
+	}
+
+	pthread_mutex_unlock(&bdev->mutex);
+}
+
+SPDK_LOG_REGISTER_COMPONENT("bdev", SPDK_LOG_BDEV)
