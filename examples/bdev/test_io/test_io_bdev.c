@@ -114,6 +114,7 @@ read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_bdev_free_io(bdev_io);
 	spdk_put_io_channel(hello_context->bdev_io_channel);
 	spdk_bdev_close(hello_context->bdev_desc);
+	//spdk_bdev_unregister(hello_context->bdev, NULL, NULL);
 	SPDK_NOTICELOG("Stopping app\n");
 	spdk_app_stop(success ? 0 : -1);
 }

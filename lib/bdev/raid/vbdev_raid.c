@@ -337,7 +337,8 @@ void rdx_raid_destroy_devices(struct rdx_raid *raid)
 
 	SPDK_NOTICELOG("Destroying base devices for raid %s\n", raid->name);
 	for (i = 0; i < raid->dev_cnt; i++) {
-		rdx_dev_destroy(raid->devices[i]);
+		if (raid->devices[i])
+			rdx_dev_destroy(raid->devices[i]);
 	}
 }
 
@@ -351,7 +352,7 @@ static int vbdev_raid_destruct(void *ctx)
 
 	rdx_raid_destroy_devices(raid);
 
-	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+	//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 	printf("destruct\n");
 	return 0;
 }
