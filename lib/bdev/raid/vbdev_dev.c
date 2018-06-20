@@ -35,7 +35,7 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
 
-	rc = spdk_bdev_open(bdev, true, vbdev_raid_base_bdev_hotremove_cb,
+	rc = spdk_bdev_open(bdev, true, NULL/*vbdev_raid_base_bdev_hotremove_cb*/,
 			dev, &dev->base_desc);
 	if (rc) {
 		SPDK_ERRLOG("could not open bdev %s\n", dev->bdev_name);
@@ -150,7 +150,7 @@ void rdx_dev_close(struct rdx_dev *dev)
 //
 //	/* Dev is closed */
 //	if (!atomic_read(&dev->ref_cnt))
-		return;
+//		return;
 
 	SPDK_NOTICELOG("Closing dev %s number %d\n", dev->bdev_name, dev->num);
 

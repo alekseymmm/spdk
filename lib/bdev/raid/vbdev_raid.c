@@ -326,6 +326,20 @@ error:
 	return rc;
 }
 
+//int rdx_raid_unregister(struct rdx_raid *raid)
+//{
+//	spdk_io_device_unregister(&raid->raid_bdev, NULL);
+//}
+
+void rdx_raid_destroy_devices(struct rdx_raid *raid)
+{
+	int i;
+
+	SPDK_NOTICELOG("Destroying base devices for raid %s\n", raid->name);
+	for (i = 0; i < raid->dev_cnt; i++) {
+		rdx_dev_destroy(raid->devices[i]);
+	}
+}
 
 /* Called after we've unregistered following a hot remove callback.
  * Our finish entry point will be called next.
@@ -335,13 +349,8 @@ static int vbdev_raid_destruct(void *ctx)
 	int i;
 	struct rdx_raid *raid = (struct rdx_raid *)ctx;
 
-	for (i = 0; i < raid->dev_cnt; i++) {
-		/* Unclaim the underlying bdev. */
-		spdk_bdev_module_release_bdev(raid->devices[i]->bdev);
+	rdx_raid_destroy_devices(raid);
 
-		/* Close the underlying bdev. */
-		spdk_bdev_close(raid->devices[i]->base_desc);
-	}
 	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 	printf("destruct\n");
 	return 0;

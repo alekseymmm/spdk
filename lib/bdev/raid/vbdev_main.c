@@ -135,6 +135,8 @@ static void vbdev_raid_init_complete(void)
 static void vbdev_raid_finish(void)
 {
 	spdk_bdev_unregister(&g_raid->raid_bdev, NULL, NULL);
+
+	rdx_raid_destroy_devices(&g_raid);
 }
 
 SPDK_LOG_REGISTER_COMPONENT("vbdev_raid", SPDK_LOG_VBDEV_RAID);
