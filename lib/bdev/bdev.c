@@ -2746,6 +2746,11 @@ spdk_vbdev_remove_base_bdevs(struct spdk_bdev *vbdev)
 	for (i = 0; i < vbdev->base_bdevs_cnt; i++) {
 		found = false;
 		base = vbdev->base_bdevs[i];
+		if (!base) {
+			SPDK_NOTICELOG("vbdev %s base bdev[%lu] already freed\n",
+					vbdev->name, i);
+			continue;
+		}
 
 		for (j = 0; j < base->vbdevs_cnt; j++) {
 			if (base->vbdevs[j] != vbdev) {

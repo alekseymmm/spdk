@@ -1,84 +1,11 @@
-# iSCSI target configuration file
-#
-# Please write all parameters using ASCII.
-# The parameter must be quoted if it includes whitespace.
-#
-# Configuration syntax:
-# Leading whitespace is ignored.
-# Lines starting with '#' are comments.
-# Lines ending with '\' are concatenated with the next line.
-# Bracketed ([]) names define sections
-[Global]
-[iSCSI]
-  # node name (not include optional part)
-  # Users can optionally change this to fit their environment.
-  NodeBase "iqn.2016-06.io.spdk"
+[Null]
+  Dev Null_0 10240 4096
+  Dev Null_1 10240 4096
 
-  AuthFile /usr/local/etc/spdk/auth.conf
-
-  MinConnectionsPerCore 4
-
-  # Socket I/O timeout sec. (0 is infinite)
-  Timeout 30
-
-  # authentication information for discovery session
-  # Options:
-  # None, Auto, CHAP and Mutual.  Note that Mutual infers CHAP.
-  DiscoveryAuthMethod Auto
-
-  #MaxSessions 128
-  #MaxConnectionsPerSession 2
-
-  # iSCSI initial parameters negotiate with initiators
-  # NOTE: incorrect values might crash
-  DefaultTime2Wait 2
-  DefaultTime2Retain 60
-
-  ImmediateData Yes
-  ErrorRecoveryLevel 0
-
-# Users must change the PortalGroup section(s) to match the IP addresses
-#  for their environment.
-# PortalGroup sections define which network portals the iSCSI target
-#  will use to listen for incoming connections.  These are also used to
-#  determine which targets are accessible over each portal group.
-# Up to 1024 portal directives are allowed.  These define the network
-#  portals of the portal group. The user must specify a IP address
-#  for each network portal, and may optionally specify a port and
-#  a cpumask. If the port is omitted, 3260 will be used. Cpumask will
-#  be used to set the processor affinity of the iSCSI connection
-#  through the portal.  If the cpumask is omitted, cpumask will be
-#  set to all available processors.
-#  Syntax:
-#    Portal <Name> <IP address>[:<port>[@<cpumask>]]
-[PortalGroup1]
-  Portal DA1 127.0.0.1:3260
-
-# Users must change the InitiatorGroup section(s) to match the IP
-#  addresses and initiator configuration in their environment.
-# Netmask can be used to specify a single IP address or a range of IP addresses
-#  Netmask 192.168.1.20   <== single IP address
-#  Netmask 192.168.1.0/24 <== IP range 192.168.1.*
-[InitiatorGroup1]
-  InitiatorName ANY
-  Netmask 127.0.0.1/24
-
-# Users should change the TargetNode section(s) below to match the
-#  desired iSCSI target node configuration.
-# TargetName, Mapping, LUN0 are minimum required
-[TargetNode1]
-  TargetName disk1
-  Mapping PortalGroup1 InitiatorGroup1
-  # Use the first malloc target
-  LUN0  Null0
-  QueueDepth 128
-
-#[TargetNode2]
-#  TargetName disk2
-#  TargetAlias "Data Disk2"
-#  Mapping PortalGroup1 InitiatorGroup1
-#  AuthMethod Auto
-#  AuthGroup AuthGroup1
-#  UseDigest Auto
-#  LUN0 Nvme0n1
-#  QueueDepth 32
+[RAID]
+  RAIDName dimec
+  Level 0
+  StripeSizeKB 64
+  NumberOfDrives  2
+  Drive Null_0
+  Drive Null_1

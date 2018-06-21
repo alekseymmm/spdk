@@ -167,6 +167,11 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct rdx_blk_req *blk_req;
 
+	if (bdev_io->u.bdev.num_blocks == 0) {
+		SPDK_NOTICELOG("0 size bdev_io, complete it.\n");
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		return;
+	}
 	/* TODO: BUG with mkfs.ext4 and page cache */
 	blk_req = calloc(1, sizeof(struct rdx_blk_req));
 	if (!blk_req) {
@@ -204,17 +209,17 @@ static int vbdev_raid_poll(void *arg)
 		next = first->next;
 		req = llist_entry(first, struct rdx_req, thread_lnode);
 
-		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
-
-		spdk_bdev_io_complete(req->bdev_io, 1);
+//		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
+//
+//		spdk_bdev_io_complete(req->bdev_io, 1);
 		first = next;
-//		sectors_to_split = req->len;
-//		req->split_offset = 0;
-//		while (sectors_to_split) {
-//			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-//			len = rdx_req_split_per_dev(req, 0);
-//			sectors_to_split -= len;
-//		}
+		sectors_to_split = req->len;
+		req->split_offset = 0;
+		while (sectors_to_split) {
+			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+			len = rdx_req_split_per_dev(req, 0);
+			sectors_to_split -= len;
+		}
 
 	}
 
