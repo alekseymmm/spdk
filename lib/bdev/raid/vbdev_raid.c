@@ -203,25 +203,28 @@ static int vbdev_raid_poll(void *arg)
 	struct rdx_req *req;
 	struct llist_node *first, *next;
 	unsigned int sectors_to_split, len = 0;
+	int processed = 0;
 
 	first = llist_del_all(&ch->req_llist);
 	while (first) {
 		next = first->next;
 		req = llist_entry(first, struct rdx_req, thread_lnode);
 
-//		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
-//
-//		spdk_bdev_io_complete(req->bdev_io, 1);
+		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
+
+		spdk_bdev_io_complete(req->bdev_io, 1);
+		processed++;
 		first = next;
-		sectors_to_split = req->len;
-		req->split_offset = 0;
-		while (sectors_to_split) {
-			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-			len = rdx_req_split_per_dev(req, 0);
-			sectors_to_split -= len;
-		}
+//		sectors_to_split = req->len;
+//		req->split_offset = 0;
+//		while (sectors_to_split) {
+//			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+//			len = rdx_req_split_per_dev(req, 0);
+//			sectors_to_split -= len;
+//		}
 
 	}
+	SPDK_NOTICELOG("In raid_io_channel %p processed %d requests\n", ch, processed);
 
 	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 
@@ -390,7 +393,8 @@ static int vbdev_raid_destruct(void *ctx)
 
 	rdx_raid_destroy_devices(raid);
 
-	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+	// we have to chek if it is already unregistered or scheduled remove:wq
+	//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 	printf("destruct\n");
 	return 0;
 }

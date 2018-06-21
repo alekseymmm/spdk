@@ -234,7 +234,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 		offset_in_stripe = addr % stripe_data_len;
 		slen = stripe_data_len - offset_in_stripe;
 		//test
-		//slen=len;
+		slen=len;
 		if (slen >= len) {
 			slen = len;
 			split_req = req;
