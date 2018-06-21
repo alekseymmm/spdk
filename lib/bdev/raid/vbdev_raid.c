@@ -196,20 +196,25 @@ static int vbdev_raid_poll(void *arg)
 {
 	struct rdx_raid_io_channel *ch = arg;
 	struct rdx_req *req;
-	struct llist_node *first;
+	struct llist_node *first, *next;
 	unsigned int sectors_to_split, len = 0;
 
-	if /*while*/ (!llist_empty(&ch->req_llist)) {
-		first = llist_del_first(&ch->req_llist);
+	first = llist_del_all(&ch->req_llist);
+	while (first) {
+		next = first->next;
 		req = llist_entry(first, struct rdx_req, thread_lnode);
 
-		sectors_to_split = req->len;
-		req->split_offset = 0;
-		while (sectors_to_split) {
-			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-			len = rdx_req_split_per_dev(req, 0);
-			sectors_to_split -= len;
-		}
+		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
+
+		spdk_bdev_io_complete(req->bdev_io, 1);
+		first = next;
+//		sectors_to_split = req->len;
+//		req->split_offset = 0;
+//		while (sectors_to_split) {
+//			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+//			len = rdx_req_split_per_dev(req, 0);
+//			sectors_to_split -= len;
+//		}
 
 	}
 
@@ -217,6 +222,35 @@ static int vbdev_raid_poll(void *arg)
 
 	return 0;
 }
+
+
+//static int vbdev_raid_poll(void *arg)
+//{
+//	struct rdx_raid_io_channel *ch = arg;
+//	struct rdx_req *req;
+//	struct llist_node *first;
+//	unsigned int sectors_to_split, len = 0;
+//
+//	if (!llist_empty(&ch->req_llist)) {
+//		first = llist_del_first(&ch->req_llist);
+//		req = llist_entry(first, struct rdx_req, thread_lnode);
+//
+//		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
+//		spdk_bdev_io_complete(req->bdev_io, 1);
+////		sectors_to_split = req->len;
+////		req->split_offset = 0;
+////		while (sectors_to_split) {
+////			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+////			len = rdx_req_split_per_dev(req, 0);
+////			sectors_to_split -= len;
+////		}
+//
+//	}
+//
+//	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+//
+//	return 0;
+//}
 /* We provide this callback for the SPDK channel code to create a channel using
  * the channel struct we provided in our module get_io_channel() entry point. Here
  * we get and save off an underlying base channel of the device below us so that
@@ -280,7 +314,6 @@ static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx)
 {
 	struct rdx_raid *raid = ctx;
 	struct spdk_io_channel *io_ch = NULL;
-
 	io_ch = spdk_get_io_channel(raid);;
 	return io_ch;
 }
@@ -352,7 +385,7 @@ static int vbdev_raid_destruct(void *ctx)
 
 	rdx_raid_destroy_devices(raid);
 
-	//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 	printf("destruct\n");
 	return 0;
 }

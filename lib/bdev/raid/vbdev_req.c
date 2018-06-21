@@ -212,6 +212,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 	while (sectors_to_split) {
 		addr = req->addr;
 		len = req->len;
+
 //		raid_dsc = rdx_req_get_raid_dsc(req);
 //
 //		if (!raid_dsc) {
@@ -232,6 +233,8 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 		stripe_data_len = 16;//raid_dsc->stripe_data_len;
 		offset_in_stripe = addr % stripe_data_len;
 		slen = stripe_data_len - offset_in_stripe;
+		//test
+		slen=len;
 		if (slen >= len) {
 			slen = len;
 			split_req = req;
