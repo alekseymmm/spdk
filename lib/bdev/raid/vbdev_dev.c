@@ -23,8 +23,8 @@ vbdev_raid_base_bdev_hotremove_cb(void *ctx)
 	 */
 
 	rdx_dev_destroy(dev);
-	spdk_io_device_unregister(raid, NULL);
-	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+//	spdk_io_device_unregister(raid, NULL);
+//	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 
 //	TAILQ_FOREACH_SAFE(pt_node, &g_pt_nodes, link, tmp) {
 //		if (bdev_find == pt_node->base_bdev) {
@@ -164,8 +164,7 @@ void rdx_dev_close(struct rdx_dev *dev)
 	/* Remove bdev from device. Do not delete the rdx_dev structure */
 	if (dev->bdev){
 		spdk_bdev_module_release_bdev(dev->bdev);
-		if (dev->bdev->status == SPDK_BDEV_STATUS_READY)
-			spdk_bdev_close(dev->base_desc);
+		spdk_bdev_close(dev->base_desc);
 	}
 	if (dev->bdev_name)
 		free(dev->bdev_name);

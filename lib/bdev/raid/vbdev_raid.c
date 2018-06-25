@@ -353,7 +353,9 @@ int rdx_raid_register(struct rdx_raid *raid)
 		base_bdevs[i] = raid->devices[i]->bdev;
 	}
 
-	rc = spdk_vbdev_register(&g_raid->raid_bdev, base_bdevs, g_raid->dev_cnt);
+	//This is not working doe to some bug in SPDK. (see github)
+	//rc = spdk_vbdev_register(&g_raid->raid_bdev, base_bdevs, g_raid->dev_cnt);
+	rc = spdk_bdev_register(&g_raid->raid_bdev);
 	if (rc) {
 		SPDK_ERRLOG("Failed to register vbdev raid\n");
 		goto error;
@@ -392,7 +394,14 @@ static int vbdev_raid_destruct(void *ctx)
 	struct rdx_raid *raid = (struct rdx_raid *)ctx;
 
 	rdx_raid_destroy_devices(raid);
+	free(raid->devices);
+	free(raid->name);
+	free(raid);
 
+	//FO not do this stuff here, or add some checks
+		//spdk_io_device_unregister(raid, NULL);
+		//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
+		//spdk_bdev_unregister(&g_raid->raid_bdev, NULL, NULL);
 	// we have to chek if it is already unregistered or scheduled remove:wq
 	//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 	printf("destruct\n");
