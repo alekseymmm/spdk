@@ -210,21 +210,21 @@ static int vbdev_raid_poll(void *arg)
 		next = first->next;
 		req = llist_entry(first, struct rdx_req, thread_lnode);
 
-		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
-
-		spdk_bdev_io_complete(req->bdev_io, 1);
+//		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
+//
+//		spdk_bdev_io_complete(req->bdev_io, 1);
 		processed++;
 		first = next;
-//		sectors_to_split = req->len;
-//		req->split_offset = 0;
-//		while (sectors_to_split) {
-//			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-//			len = rdx_req_split_per_dev(req, 0);
-//			sectors_to_split -= len;
-//		}
+		sectors_to_split = req->len;
+		req->split_offset = 0;
+		while (sectors_to_split) {
+			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+			len = rdx_req_split_per_dev(req, 0);
+			sectors_to_split -= len;
+		}
 
 	}
-	SPDK_NOTICELOG("In raid_io_channel %p processed %d requests\n", ch, processed);
+//	SPDK_NOTICELOG("In raid_io_channel %p processed %d requests\n", ch, processed);
 
 	//spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 
