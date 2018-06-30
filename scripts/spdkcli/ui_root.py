@@ -31,7 +31,7 @@ class UIRoot(UINode):
         # For example logical volumes: listing in menu is "Logical_Volume"
         # (cannot have space), but the product name in SPDK is "Logical Volume"
         bdev_type = bdev_type.replace("_", " ")
-        for bdev in filter(lambda x: bdev_type in x["product_name"],
+        for bdev in filter(lambda x: bdev_type in x["product_name"].lower(),
                            self.current_bdevs):
             test = Bdev(bdev)
             yield test
@@ -51,26 +51,42 @@ class UIRoot(UINode):
 
     def create_malloc_bdev(self, **kwargs):
         response = rpc.bdev.construct_malloc_bdev(self.client, **kwargs)
-        return self.print_array(response)
+        return response
+
+    def delete_malloc_bdev(self, **kwargs):
+        rpc.bdev.delete_malloc_bdev(self.client, **kwargs)
+
+    def create_iscsi_bdev(self, **kwargs):
+        response = rpc.bdev.construct_iscsi_bdev(self.client, **kwargs)
+        return response
+
+    def delete_iscsi_bdev(self, **kwargs):
+        rpc.bdev.delete_iscsi_bdev(self.client, **kwargs)
 
     def create_aio_bdev(self, **kwargs):
         response = rpc.bdev.construct_aio_bdev(self.client, **kwargs)
-        return self.print_array(response)
+        return response
+
+    def delete_aio_bdev(self, **kwargs):
+        rpc.bdev.delete_aio_bdev(self.client, **kwargs)
 
     def create_lvol_bdev(self, **kwargs):
         response = rpc.lvol.construct_lvol_bdev(self.client, **kwargs)
-        return self.print_array(response)
+        return response
 
     def create_nvme_bdev(self, **kwargs):
         response = rpc.bdev.construct_nvme_bdev(self.client, **kwargs)
-        return self.print_array(response)
+        return response
 
     def create_null_bdev(self, **kwargs):
         response = rpc.bdev.construct_null_bdev(self.client, **kwargs)
-        return self.print_array(response)
+        return response
 
     def create_error_bdev(self, **kwargs):
         response = rpc.bdev.construct_error_bdev(self.client, **kwargs)
+
+    def delete_error_bdev(self, **kwargs):
+        rpc.bdev.delete_error_bdev(self.client, **kwargs)
 
     def get_lvol_stores(self):
         self.current_lvol_stores = rpc.lvol.get_lvol_stores(self.client)
@@ -80,12 +96,27 @@ class UIRoot(UINode):
     def create_lvol_store(self, **kwargs):
         response = rpc.lvol.construct_lvol_store(self.client, **kwargs)
         new_lvs = rpc.lvol.get_lvol_stores(self.client,
-                                           self.print_array(response),
+                                           response,
                                            lvs_name=None)
         return new_lvs[0]["name"]
 
     def delete_lvol_store(self, **kwargs):
         rpc.lvol.destroy_lvol_store(self.client, **kwargs)
+
+    def create_pmem_pool(self, **kwargs):
+        response = rpc.pmem.create_pmem_pool(self.client, **kwargs)
+        return response
+
+    def delete_pmem_pool(self, **kwargs):
+        rpc.pmem.delete_pmem_pool(self.client, **kwargs)
+
+    def create_pmem_bdev(self, **kwargs):
+        response = rpc.bdev.construct_pmem_bdev(self.client, **kwargs)
+        return response
+
+    def create_rbd_bdev(self, **kwargs):
+        response = rpc.bdev.construct_rbd_bdev(self.client, **kwargs)
+        return response
 
 
 class Bdev(object):

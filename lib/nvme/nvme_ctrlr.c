@@ -116,15 +116,17 @@ spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts, size_t
 		memset(opts->host_id, 0, sizeof(opts->host_id));
 	}
 
-	if (FIELD_OK(extended_host_id)) {
-		memcpy(opts->extended_host_id, &g_spdk_nvme_driver->default_extended_host_id,
-		       sizeof(opts->extended_host_id));
-	}
+	if (nvme_driver_init() == 0) {
+		if (FIELD_OK(extended_host_id)) {
+			memcpy(opts->extended_host_id, &g_spdk_nvme_driver->default_extended_host_id,
+			       sizeof(opts->extended_host_id));
+		}
 
-	if (FIELD_OK(hostnqn)) {
-		spdk_uuid_fmt_lower(host_id_str, sizeof(host_id_str),
-				    &g_spdk_nvme_driver->default_extended_host_id);
-		snprintf(opts->hostnqn, sizeof(opts->hostnqn), "2014-08.org.nvmexpress:uuid:%s", host_id_str);
+		if (FIELD_OK(hostnqn)) {
+			spdk_uuid_fmt_lower(host_id_str, sizeof(host_id_str),
+					    &g_spdk_nvme_driver->default_extended_host_id);
+			snprintf(opts->hostnqn, sizeof(opts->hostnqn), "2014-08.org.nvmexpress:uuid:%s", host_id_str);
+		}
 	}
 
 	if (FIELD_OK(src_addr)) {
@@ -780,6 +782,23 @@ nvme_ctrlr_identify(struct spdk_nvme_ctrlr *ctrlr)
 		ctrlr->max_xfer_size = spdk_min(ctrlr->max_xfer_size,
 						ctrlr->min_page_size * (1 << (ctrlr->cdata.mdts)));
 		SPDK_DEBUGLOG(SPDK_LOG_NVME, "MDTS max_xfer_size %u\n", ctrlr->max_xfer_size);
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_NVME, "CNTLID 0x%04" PRIx16 "\n", ctrlr->cdata.cntlid);
+	if (ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		ctrlr->cntlid = ctrlr->cdata.cntlid;
+	} else {
+		/*
+		 * Fabrics controllers should already have CNTLID from the Connect command.
+		 *
+		 * If CNTLID from Connect doesn't match CNTLID in the Identify Controller data,
+		 * trust the one from Connect.
+		 */
+		if (ctrlr->cntlid != ctrlr->cdata.cntlid) {
+			SPDK_DEBUGLOG(SPDK_LOG_NVME,
+				      "Identify CNTLID 0x%04" PRIx16 " != Connect CNTLID 0x%04" PRIx16 "\n",
+				      ctrlr->cdata.cntlid, ctrlr->cntlid);
+		}
 	}
 
 	return 0;

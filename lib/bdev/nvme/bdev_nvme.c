@@ -91,6 +91,7 @@ struct nvme_probe_ctx {
 	size_t count;
 	struct spdk_nvme_transport_id trids[NVME_MAX_CONTROLLERS];
 	const char *names[NVME_MAX_CONTROLLERS];
+	const char *hostnqn;
 };
 
 enum timeout_action {
@@ -106,6 +107,7 @@ static int g_nvme_adminq_poll_timeout_us = 0;
 static bool g_nvme_hotplug_enabled = false;
 static int g_nvme_hotplug_poll_timeout_us = 0;
 static struct spdk_poller *g_hotplug_poller;
+static char *g_nvme_hostnqn = NULL;
 static pthread_mutex_t g_bdev_nvme_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static TAILQ_HEAD(, nvme_ctrlr)	g_nvme_ctrlrs = TAILQ_HEAD_INITIALIZER(g_nvme_ctrlrs);
@@ -773,6 +775,7 @@ static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
+	struct nvme_probe_ctx *ctx = cb_ctx;
 
 	SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Probing device %s\n", trid->traddr);
 
@@ -784,7 +787,6 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		bool claim_device = false;
-		struct nvme_probe_ctx *ctx = cb_ctx;
 		size_t i;
 
 		for (i = 0; i < ctx->count; i++) {
@@ -798,6 +800,10 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 			SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Not claiming device at %s\n", trid->traddr);
 			return false;
 		}
+	}
+
+	if (ctx->hostnqn) {
+		snprintf(opts->hostnqn, sizeof(opts->hostnqn), "%s", ctx->hostnqn);
 	}
 
 	return true;
@@ -851,10 +857,108 @@ timeout_cb(void *cb_arg, struct spdk_nvme_ctrlr *ctrlr,
 }
 
 static void
+nvme_ctrlr_deactivate_bdev(struct nvme_bdev *bdev)
+{
+	spdk_bdev_unregister(&bdev->disk, NULL, NULL);
+	bdev->active = false;
+}
+
+static void
+nvme_ctrlr_update_ns_bdevs(struct nvme_ctrlr *nvme_ctrlr)
+{
+	struct spdk_nvme_ctrlr	*ctrlr = nvme_ctrlr->ctrlr;
+	uint32_t		i;
+	struct nvme_bdev	*bdev;
+
+	for (i = 0; i < nvme_ctrlr->num_ns; i++) {
+		uint32_t	nsid = i + 1;
+
+		bdev = &nvme_ctrlr->bdevs[i];
+		if (!bdev->active && spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
+			SPDK_NOTICELOG("NSID %u to be added\n", nsid);
+			nvme_ctrlr_create_bdev(nvme_ctrlr, nsid);
+		}
+
+		if (bdev->active && !spdk_nvme_ctrlr_is_active_ns(ctrlr, nsid)) {
+			SPDK_NOTICELOG("NSID %u Bdev %s is removed\n", nsid, bdev->disk.name);
+			nvme_ctrlr_deactivate_bdev(bdev);
+		}
+	}
+
+}
+
+static void
+aer_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_ctrlr *nvme_ctrlr		= arg;
+	union spdk_nvme_async_event_completion	event;
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		SPDK_WARNLOG("AER request execute failed");
+		return;
+	}
+
+	event.raw = cpl->cdw0;
+	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
+	    (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED)) {
+		nvme_ctrlr_update_ns_bdevs(nvme_ctrlr);
+	}
+}
+
+static int
+create_ctrlr(struct spdk_nvme_ctrlr *ctrlr,
+	     const char *name,
+	     const struct spdk_nvme_transport_id *trid)
+{
+	struct nvme_ctrlr *nvme_ctrlr;
+
+	nvme_ctrlr = calloc(1, sizeof(*nvme_ctrlr));
+	if (nvme_ctrlr == NULL) {
+		SPDK_ERRLOG("Failed to allocate device struct\n");
+		return -ENOMEM;
+	}
+	nvme_ctrlr->num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
+	nvme_ctrlr->bdevs = calloc(nvme_ctrlr->num_ns, sizeof(struct nvme_bdev));
+	if (!nvme_ctrlr->bdevs) {
+		SPDK_ERRLOG("Failed to allocate block devices struct\n");
+		free(nvme_ctrlr);
+		return -ENOMEM;
+	}
+
+	nvme_ctrlr->adminq_timer_poller = NULL;
+	nvme_ctrlr->ctrlr = ctrlr;
+	nvme_ctrlr->ref = 0;
+	nvme_ctrlr->trid = *trid;
+	nvme_ctrlr->name = strdup(name);
+
+	spdk_io_device_register(ctrlr, bdev_nvme_create_cb, bdev_nvme_destroy_cb,
+				sizeof(struct nvme_io_channel));
+
+	if (nvme_ctrlr_create_bdevs(nvme_ctrlr) != 0) {
+		spdk_io_device_unregister(ctrlr, NULL);
+		free(nvme_ctrlr);
+		return -1;
+	}
+
+	nvme_ctrlr->adminq_timer_poller = spdk_poller_register(bdev_nvme_poll_adminq, ctrlr,
+					  g_nvme_adminq_poll_timeout_us);
+
+	TAILQ_INSERT_TAIL(&g_nvme_ctrlrs, nvme_ctrlr, tailq);
+
+	if (g_action_on_timeout != TIMEOUT_ACTION_NONE) {
+		spdk_nvme_ctrlr_register_timeout_callback(ctrlr, g_timeout,
+				timeout_cb, NULL);
+	}
+
+	spdk_nvme_ctrlr_register_aer_callback(ctrlr, aer_cb, nvme_ctrlr);
+
+	return 0;
+}
+
+static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct nvme_ctrlr *nvme_ctrlr;
 	struct nvme_probe_ctx *ctx = cb_ctx;
 	char *name = NULL;
 	size_t i;
@@ -876,46 +980,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	SPDK_DEBUGLOG(SPDK_LOG_BDEV_NVME, "Attached to %s (%s)\n", trid->traddr, name);
 
-	nvme_ctrlr = calloc(1, sizeof(*nvme_ctrlr));
-	if (nvme_ctrlr == NULL) {
-		SPDK_ERRLOG("Failed to allocate device struct\n");
-		free((void *)name);
-		return;
-	}
-	nvme_ctrlr->num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
-	nvme_ctrlr->bdevs = calloc(nvme_ctrlr->num_ns, sizeof(struct nvme_bdev));
-	if (!nvme_ctrlr->bdevs) {
-		SPDK_ERRLOG("Failed to allocate block devices struct\n");
-		free(nvme_ctrlr);
-		free((void *)name);
-		return;
-	}
+	create_ctrlr(ctrlr, name, trid);
 
-	nvme_ctrlr->adminq_timer_poller = NULL;
-	nvme_ctrlr->ctrlr = ctrlr;
-	nvme_ctrlr->ref = 0;
-	nvme_ctrlr->trid = *trid;
-	nvme_ctrlr->name = name;
-
-	spdk_io_device_register(ctrlr, bdev_nvme_create_cb, bdev_nvme_destroy_cb,
-				sizeof(struct nvme_io_channel));
-
-	if (nvme_ctrlr_create_bdevs(nvme_ctrlr) != 0) {
-		spdk_io_device_unregister(ctrlr, NULL);
-		free(nvme_ctrlr->name);
-		free(nvme_ctrlr);
-		return;
-	}
-
-	nvme_ctrlr->adminq_timer_poller = spdk_poller_register(bdev_nvme_poll_adminq, ctrlr,
-					  g_nvme_adminq_poll_timeout_us);
-
-	TAILQ_INSERT_TAIL(&g_nvme_ctrlrs, nvme_ctrlr, tailq);
-
-	if (g_action_on_timeout != TIMEOUT_ACTION_NONE) {
-		spdk_nvme_ctrlr_register_timeout_callback(ctrlr, g_timeout,
-				timeout_cb, NULL);
-	}
+	free(name);
 }
 
 static void
@@ -957,7 +1024,8 @@ bdev_nvme_hotplug(void *arg)
 int
 spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 		      const char *base_name,
-		      const char **names, size_t *count)
+		      const char **names, size_t *count,
+		      const char *hostnqn)
 {
 	struct nvme_probe_ctx	*probe_ctx;
 	struct nvme_ctrlr	*nvme_ctrlr;
@@ -979,6 +1047,7 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 	probe_ctx->count = 1;
 	probe_ctx->trids[0] = *trid;
 	probe_ctx->names[0] = base_name;
+	probe_ctx->hostnqn = hostnqn;
 	if (spdk_nvme_probe(trid, probe_ctx, probe_cb, attach_cb, NULL)) {
 		SPDK_ERRLOG("Failed to probe for new devices\n");
 		free(probe_ctx);
@@ -1101,6 +1170,11 @@ bdev_nvme_library_init(void)
 		g_nvme_hotplug_poll_timeout_us = 100000;
 	}
 
+	g_nvme_hostnqn = spdk_conf_section_get_val(sp, "HostNQN");
+	if (g_nvme_hostnqn) {
+		probe_ctx->hostnqn = g_nvme_hostnqn;
+	}
+
 	for (i = 0; i < NVME_MAX_CONTROLLERS; i++) {
 		val = spdk_conf_section_get_nmval(sp, "TransportID", i, 0);
 		if (val == NULL) {
@@ -1125,14 +1199,38 @@ bdev_nvme_library_init(void)
 		probe_ctx->count++;
 
 		if (probe_ctx->trids[i].trtype != SPDK_NVME_TRANSPORT_PCIE) {
+			struct spdk_nvme_ctrlr *ctrlr;
+			struct spdk_nvme_ctrlr_opts opts;
+
+			if (nvme_ctrlr_get(&probe_ctx->trids[i])) {
+				SPDK_ERRLOG("A controller with the provided trid (traddr: %s) already exists.\n",
+					    probe_ctx->trids[i].traddr);
+				rc = -1;
+				goto end;
+			}
+
 			if (probe_ctx->trids[i].subnqn[0] == '\0') {
 				SPDK_ERRLOG("Need to provide subsystem nqn\n");
 				rc = -1;
 				goto end;
 			}
 
-			if (spdk_nvme_probe(&probe_ctx->trids[i], probe_ctx, probe_cb, attach_cb, NULL)) {
+			spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
+
+			if (probe_ctx->hostnqn != NULL) {
+				snprintf(opts.hostnqn, sizeof(opts.hostnqn), "%s", probe_ctx->hostnqn);
+			}
+
+			ctrlr = spdk_nvme_connect(&probe_ctx->trids[i], &opts, sizeof(opts));
+			if (ctrlr == NULL) {
+				SPDK_ERRLOG("Unable to connect to provided trid (traddr: %s)\n",
+					    probe_ctx->trids[i].traddr);
 				rc = -1;
+				goto end;
+			}
+
+			rc = create_ctrlr(ctrlr, probe_ctx->names[i], &probe_ctx->trids[i]);
+			if (!rc) {
 				goto end;
 			}
 		} else {
@@ -1501,6 +1599,9 @@ bdev_nvme_get_spdk_running_config(FILE *fp)
 		"# Set how often the hotplug is processed for insert and remove events."
 		"# Units in microseconds.\n");
 	fprintf(fp, "HotplugPollRate %d\n", g_nvme_hotplug_poll_timeout_us);
+	if (g_nvme_hostnqn) {
+		fprintf(fp, "HostNQN %s\n",  g_nvme_hostnqn);
+	}
 
 	fprintf(fp, "\n");
 }

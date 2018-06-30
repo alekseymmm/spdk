@@ -6,6 +6,10 @@ fi
 
 set -e
 
+# Export flag to skip the known bug that exists in librados
+# Bug is reported on ceph bug tracker with number 24078
+export ASAN_OPTIONS=new_delete_type_mismatch=0
+
 PS4=' \t	\$ '
 ulimit -c unlimited
 
@@ -61,8 +65,12 @@ config_params='--enable-debug --enable-werror'
 
 export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
 
-# Override the default HUGEMEM in scripts/setup.sh
-export HUGEMEM=8192
+# On Linux systems, override the default HUGEMEM in scripts/setup.sh to
+#  allocate 8GB in hugepages.
+# FreeBSD runs a much more limited set of tests, so keep the default 2GB.
+if [ `uname -s` = "Linux" ]; then
+	export HUGEMEM=8192
+fi
 
 DEFAULT_RPC_ADDR=/var/tmp/spdk.sock
 
@@ -363,9 +371,8 @@ function rbd_cleanup() {
 
 function start_stub() {
 	# Disable ASLR for multi-process testing.  SPDK does support using DPDK multi-process,
-	# but ASAN instrumentation will result in mmap hints in our specified virt address
-	# region getting ignored.   We will reenable it again after multi-process testing
-	# is complete in kill_stub()
+	# but ASLR can still be unreliable in some cases.
+	# We will reenable it again after multi-process testing is complete in kill_stub()
 	echo 0 > /proc/sys/kernel/randomize_va_space
 	$rootdir/test/app/stub/stub $1 &
 	stubpid=$!

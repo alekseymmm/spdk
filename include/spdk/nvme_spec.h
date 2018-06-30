@@ -562,7 +562,8 @@ enum spdk_nvme_status_code_type {
 	SPDK_NVME_SCT_GENERIC		= 0x0,
 	SPDK_NVME_SCT_COMMAND_SPECIFIC	= 0x1,
 	SPDK_NVME_SCT_MEDIA_ERROR	= 0x2,
-	/* 0x3-0x6 - reserved */
+	SPDK_NVME_SCT_PATH		= 0x3,
+	/* 0x4-0x6 - reserved */
 	SPDK_NVME_SCT_VENDOR_SPECIFIC	= 0x7,
 };
 
@@ -667,6 +668,18 @@ enum spdk_nvme_media_error_status_code {
 	SPDK_NVME_SC_COMPARE_FAILURE			= 0x85,
 	SPDK_NVME_SC_ACCESS_DENIED			= 0x86,
 	SPDK_NVME_SC_DEALLOCATED_OR_UNWRITTEN_BLOCK     = 0x87,
+};
+
+/**
+ * Path related status codes
+ */
+enum spdk_nvme_path_status_code {
+	SPDK_NVME_SC_INTERNAL_PATH_ERROR		= 0x00,
+
+	SPDK_NVME_SC_CONTROLLER_PATH_ERROR		= 0x60,
+
+	SPDK_NVME_SC_HOST_PATH_ERROR			= 0x70,
+	SPDK_NVME_SC_ABORTED_BY_HOST			= 0x71,
 };
 
 /**
@@ -904,6 +917,20 @@ enum spdk_nvme_sgls_supported {
 
 	/** SGLs are supported with a DWORD alignment and granularity requirement. */
 	SPDK_NVME_SGLS_SUPPORTED_DWORD_ALIGNED		= 2,
+};
+
+/** Identify Controller data vwc.flush_broadcast values */
+enum spdk_nvme_flush_broadcast {
+	/** Support for NSID=FFFFFFFFh with Flush is not indicated. */
+	SPDK_NVME_FLUSH_BROADCAST_NOT_INDICATED		= 0,
+
+	/* 01b: Reserved */
+
+	/** Flush does not support NSID set to FFFFFFFFh. */
+	SPDK_NVME_FLUSH_BROADCAST_NOT_SUPPORTED		= 2,
+
+	/** Flush supports NSID set to FFFFFFFFh. */
+	SPDK_NVME_FLUSH_BROADCAST_SUPPORTED		= 3
 };
 
 struct __attribute__((packed)) spdk_nvme_ctrlr_data {
@@ -1210,7 +1237,8 @@ struct __attribute__((packed)) spdk_nvme_ctrlr_data {
 	/** volatile write cache */
 	struct {
 		uint8_t		present : 1;
-		uint8_t		reserved : 7;
+		uint8_t		flush_broadcast : 2;
+		uint8_t		reserved : 5;
 	} vwc;
 
 	/** atomic write unit normal */
@@ -1728,7 +1756,11 @@ struct spdk_nvme_error_information_entry {
 	uint64_t		lba;
 	uint32_t		nsid;
 	uint8_t			vendor_specific;
-	uint8_t			reserved[35];
+	uint8_t			trtype;
+	uint8_t			reserved30[2];
+	uint64_t		command_specific;
+	uint16_t		trtype_specific;
+	uint8_t			reserved42[22];
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_error_information_entry) == 64, "Incorrect size");
 

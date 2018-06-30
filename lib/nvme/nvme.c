@@ -283,7 +283,7 @@ nvme_robust_mutex_init_shared(pthread_mutex_t *mtx)
 	return rc;
 }
 
-static int
+int
 nvme_driver_init(void)
 {
 	int ret = 0;
@@ -302,8 +302,6 @@ nvme_driver_init(void)
 	if (spdk_process_is_primary()) {
 		/* The unique named memzone already reserved. */
 		if (g_spdk_nvme_driver != NULL) {
-			assert(g_spdk_nvme_driver->initialized == true);
-
 			return 0;
 		} else {
 			g_spdk_nvme_driver = spdk_memzone_reserve(SPDK_NVME_DRIVER_NAME,
@@ -647,6 +645,8 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 		*trtype = SPDK_NVME_TRANSPORT_PCIE;
 	} else if (strcasecmp(str, "RDMA") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_RDMA;
+	} else if (strcasecmp(str, "FC") == 0) {
+		*trtype = SPDK_NVME_TRANSPORT_FC;
 	} else {
 		return -ENOENT;
 	}
@@ -661,6 +661,8 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
 		return "PCIe";
 	case SPDK_NVME_TRANSPORT_RDMA:
 		return "RDMA";
+	case SPDK_NVME_TRANSPORT_FC:
+		return "FC";
 	default:
 		return NULL;
 	}

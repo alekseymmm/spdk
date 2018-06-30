@@ -115,6 +115,9 @@ struct spdk_nvmf_poll_group {
 	/* Array of poll groups indexed by subsystem id (sid) */
 	struct spdk_nvmf_subsystem_poll_group		*sgroups;
 	uint32_t					num_sgroups;
+
+	/* All of the queue pairs that belong to this poll group */
+	TAILQ_HEAD(, spdk_nvmf_qpair)			qpairs;
 };
 
 typedef enum _spdk_nvmf_request_exec_status {
@@ -205,8 +208,9 @@ struct spdk_nvmf_ctrlr {
 
 	struct spdk_nvmf_qpair *admin_qpair;
 
-	TAILQ_HEAD(, spdk_nvmf_qpair) qpairs;
-	struct spdk_bit_array *qpair_mask;
+	/* Mutex to protect the qpair mask */
+	pthread_mutex_t		mtx;
+	struct spdk_bit_array	*qpair_mask;
 
 	struct spdk_nvmf_request *aer_req;
 	union spdk_nvme_async_event_completion notice_event;
@@ -269,7 +273,6 @@ void spdk_nvmf_get_discovery_log_page(struct spdk_nvmf_tgt *tgt,
 				      void *buffer, uint64_t offset,
 				      uint32_t length);
 
-struct spdk_nvmf_qpair *spdk_nvmf_ctrlr_get_qpair(struct spdk_nvmf_ctrlr *ctrlr, uint16_t qid);
 void spdk_nvmf_ctrlr_destruct(struct spdk_nvmf_ctrlr *ctrlr);
 int spdk_nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req);
 int spdk_nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req);

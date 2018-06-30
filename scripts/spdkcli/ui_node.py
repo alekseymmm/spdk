@@ -55,6 +55,9 @@ class UIBdevs(UINode):
         UINullBdev(self)
         UIErrorBdev(self)
         UISplitBdev(self)
+        UIPmemBdev(self)
+        UIRbdBdev(self)
+        UIiSCSIBdev(self)
 
     def ui_command_delete(self, name):
         """
@@ -177,7 +180,7 @@ class UIBdev(UINode):
 
 class UIMallocBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "Malloc", parent)
+        UIBdev.__init__(self, "malloc", parent)
 
     def ui_command_create(self, size, block_size, name=None, uuid=None):
         """
@@ -202,10 +205,21 @@ class UIMallocBdev(UIBdev):
         self.get_root().refresh()
         self.refresh()
 
+    def ui_command_delete(self, name):
+        """
+        Deletes malloc bdev from configuration.
+
+        Arguments:
+        name - Is a unique identifier of the malloc bdev to be deleted - UUID number or name alias.
+        """
+        self.get_root().delete_malloc_bdev(name=name)
+        self.get_root().refresh()
+        self.refresh()
+
 
 class UIAIOBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "AIO", parent)
+        UIBdev.__init__(self, "aio", parent)
 
     def ui_command_create(self, name, filename, block_size):
         """
@@ -231,7 +245,7 @@ class UIAIOBdev(UIBdev):
 
 class UILvolBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "Logical_Volume", parent)
+        UIBdev.__init__(self, "logical_volume", parent)
 
     def ui_command_create(self, name, size, lvs, thin_provision=None):
         """
@@ -267,7 +281,7 @@ class UILvolBdev(UIBdev):
 
 class UINvmeBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "NVMe", parent)
+        UIBdev.__init__(self, "nvme", parent)
 
     def ui_command_create(self, name, trtype, traddr,
                           adrfam=None, trsvcid=None, subnqn=None):
@@ -286,7 +300,7 @@ class UINvmeBdev(UIBdev):
 
 class UINullBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "Null", parent)
+        UIBdev.__init__(self, "null", parent)
 
     def ui_command_create(self, name, size, block_size, uuid=None):
         """
@@ -314,7 +328,7 @@ class UINullBdev(UIBdev):
 
 class UIErrorBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "Error", parent)
+        UIBdev.__init__(self, "error", parent)
 
     def ui_command_create(self, base_name):
         """
@@ -331,7 +345,85 @@ class UIErrorBdev(UIBdev):
 
 class UISplitBdev(UIBdev):
     def __init__(self, parent):
-        UIBdev.__init__(self, "Split_Disk", parent)
+        UIBdev.__init__(self, "split_disk", parent)
+
+
+class UIPmemBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "pmemblk", parent)
+
+    def ui_command_create_pmem_pool(self, pmem_file, total_size, block_size):
+        total_size = self.ui_eval_param(total_size, "number", None)
+        block_size = self.ui_eval_param(block_size, "number", None)
+        num_blocks = int((total_size * 1024 * 1024) / block_size)
+
+        self.get_root().create_pmem_pool(pmem_file=pmem_file,
+                                         num_blocks=num_blocks,
+                                         block_size=block_size)
+
+    def ui_command_delete_pmem_pool(self, pmem_file):
+        self.get_root().delete_pmem_pool(pmem_file=pmem_file)
+
+    def ui_command_info_pmem_pool(self, pmem_file):
+        ret = self.get_root().delete_pmem_pool(pmem_file=pmem_file)
+        self.shell.log.info(ret)
+
+    def ui_command_create(self, pmem_file, name):
+        ret_name = self.get_root().create_pmem_bdev(pmem_file=pmem_file,
+                                                    name=name)
+        self.shell.log.info(ret_name)
+        self.get_root().refresh()
+        self.refresh()
+
+
+class UIRbdBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "rbd", parent)
+
+    def ui_command_create(self, pool_name, rbd_name, block_size, name=None):
+        block_size = self.ui_eval_param(block_size, "number", None)
+
+        ret_name = self.get_root().create_rbd_bdev(pool_name=pool_name,
+                                                   rbd_name=rbd_name,
+                                                   block_size=block_size,
+                                                   name=name)
+        self.shell.log.info(ret_name)
+        self.get_root().refresh()
+        self.refresh()
+
+
+class UIiSCSIBdev(UIBdev):
+    def __init__(self, parent):
+        UIBdev.__init__(self, "iscsi", parent)
+
+    def ui_command_create(self, name, url, initiator_iqn):
+        """
+        Create iSCSI bdev in configuration by connecting to remote
+        iSCSI target.
+
+        Arguments:
+        name - name to be used as an ID for created iSCSI bdev.
+        url - iscsi url pointing to LUN on remote iSCSI target.
+              Example: iscsi://127.0.0.1:3260/iqn.2018-06.org.spdk/0.
+        initiator_iqn - IQN to use for initiating connection with the target.
+        """
+        ret_name = self.get_root().create_iscsi_bdev(name=name,
+                                                     url=url,
+                                                     initiator_iqn=initiator_iqn)
+        self.shell.log.info(ret_name)
+        self.get_root().refresh()
+        self.refresh()
+
+    def ui_command_delete(self, name):
+        """
+        Deletes iSCSI bdev from configuration.
+
+        Arguments:
+        name - name of the iscsi bdev to be deleted.
+        """
+        self.get_root().delete_iscsi_bdev(name=name)
+        self.get_root().refresh()
+        self.refresh()
 
 
 class UIBdevObj(UINode):

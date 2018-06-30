@@ -76,12 +76,24 @@ if __name__ == "__main__":
     p.set_defaults(func=load_config)
 
     @call_cmd
+    def save_subsystem_config(args):
+        rpc.save_subsystem_config(args.client, args)
+
+    p = subparsers.add_parser('save_subsystem_config', help="""Write current (live) configuration of SPDK subsystem.
+    If no filename is given write configuration to stdout.""")
+    p.add_argument('-f', '--filename', help='File where to save JSON configuration to.')
+    p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. If filename is not given default
+    indent level is 2. If writing to file of filename is '-' then default is compact mode.""", type=int, default=2)
+    p.add_argument('-n', '--name', help='Name of subsystem', required=True)
+    p.set_defaults(func=save_subsystem_config)
+
+    @call_cmd
     def load_subsystem_config(args):
         rpc.load_subsystem_config(args.client, args)
 
     p = subparsers.add_parser('load_subsystem_config', help="""Configure SPDK subsystem using JSON RPC. If no file is
     provided or file is '-' read configuration from stdin.""")
-    p.add_argument('--filename', help="""JSON Configuration file.""")
+    p.add_argument('-f', '--filename', help="""JSON Configuration file.""")
     p.set_defaults(func=load_subsystem_config)
 
     # app
@@ -124,11 +136,11 @@ if __name__ == "__main__":
     @call_cmd
     def construct_malloc_bdev(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
-        print_array(rpc.bdev.construct_malloc_bdev(args.client,
-                                                   num_blocks=num_blocks,
-                                                   block_size=args.block_size,
-                                                   name=args.name,
-                                                   uuid=args.uuid))
+        print(rpc.bdev.construct_malloc_bdev(args.client,
+                                             num_blocks=num_blocks,
+                                             block_size=args.block_size,
+                                             name=args.name,
+                                             uuid=args.uuid))
 
     p = subparsers.add_parser('construct_malloc_bdev',
                               help='Add a bdev with malloc backend')
@@ -140,13 +152,22 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_malloc_bdev)
 
     @call_cmd
+    def delete_malloc_bdev(args):
+        rpc.bdev.delete_malloc_bdev(args.client,
+                                    name=args.name)
+
+    p = subparsers.add_parser('delete_malloc_bdev', help='Delete a malloc disk')
+    p.add_argument('name', help='malloc bdev name')
+    p.set_defaults(func=delete_malloc_bdev)
+
+    @call_cmd
     def construct_null_bdev(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
-        print_array(rpc.bdev.construct_null_bdev(args.client,
-                                                 num_blocks=num_blocks,
-                                                 block_size=args.block_size,
-                                                 name=args.name,
-                                                 uuid=args.uuid))
+        print(rpc.bdev.construct_null_bdev(args.client,
+                                           num_blocks=num_blocks,
+                                           block_size=args.block_size,
+                                           name=args.name,
+                                           uuid=args.uuid))
 
     p = subparsers.add_parser('construct_null_bdev',
                               help='Add a bdev with null backend')
@@ -159,10 +180,10 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_aio_bdev(args):
-        print_array(rpc.bdev.construct_aio_bdev(args.client,
-                                                filename=args.filename,
-                                                name=args.name,
-                                                block_size=args.block_size))
+        print(rpc.bdev.construct_aio_bdev(args.client,
+                                          filename=args.filename,
+                                          name=args.name,
+                                          block_size=args.block_size))
 
     p = subparsers.add_parser('construct_aio_bdev',
                               help='Add a bdev with aio backend')
@@ -170,6 +191,15 @@ if __name__ == "__main__":
     p.add_argument('name', help='Block device name')
     p.add_argument('block_size', help='Block size for this bdev', type=int, nargs='?', default=0)
     p.set_defaults(func=construct_aio_bdev)
+
+    @call_cmd
+    def delete_aio_bdev(args):
+        rpc.bdev.delete_aio_bdev(args.client,
+                                 name=args.name)
+
+    p = subparsers.add_parser('delete_aio_bdev', help='Delete an aio disk')
+    p.add_argument('name', help='aio bdev name')
+    p.set_defaults(func=delete_aio_bdev)
 
     @call_cmd
     def construct_nvme_bdev(args):
@@ -197,11 +227,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_rbd_bdev(args):
-        print_array(rpc.bdev.construct_rbd_bdev(args.client,
-                                                name=args.name,
-                                                pool_name=args.pool_name,
-                                                rbd_name=args.rbd_name,
-                                                block_size=args.block_size))
+        print(rpc.bdev.construct_rbd_bdev(args.client,
+                                          name=args.name,
+                                          pool_name=args.pool_name,
+                                          rbd_name=args.rbd_name,
+                                          block_size=args.block_size))
 
     p = subparsers.add_parser('construct_rbd_bdev',
                               help='Add a bdev with ceph rbd backend')
@@ -213,8 +243,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_error_bdev(args):
-        rpc.bdev.construct_error_bdev(args.client,
-                                      base_name=args.base_name)
+        print(rpc.bdev.construct_error_bdev(args.client,
+                                            base_name=args.base_name))
 
     p = subparsers.add_parser('construct_error_bdev',
                               help='Add bdev with error injection backend')
@@ -222,11 +252,20 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_error_bdev)
 
     @call_cmd
+    def delete_error_bdev(args):
+        rpc.bdev.delete_error_bdev(args.client,
+                                   name=args.name)
+
+    p = subparsers.add_parser('delete_error_bdev', help='Delete an error bdev')
+    p.add_argument('name', help='error bdev name')
+    p.set_defaults(func=delete_error_bdev)
+
+    @call_cmd
     def construct_iscsi_bdev(args):
-        rpc.bdev.construct_iscsi_bdev(args.client,
-                                      name=args.name,
-                                      url=args.url,
-                                      initiator_iqn=args.initiator_iqn)
+        print(rpc.bdev.construct_iscsi_bdev(args.client,
+                                            name=args.name,
+                                            url=args.url,
+                                            initiator_iqn=args.initiator_iqn))
 
     p = subparsers.add_parser('construct_iscsi_bdev',
                               help='Add bdev with iSCSI initiator backend')
@@ -236,10 +275,19 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_iscsi_bdev)
 
     @call_cmd
+    def delete_iscsi_bdev(args):
+        rpc.bdev.delete_iscsi_bdev(args.client,
+                                   name=args.name)
+
+    p = subparsers.add_parser('delete_iscsi_bdev', help='Delete an iSCSI bdev')
+    p.add_argument('name', help='iSCSI bdev name')
+    p.set_defaults(func=delete_iscsi_bdev)
+
+    @call_cmd
     def construct_pmem_bdev(args):
-        print_array(rpc.bdev.construct_pmem_bdev(args.client,
-                                                 pmem_file=args.pmem_file,
-                                                 name=args.name))
+        print(rpc.bdev.construct_pmem_bdev(args.client,
+                                           pmem_file=args.pmem_file,
+                                           name=args.name))
 
     p = subparsers.add_parser('construct_pmem_bdev', help='Add a bdev with pmem backend')
     p.add_argument('pmem_file', help='Path to pmemblk pool file')
@@ -248,9 +296,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_passthru_bdev(args):
-        print_array(rpc.bdev.construct_passthru_bdev(args.client,
-                                                     base_bdev_name=args.base_bdev_name,
-                                                     passthru_bdev_name=args.passthru_bdev_name))
+        print(rpc.bdev.construct_passthru_bdev(args.client,
+                                               base_bdev_name=args.base_bdev_name,
+                                               passthru_bdev_name=args.passthru_bdev_name))
 
     p = subparsers.add_parser('construct_passthru_bdev',
                               help='Add a pass through bdev on existing bdev')
@@ -352,7 +400,24 @@ if __name__ == "__main__":
 
     # iSCSI
     def set_iscsi_options(args):
-        rpc.iscsi.set_iscsi_options(args.client, args)
+        rpc.iscsi.set_iscsi_options(
+            args.client,
+            auth_file=args.auth_file,
+            node_base=args.node_base,
+            nop_timeout=args.nop_timeout,
+            nop_in_interval=args.nop_in_interval,
+            no_discovery_auth=args.no_discovery_auth,
+            req_discovery_auth=args.req_discovery_auth,
+            req_discovery_auth_mutual=args.req_discovery_auth_mutual,
+            discovery_auth_group=args.discovery_auth_group,
+            max_sessions=args.max_sessions,
+            max_connections_per_session=args.max_connections_per_session,
+            default_time2wait=args.default_time2wait,
+            default_time2retain=args.default_time2retain,
+            immediate_data=args.immediate_data,
+            error_recovery_level=args.error_recovery_level,
+            allow_duplicated_isid=args.allow_duplicated_isid,
+            min_connections_per_session=args.min_connections_per_session)
 
     p = subparsers.add_parser('set_iscsi_options', help="""Set options of iSCSI subsystem""")
     p.add_argument('-f', '--auth-file', help='Path to CHAP shared secret file for discovery session')
@@ -378,7 +443,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_portal_groups(args):
-        print_dict(rpc.iscsi.get_portal_groups(args.client, args))
+        print_dict(rpc.iscsi.get_portal_groups(args.client))
 
     p = subparsers.add_parser(
         'get_portal_groups', help='Display current portal group configuration')
@@ -386,7 +451,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_initiator_groups(args):
-        print_dict(rpc.iscsi.get_initiator_groups(args.client, args))
+        print_dict(rpc.iscsi.get_initiator_groups(args.client))
 
     p = subparsers.add_parser('get_initiator_groups',
                               help='Display current initiator group configuration')
@@ -394,14 +459,36 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_target_nodes(args):
-        print_dict(rpc.iscsi.get_target_nodes(args.client, args))
+        print_dict(rpc.iscsi.get_target_nodes(args.client))
 
     p = subparsers.add_parser('get_target_nodes', help='Display target nodes')
     p.set_defaults(func=get_target_nodes)
 
     @call_cmd
     def construct_target_node(args):
-        rpc.iscsi.construct_target_node(args.client, args)
+        luns = []
+        for u in args.bdev_name_id_pairs.strip().split(" "):
+            bdev_name, lun_id = u.split(":")
+            luns.append({"bdev_name": bdev_name, "lun_id": int(lun_id)})
+
+        pg_ig_maps = []
+        for u in args.pg_ig_mappings.strip().split(" "):
+            pg, ig = u.split(":")
+            pg_ig_maps.append({"pg_tag": int(pg), "ig_tag": int(ig)})
+
+        rpc.iscsi.construct_target_node(
+            args.client,
+            luns=luns,
+            pg_ig_maps=pg_ig_maps,
+            name=args.name,
+            alias_name=args.alias_name,
+            queue_depth=args.queue_depth,
+            chap_group=args.chap_group,
+            disable_chap=args.disable_chap,
+            require_chap=args.require_chap,
+            mutual_chap=args.mutual_chap,
+            header_digest=args.header_digest,
+            data_digest=args.data_digest)
 
     p = subparsers.add_parser('construct_target_node',
                               help='Add a target node')
@@ -435,7 +522,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def target_node_add_lun(args):
-        rpc.iscsi.target_node_add_lun(args.client, args)
+        rpc.iscsi.target_node_add_lun(
+            args.client,
+            name=args.name,
+            bdev_name=args.bdev_name,
+            lun_id=args.lun_id)
 
     p = subparsers.add_parser('target_node_add_lun', help='Add LUN to the target node')
     p.add_argument('name', help='Target node name (ASCII)')
@@ -447,7 +538,14 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_pg_ig_maps(args):
-        rpc.iscsi.add_pg_ig_maps(args.client, args)
+        pg_ig_maps = []
+        for u in args.pg_ig_mappings.strip().split(" "):
+            pg, ig = u.split(":")
+            pg_ig_maps.append({"pg_tag": int(pg), "ig_tag": int(ig)})
+        rpc.iscsi.add_pg_ig_maps(
+            args.client,
+            pg_ig_maps=pg_ig_maps,
+            name=args.name)
 
     p = subparsers.add_parser('add_pg_ig_maps', help='Add PG-IG maps to the target node')
     p.add_argument('name', help='Target node name (ASCII)')
@@ -460,7 +558,12 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_pg_ig_maps(args):
-        rpc.iscsi.delete_pg_ig_maps(args.client, args)
+        pg_ig_maps = []
+        for u in args.pg_ig_mappings.strip().split(" "):
+            pg, ig = u.split(":")
+            pg_ig_maps.append({"pg_tag": int(pg), "ig_tag": int(ig)})
+        rpc.iscsi.delete_pg_ig_maps(
+            args.client, pg_ig_maps=pg_ig_maps, name=args.name)
 
     p = subparsers.add_parser('delete_pg_ig_maps', help='Delete PG-IG maps from the target node')
     p.add_argument('name', help='Target node name (ASCII)')
@@ -473,7 +576,21 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_portal_group(args):
-        rpc.iscsi.add_portal_group(args.client, args)
+        portals = []
+        for p in args.portal_list:
+            ip, separator, port_cpumask = p.rpartition(':')
+            split_port_cpumask = port_cpumask.split('@')
+            if len(split_port_cpumask) == 1:
+                port = port_cpumask
+                portals.append({'host': ip, 'port': port})
+            else:
+                port = split_port_cpumask[0]
+                cpumask = split_port_cpumask[1]
+                portals.append({'host': ip, 'port': port, 'cpumask': cpumask})
+        rpc.iscsi.add_portal_group(
+            args.client,
+            portals=portals,
+            tag=args.tag)
 
     p = subparsers.add_parser('add_portal_group', help='Add a portal group')
     p.add_argument(
@@ -485,7 +602,17 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_initiator_group(args):
-        rpc.iscsi.add_initiator_group(args.client, args)
+        initiators = []
+        netmasks = []
+        for i in args.initiator_list.strip().split(' '):
+            initiators.append(i)
+        for n in args.netmask_list.strip().split(' '):
+            netmasks.append(n)
+        rpc.iscsi.add_initiator_group(
+            args.client,
+            tag=args.tag,
+            initiators=initiators,
+            netmasks=netmasks)
 
     p = subparsers.add_parser('add_initiator_group',
                               help='Add an initiator group')
@@ -499,7 +626,21 @@ if __name__ == "__main__":
 
     @call_cmd
     def add_initiators_to_initiator_group(args):
-        rpc.iscsi.add_initiators_to_initiator_group(args.client, args)
+        initiators = None
+        netmasks = None
+        if args.initiator_list:
+            initiators = []
+            for i in args.initiator_list.strip().split(' '):
+                initiators.append(i)
+        if args.netmask_list:
+            netmasks = []
+            for n in args.netmask_list.strip().split(' '):
+                netmasks.append(n)
+        rpc.iscsi.add_initiators_to_initiator_group(
+            args.client,
+            tag=args.tag,
+            initiators=initiators,
+            netmasks=netmasks)
 
     p = subparsers.add_parser('add_initiators_to_initiator_group',
                               help='Add initiators to an existing initiator group')
@@ -513,7 +654,21 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_initiators_from_initiator_group(args):
-        rpc.iscsi.delete_initiators_from_initiator_group(args.client, args)
+        initiators = None
+        netmasks = None
+        if args.initiator_list:
+            initiators = []
+            for i in args.initiator_list.strip().split(' '):
+                initiators.append(i)
+        if args.netmask_list:
+            netmasks = []
+            for n in args.netmask_list.strip().split(' '):
+                netmasks.append(n)
+        rpc.iscsi.delete_initiators_from_initiator_group(
+            args.client,
+            tag=args.tag,
+            initiators=initiators,
+            netmasks=netmasks)
 
     p = subparsers.add_parser('delete_initiators_from_initiator_group',
                               help='Delete initiators from an existing initiator group')
@@ -527,7 +682,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_target_node(args):
-        rpc.iscsi.delete_target_node(args.client, args)
+        rpc.iscsi.delete_target_node(
+            args.client, target_node_name=args.target_node_name)
 
     p = subparsers.add_parser('delete_target_node',
                               help='Delete a target node')
@@ -537,7 +693,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_portal_group(args):
-        rpc.iscsi.delete_portal_group(args.client, args)
+        rpc.iscsi.delete_portal_group(args.client, tag=args.tag)
 
     p = subparsers.add_parser('delete_portal_group',
                               help='Delete a portal group')
@@ -547,7 +703,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_initiator_group(args):
-        rpc.iscsi.delete_initiator_group(args.client, args)
+        rpc.iscsi.delete_initiator_group(args.client, tag=args.tag)
 
     p = subparsers.add_parser('delete_initiator_group',
                               help='Delete an initiator group')
@@ -557,7 +713,7 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_iscsi_connections(args):
-        print_dict(rpc.iscsi.get_iscsi_connections(args.client, args))
+        print_dict(rpc.iscsi.get_iscsi_connections(args.client))
 
     p = subparsers.add_parser('get_iscsi_connections',
                               help='Display iSCSI connections')
@@ -565,14 +721,14 @@ if __name__ == "__main__":
 
     @call_cmd
     def get_iscsi_global_params(args):
-        print_dict(rpc.iscsi.get_iscsi_global_params(args.client, args))
+        print_dict(rpc.iscsi.get_iscsi_global_params(args.client))
 
     p = subparsers.add_parser('get_iscsi_global_params', help='Display iSCSI global parameters')
     p.set_defaults(func=get_iscsi_global_params)
 
     @call_cmd
     def get_scsi_devices(args):
-        print_dict(rpc.iscsi.get_scsi_devices(args.client, args))
+        print_dict(rpc.iscsi.get_scsi_devices(args.client))
 
     p = subparsers.add_parser('get_scsi_devices', help='Display SCSI devices')
     p.set_defaults(func=get_scsi_devices)
@@ -636,10 +792,10 @@ if __name__ == "__main__":
     # lvol
     @call_cmd
     def construct_lvol_store(args):
-        print_array(rpc.lvol.construct_lvol_store(args.client,
-                                                  bdev_name=args.bdev_name,
-                                                  lvs_name=args.lvs_name,
-                                                  cluster_sz=args.cluster_sz))
+        print(rpc.lvol.construct_lvol_store(args.client,
+                                            bdev_name=args.bdev_name,
+                                            lvs_name=args.lvs_name,
+                                            cluster_sz=args.cluster_sz))
 
     p = subparsers.add_parser('construct_lvol_store', help='Add logical volume store on base bdev')
     p.add_argument('bdev_name', help='base bdev name')
@@ -660,12 +816,12 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_lvol_bdev(args):
-        print_array(rpc.lvol.construct_lvol_bdev(args.client,
-                                                 lvol_name=args.lvol_name,
-                                                 size=args.size * 1024 * 1024,
-                                                 thin_provision=args.thin_provision,
-                                                 uuid=args.uuid,
-                                                 lvs_name=args.lvs_name))
+        print(rpc.lvol.construct_lvol_bdev(args.client,
+                                           lvol_name=args.lvol_name,
+                                           size=args.size * 1024 * 1024,
+                                           thin_provision=args.thin_provision,
+                                           uuid=args.uuid,
+                                           lvs_name=args.lvs_name))
 
     p = subparsers.add_parser('construct_lvol_bdev', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID', required=False)
@@ -677,9 +833,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def snapshot_lvol_bdev(args):
-        rpc.lvol.snapshot_lvol_bdev(args.client,
-                                    lvol_name=args.lvol_name,
-                                    snapshot_name=args.snapshot_name)
+        print(rpc.lvol.snapshot_lvol_bdev(args.client,
+                                          lvol_name=args.lvol_name,
+                                          snapshot_name=args.snapshot_name))
 
     p = subparsers.add_parser('snapshot_lvol_bdev', help='Create a snapshot of an lvol bdev')
     p.add_argument('lvol_name', help='lvol bdev name')
@@ -688,9 +844,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def clone_lvol_bdev(args):
-        rpc.lvol.clone_lvol_bdev(args.client,
-                                 snapshot_name=args.snapshot_name,
-                                 clone_name=args.clone_name)
+        print(rpc.lvol.clone_lvol_bdev(args.client,
+                                       snapshot_name=args.snapshot_name,
+                                       clone_name=args.clone_name))
 
     p = subparsers.add_parser('clone_lvol_bdev', help='Create a clone of an lvol snapshot')
     p.add_argument('snapshot_name', help='lvol snapshot name')
@@ -714,6 +870,15 @@ if __name__ == "__main__":
                                    name=args.name)
 
     p = subparsers.add_parser('inflate_lvol_bdev', help='Make thin provisioned lvol a thick provisioned lvol')
+    p.add_argument('name', help='lvol bdev name')
+    p.set_defaults(func=inflate_lvol_bdev)
+
+    @call_cmd
+    def decouple_parent_lvol_bdev(args):
+        rpc.lvol.decouple_parent_lvol_bdev(args.client,
+                                           name=args.name)
+
+    p = subparsers.add_parser('decouple_parent_lvol_bdev', help='Decouple parent of lvol')
     p.add_argument('name', help='lvol bdev name')
     p.set_defaults(func=inflate_lvol_bdev)
 
@@ -762,10 +927,10 @@ if __name__ == "__main__":
     # split
     @call_cmd
     def construct_split_vbdev(args):
-        print_dict(rpc.bdev.construct_split_vbdev(args.client,
-                                                  base_bdev=args.base_bdev,
-                                                  split_count=args.split_count,
-                                                  split_size_mb=args.split_size_mb))
+        print_array(rpc.bdev.construct_split_vbdev(args.client,
+                                                   base_bdev=args.base_bdev,
+                                                   split_count=args.split_count,
+                                                   split_size_mb=args.split_size_mb))
 
     p = subparsers.add_parser('construct_split_vbdev', help="""Add given disk name to split config. If bdev with base_name
     name exist the split bdevs will be created right away, if not split bdevs will be created when base bdev became
@@ -1053,7 +1218,11 @@ if __name__ == "__main__":
     # pmem
     @call_cmd
     def create_pmem_pool(args):
-        rpc.pmem.create_pmem_pool(args.client, args)
+        num_blocks = int((args.total_size * 1024 * 1024) / args.block_size)
+        rpc.pmem.create_pmem_pool(args.client,
+                                  pmem_file=args.pmem_file,
+                                  num_blocks=num_blocks,
+                                  block_size=args.block_size)
 
     p = subparsers.add_parser('create_pmem_pool', help='Create pmem pool')
     p.add_argument('pmem_file', help='Path to pmemblk pool file')
@@ -1063,7 +1232,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def pmem_pool_info(args):
-        print_dict(rpc.pmem.pmem_pool_info(args.client, args))
+        print_dict(rpc.pmem.pmem_pool_info(args.client,
+                                           pmem_file=args.pmem_file))
 
     p = subparsers.add_parser('pmem_pool_info', help='Display pmem pool info and check consistency')
     p.add_argument('pmem_file', help='Path to pmemblk pool file')
@@ -1071,7 +1241,8 @@ if __name__ == "__main__":
 
     @call_cmd
     def delete_pmem_pool(args):
-        rpc.pmem.delete_pmem_pool(args.client, args)
+        rpc.pmem.delete_pmem_pool(args.client,
+                                  pmem_file=args.pmem_file)
 
     p = subparsers.add_parser('delete_pmem_pool', help='Delete pmem pool')
     p.add_argument('pmem_file', help='Path to pmemblk pool file')
@@ -1274,11 +1445,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_user_blk_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_user_blk_bdev(args.client,
-                                                            path=args.path,
-                                                            name=args.name,
-                                                            vq_count=args.vq_count,
-                                                            vq_size=args.vq_size))
+        print(rpc.vhost.construct_virtio_user_blk_bdev(args.client,
+                                                       path=args.path,
+                                                       name=args.name,
+                                                       vq_count=args.vq_count,
+                                                       vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_user_blk_bdev', help='Connect to a virtio user blk device.')
     p.add_argument('path', help='Path to Virtio BLK socket')
@@ -1289,9 +1460,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_pci_blk_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_pci_blk_bdev(args.client,
-                                                           pci_address=args.pci_address,
-                                                           name=args.name))
+        print(rpc.vhost.construct_virtio_pci_blk_bdev(args.client,
+                                                      pci_address=args.pci_address,
+                                                      name=args.name))
 
     p = subparsers.add_parser('construct_virtio_pci_blk_bdev', help='Create a Virtio Blk device from a virtio-pci device.')
     p.add_argument('pci_address', help="""PCI address in domain:bus:device.function format or

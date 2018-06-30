@@ -57,9 +57,11 @@ SPDK_LIB_LIST += json
 SPDK_LIB_LIST += jsonrpc
 SPDK_LIB_LIST += log
 SPDK_LIB_LIST += log_rpc
+SPDK_LIB_LIST += net
 SPDK_LIB_LIST += nvmf
 SPDK_LIB_LIST += rpc
 SPDK_LIB_LIST += scsi
+SPDK_LIB_LIST += thread
 SPDK_LIB_LIST += trace
 SPDK_LIB_LIST += util
 
@@ -77,20 +79,20 @@ endif
 
 LIBS += $(BLOCKDEV_MODULES_LINKER_ARGS)
 LIBS += $(COPY_MODULES_LINKER_ARGS)
-LIBS += $(NET_MODULES_LINKER_ARGS)
+LIBS += $(SOCK_MODULES_LINKER_ARGS)
 LIBS += $(SPDK_LIB_LINKER_ARGS)
 LIBS += $(ENV_LINKER_ARGS)
 
 comma := ,
 
-$(SHARED_LIB): $(SPDK_LIB_FILES) $(SPDK_WHOLE_LIBS) $(BLOCKDEV_MODULES_FILES) $(COPY_MODULES_FILES) $(NET_MODULES_FILES) $(LINKER_MODULES) $(ENV_LIBS) $(MAKEFILE_LIST)
+$(SHARED_LIB): $(SPDK_LIB_FILES) $(SPDK_WHOLE_LIBS) $(BLOCKDEV_MODULES_FILES) $(COPY_MODULES_FILES) $(SOCK_MODULES_FILES) $(LINKER_MODULES) $(ENV_LIBS) $(MAKEFILE_LIST) spdk.map
 	$(Q)echo "  SO $(notdir $@)"; \
 	rm -f $@; \
 	$(CC) -o $@ -shared $(CPPFLAGS) $(LDFLAGS) \
 		-Wl,--whole-archive \
 		$(filter-out -Wl$(comma)--no-whole-archive,$(LIBS)) \
 		-Wl,--no-whole-archive \
-		-lcrypto \
+		-Wl,--version-script=spdk.map \
 		$(SYS_LIBS)
 
 .PHONY: all clean $(DIRS-y)

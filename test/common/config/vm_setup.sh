@@ -24,16 +24,30 @@ set -e
 jobs=$(($(nproc)*2))
 
 sudo dnf upgrade -y
-sudo dnf install -y gcc
-sudo dnf install -y gcc-c++
-sudo dnf install -y make
 sudo dnf install -y git
+
+cd ~
+mkdir -p spdk_repo
+
+cd spdk_repo
+mkdir -p output
+if [ -d spdk ]; then
+    echo "spdk source already present, not cloning"
+else
+    git clone https://review.gerrithub.io/spdk/spdk
+fi
+cd spdk
+git submodule update --init --recursive
+sudo ./scripts/pkgdep.sh
+cd ~
+
+
 sudo dnf install -y jq
+sudo dnf install -y tsocks
 sudo dnf install -y valgrind
 sudo dnf install -y nvme-cli
 sudo dnf install -y ceph
 sudo dnf install -y gdb
-sudo dnf install -y sg3_utils
 sudo dnf install -y fio
 sudo dnf install -y librbd-devel
 sudo dnf install -y kernel-devel
@@ -45,32 +59,15 @@ sudo dnf install -y automake
 sudo dnf install -y libtool
 sudo dnf install -y libmount-devel
 sudo dnf install -y isns-utils-devel
-sudo dnf install -y openssl-devel
-sudo dnf install -y numactl-devel
-sudo dnf install -y libaio-devel
-sudo dnf install -y CUnit-devel
-sudo dnf install -y clang-analyzer
-sudo dnf install -y libpmemblk-devel pmempool
-sudo dnf install -y libibverbs libibverbs-devel librdmacm librdmacm-devel
+sudo dnf install -y pmempool
 sudo dnf install -y perl-open
 sudo dnf install -y glib2-devel
 sudo dnf install -y pixman-devel
-sudo dnf install -y libiscsi-devel
-sudo dnf install -y doxygen
 sudo dnf install -y astyle-devel
-sudo dnf install -y python
-sudo dnf install -y python-pep8
-sudo dnf install -y lcov
-sudo dnf install -y libuuid-devel
 sudo dnf install -y elfutils-libelf-devel
 sudo dnf install -y flex
 sudo dnf install -y bison
 sudo dnf install -y targetcli
-sudo dnf install -y nasm
-
-cd ~
-
-mkdir -p spdk_repo
 
 # The librxe-dev repository provides a command line tool called rxe_cfg which makes it
 # very easy to use Soft-RoCE. The build pool utilizes this command line tool in the absence
@@ -89,17 +86,6 @@ else
 fi
 sudo dnf install -y perl-Switch librdmacm-utils libibverbs-utils
 
-cd spdk_repo
-mkdir -p output
-if [ -d spdk ]; then
-    echo "spdk source already present, not cloning"
-else
-    git clone https://review.gerrithub.io/spdk/spdk
-fi
-cd spdk
-git submodule update --init --recursive
-cd ~
-
 # The version of iscsiadm that ships with fedora 26 was broken as of November 3 2017.
 # There is already a bug report out about it, and hopefully it is fixed soon, but in the event that
 # that version is still broken when you do your setup, the below steps will fix the issue.
@@ -110,7 +96,7 @@ if [ "$CURRENT_VERSION" == "$OPEN_ISCSI_VER" ]; then
         mkdir -p open-iscsi-install
         cd open-iscsi-install
         sudo dnf download --source iscsi-initiator-utils
-        rpm2cpio iscsi-initiator-utils-6.2.0.874-3.git86e8892.fc26.src.rpm | cpio -idmv
+        rpm2cpio $(ls) | cpio -idmv
         mkdir -p patches
         mv 00* patches/
         git clone https://github.com/open-iscsi/open-iscsi
@@ -182,7 +168,7 @@ else
     echo "qemu already checked out. Skipping"
 fi
 cd "$SPDK_QEMU_BRANCH"
-if hash tsocks &> /dev/null; then
+if hash tsocks 2> /dev/null; then
     git_param="--with-git='tsocks git'"
 fi
 ./configure "$git_param" --prefix=/usr/local/qemu/$SPDK_QEMU_BRANCH --target-list="x86_64-softmmu" --enable-kvm --enable-linux-aio --enable-numa

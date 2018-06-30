@@ -183,6 +183,11 @@ enum spdk_nvme_transport_type {
 	 * RDMA Transport (RoCE, iWARP, etc.)
 	 */
 	SPDK_NVME_TRANSPORT_RDMA = SPDK_NVMF_TRTYPE_RDMA,
+
+	/**
+	 * Fibre Channel (FC) Transport
+	 */
+	SPDK_NVME_TRANSPORT_FC = SPDK_NVMF_TRTYPE_FC,
 };
 
 /**
@@ -210,14 +215,16 @@ struct spdk_nvme_transport_id {
 	 * Transport address of the NVMe-oF endpoint. For transports which use IP
 	 * addressing (e.g. RDMA), this should be an IP address. For PCIe, this
 	 * can either be a zero length string (the whole bus) or a PCI address
-	 * in the format DDDD:BB:DD.FF or DDDD.BB.DD.FF
+	 * in the format DDDD:BB:DD.FF or DDDD.BB.DD.FF. For FC the string is
+	 * formatted as: nn-0xWWNN:pn-0xWWPN” where a)WWN isthe Node_Name of the
+	 * target NVMe_Port and b)WWPN is the N_Port_Name of the target NVMe_Port.
 	 */
 	char traddr[SPDK_NVMF_TRADDR_MAX_LEN + 1];
 
 	/**
 	 * Transport service id of the NVMe-oF endpoint.  For transports which use
 	 * IP addressing (e.g. RDMA), this field shoud be the port number. For PCIe,
-	 * this is always a zero length string.
+	 * and FC this is always a zero length string.
 	 */
 	char trsvcid[SPDK_NVMF_TRSVCID_MAX_LEN + 1];
 
@@ -241,7 +248,7 @@ struct spdk_nvme_transport_id {
  * ------------ | -----
  * trtype       | Transport type (e.g. PCIe, RDMA)
  * adrfam       | Address family (e.g. IPv4, IPv6)
- * traddr       | Transport address (e.g. 0000:04:00.0 for PCIe or 192.168.100.8 for RDMA)
+ * traddr       | Transport address (e.g. 0000:04:00.0 for PCIe, 192.168.100.8 for RDMA, or WWN for FC)
  * trsvcid      | Transport service identifier (e.g. 4420)
  * subnqn       | Subsystem NQN
  *
@@ -1678,6 +1685,54 @@ int spdk_nvme_ns_cmd_compare_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_q
 				     uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
 				     void *cb_arg, uint32_t io_flags,
 				     uint16_t apptag_mask, uint16_t apptag);
+
+/**
+ * \brief Inject an error for the next request with a given opcode.
+ *
+ * \param ctrlr NVMe controller.
+ * \param qpair I/O queue pair to add the error command,
+ *              NULL for Admin queue pair.
+ * \param opc Opcode for Admin or I/O commands.
+ * \param do_not_submit True if matching requests should not be submitted
+ *                      to the controller, but instead completed manually
+ *                      after timeout_in_us has expired.  False if matching
+ *                      requests should be submitted to the controller and
+ *                      have their completion status modified after the
+ *                      controller completes the request.
+ * \param timeout_in_us Wait specified microseconds when do_not_submit is true.
+ * \param err_count Number of matching requests to inject errors.
+ * \param sct Status code type.
+ * \param sc Status code.
+ *
+ * \return 0 if successfully enabled, ENOMEM if an error command
+ *	     structure cannot be allocated.
+ *
+ * The function can be called multiple times to inject errors for different
+ * commands.  If the opcode matches an existing entry, the existing entry
+ * will be updated with the values specified.
+ */
+int spdk_nvme_qpair_add_cmd_error_injection(struct spdk_nvme_ctrlr *ctrlr,
+		struct spdk_nvme_qpair *qpair,
+		uint8_t opc,
+		bool do_not_submit,
+		uint64_t timeout_in_us,
+		uint32_t err_count,
+		uint8_t sct, uint8_t sc);
+
+/**
+ * \brief Clear the specified NVMe command with error status.
+ *
+ * \param ctrlr NVMe controller.
+ * \param qpair I/O queue pair to remove the error command,
+ * \            NULL for Admin queue pair.
+ * \param opc Opcode for Admin or I/O commands.
+ *
+ * The function will remove specified command in the error list.
+ */
+void spdk_nvme_qpair_remove_cmd_error_injection(struct spdk_nvme_ctrlr *ctrlr,
+		struct spdk_nvme_qpair *qpair,
+		uint8_t opc);
+
 
 #ifdef __cplusplus
 }

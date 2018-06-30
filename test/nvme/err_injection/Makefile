@@ -34,8 +34,6 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-C_SRCS += vpp.c
+APP = err_injection
 
-LIBNAME = net_vpp
-
-include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk
+include $(SPDK_ROOT_DIR)/mk/nvme.libtest.mk

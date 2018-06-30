@@ -74,8 +74,6 @@ struct spdk_nvme_rdma_mr_map {
 /* NVMe RDMA transport extensions for spdk_nvme_ctrlr */
 struct nvme_rdma_ctrlr {
 	struct spdk_nvme_ctrlr			ctrlr;
-
-	uint16_t				cntlid;
 };
 
 /* NVMe RDMA qpair extensions for spdk_nvme_qpair */
@@ -516,7 +514,6 @@ nvme_rdma_connect(struct nvme_rdma_qpair *rqpair)
 	int						ret;
 	struct rdma_cm_event				*event;
 	struct spdk_nvme_ctrlr				*ctrlr;
-	struct nvme_rdma_ctrlr				*rctrlr;
 
 	ret = ibv_query_device(rqpair->cm_id->verbs, &attr);
 	if (ret != 0) {
@@ -531,12 +528,10 @@ nvme_rdma_connect(struct nvme_rdma_qpair *rqpair)
 		return -1;
 	}
 
-	rctrlr = nvme_rdma_ctrlr(ctrlr);
-
 	request_data.qid = rqpair->qpair.id;
 	request_data.hrqsize = rqpair->num_entries;
 	request_data.hsqsize = rqpair->num_entries - 1;
-	request_data.cntlid = rctrlr->cntlid;
+	request_data.cntlid = ctrlr->cntlid;
 
 	param.private_data = &request_data;
 	param.private_data_len = sizeof(request_data);
@@ -598,75 +593,6 @@ nvme_rdma_parse_addr(struct sockaddr_storage *sa, int family, const char *addr, 
 
 	freeaddrinfo(res);
 	return ret;
-}
-
-static int
-nvme_rdma_qpair_fabric_connect(struct nvme_rdma_qpair *rqpair)
-{
-	struct nvme_completion_poll_status status;
-	struct spdk_nvmf_fabric_connect_rsp *rsp;
-	struct spdk_nvmf_fabric_connect_cmd cmd;
-	struct spdk_nvmf_fabric_connect_data *nvmf_data;
-	struct spdk_nvme_ctrlr *ctrlr;
-	struct nvme_rdma_ctrlr *rctrlr;
-	int rc = 0;
-
-	ctrlr = rqpair->qpair.ctrlr;
-	if (!ctrlr) {
-		return -1;
-	}
-
-	rctrlr = nvme_rdma_ctrlr(ctrlr);
-
-	nvmf_data = spdk_dma_zmalloc(sizeof(*nvmf_data), 0, NULL);
-	if (!nvmf_data) {
-		SPDK_ERRLOG("nvmf_data allocation error\n");
-		rc = -1;
-		return rc;
-	}
-
-	memset(&cmd, 0, sizeof(cmd));
-
-	cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
-	cmd.qid = rqpair->qpair.id;
-	cmd.sqsize = rqpair->num_entries - 1;
-	cmd.kato = ctrlr->opts.keep_alive_timeout_ms;
-
-	if (nvme_qpair_is_admin_queue(&rqpair->qpair)) {
-		nvmf_data->cntlid = 0xFFFF;
-	} else {
-		nvmf_data->cntlid = rctrlr->cntlid;
-	}
-
-	SPDK_STATIC_ASSERT(sizeof(nvmf_data->hostid) == sizeof(ctrlr->opts.extended_host_id),
-			   "host ID size mismatch");
-	memcpy(nvmf_data->hostid, ctrlr->opts.extended_host_id, sizeof(nvmf_data->hostid));
-	snprintf(nvmf_data->hostnqn, sizeof(nvmf_data->hostnqn), "%s", ctrlr->opts.hostnqn);
-	snprintf(nvmf_data->subnqn, sizeof(nvmf_data->subnqn), "%s", ctrlr->trid.subnqn);
-
-	rc = spdk_nvme_ctrlr_cmd_io_raw(ctrlr, &rqpair->qpair,
-					(struct spdk_nvme_cmd *)&cmd,
-					nvmf_data, sizeof(*nvmf_data),
-					nvme_completion_poll_cb, &status);
-	if (rc < 0) {
-		SPDK_ERRLOG("spdk_nvme_rdma_req_fabric_connect failed\n");
-		rc = -1;
-		goto ret;
-	}
-
-	if (spdk_nvme_wait_for_completion(&rqpair->qpair, &status)) {
-		SPDK_ERRLOG("Connect command failed\n");
-		return -1;
-	}
-
-	if (nvme_qpair_is_admin_queue(&rqpair->qpair)) {
-		rsp = (struct spdk_nvmf_fabric_connect_rsp *)&status.cpl;
-		rctrlr->cntlid = rsp->status_code_specific.success.cntlid;
-	}
-ret:
-	spdk_dma_free(nvmf_data);
-	return rc;
 }
 
 static int
@@ -875,7 +801,7 @@ nvme_rdma_qpair_connect(struct nvme_rdma_qpair *rqpair)
 		return -1;
 	}
 
-	rc = nvme_rdma_qpair_fabric_connect(rqpair);
+	rc = nvme_fabric_qpair_connect(&rqpair->qpair, rqpair->num_entries);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to send an NVMe-oF Fabric CONNECT command\n");
 		return -1;
@@ -1003,76 +929,6 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 	return 0;
 }
 
-static int
-nvme_rdma_fabric_prop_set_cmd(struct spdk_nvme_ctrlr *ctrlr,
-			      uint32_t offset, uint8_t size, uint64_t value)
-{
-	struct spdk_nvmf_fabric_prop_set_cmd cmd = {};
-	struct nvme_completion_poll_status status;
-	int rc;
-
-	cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
-	cmd.ofst = offset;
-	cmd.attrib.size = size;
-	cmd.value.u64 = value;
-
-	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, (struct spdk_nvme_cmd *)&cmd,
-					   NULL, 0,
-					   nvme_completion_poll_cb, &status);
-
-	if (rc < 0) {
-		SPDK_ERRLOG("failed to send nvmf_fabric_prop_set_cmd\n");
-		return -1;
-	}
-
-	if (spdk_nvme_wait_for_completion(ctrlr->adminq, &status)) {
-		SPDK_ERRLOG("nvme_rdma_fabric_prop_get_cmd failed\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int
-nvme_rdma_fabric_prop_get_cmd(struct spdk_nvme_ctrlr *ctrlr,
-			      uint32_t offset, uint8_t size, uint64_t *value)
-{
-	struct spdk_nvmf_fabric_prop_set_cmd cmd = {};
-	struct nvme_completion_poll_status status;
-	struct spdk_nvmf_fabric_prop_get_rsp *response;
-	int rc;
-
-	cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
-	cmd.ofst = offset;
-	cmd.attrib.size = size;
-
-	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, (struct spdk_nvme_cmd *)&cmd,
-					   NULL, 0, nvme_completion_poll_cb,
-					   &status);
-
-	if (rc < 0) {
-		SPDK_ERRLOG("failed to send nvme_rdma_fabric_prop_get_cmd\n");
-		return -1;
-	}
-
-	if (spdk_nvme_wait_for_completion(ctrlr->adminq, &status)) {
-		SPDK_ERRLOG("nvme_rdma_fabric_prop_get_cmd failed\n");
-		return -1;
-	}
-
-	response = (struct spdk_nvmf_fabric_prop_get_rsp *)&status.cpl;
-
-	if (!size) {
-		*value = response->value.u32.low;
-	} else {
-		*value = response->value.u64;
-	}
-
-	return 0;
-}
-
 static struct spdk_nvme_qpair *
 nvme_rdma_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 			     uint16_t qid, uint32_t qsize,
@@ -1158,84 +1014,6 @@ nvme_rdma_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
-static int
-nvme_fabrics_get_log_discovery_page(struct spdk_nvme_ctrlr *ctrlr,
-				    void *log_page, uint32_t size, uint64_t offset)
-{
-	struct nvme_completion_poll_status status;
-	int rc;
-
-	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_DISCOVERY, 0, log_page, size, offset,
-					      nvme_completion_poll_cb, &status);
-	if (rc < 0) {
-		return -1;
-	}
-
-	if (spdk_nvme_wait_for_completion(ctrlr->adminq, &status)) {
-		return -1;
-	}
-
-	return 0;
-}
-
-static void
-nvme_rdma_discovery_probe(struct spdk_nvmf_discovery_log_page_entry *entry,
-			  void *cb_ctx, spdk_nvme_probe_cb probe_cb)
-{
-	struct spdk_nvme_transport_id trid;
-	uint8_t *end;
-	size_t len;
-
-	memset(&trid, 0, sizeof(trid));
-
-	if (entry->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY) {
-		SPDK_WARNLOG("Skipping unsupported discovery service referral\n");
-		return;
-	} else if (entry->subtype != SPDK_NVMF_SUBTYPE_NVME) {
-		SPDK_WARNLOG("Skipping unknown subtype %u\n", entry->subtype);
-		return;
-	}
-
-	trid.trtype = entry->trtype;
-	if (!spdk_nvme_transport_available(trid.trtype)) {
-		SPDK_WARNLOG("NVMe transport type %u not available; skipping probe\n",
-			     trid.trtype);
-		return;
-	}
-
-	trid.adrfam = entry->adrfam;
-
-	/* Ensure that subnqn is null terminated. */
-	end = memchr(entry->subnqn, '\0', SPDK_NVMF_NQN_MAX_LEN + 1);
-	if (!end) {
-		SPDK_ERRLOG("Discovery entry SUBNQN is not null terminated\n");
-		return;
-	}
-	len = end - entry->subnqn;
-	memcpy(trid.subnqn, entry->subnqn, len);
-	trid.subnqn[len] = '\0';
-
-	/* Convert traddr to a null terminated string. */
-	len = spdk_strlen_pad(entry->traddr, sizeof(entry->traddr), ' ');
-	memcpy(trid.traddr, entry->traddr, len);
-	if (spdk_str_chomp(trid.traddr) != 0) {
-		SPDK_DEBUGLOG(SPDK_LOG_NVME, "Trailing newlines removed from discovery TRADDR\n");
-	}
-
-	/* Convert trsvcid to a null terminated string. */
-	len = spdk_strlen_pad(entry->trsvcid, sizeof(entry->trsvcid), ' ');
-	memcpy(trid.trsvcid, entry->trsvcid, len);
-	if (spdk_str_chomp(trid.trsvcid) != 0) {
-		SPDK_DEBUGLOG(SPDK_LOG_NVME, "Trailing newlines removed from discovery TRSVCID\n");
-	}
-
-	SPDK_DEBUGLOG(SPDK_LOG_NVME, "subnqn=%s, trtype=%u, traddr=%s, trsvcid=%s\n",
-		      trid.subnqn, trid.trtype,
-		      trid.traddr, trid.trsvcid);
-
-	nvme_ctrlr_probe(&trid, NULL, probe_cb, cb_ctx);
-}
-
 /* This function must only be called while holding g_spdk_nvme_driver->lock */
 int
 nvme_rdma_ctrlr_scan(const struct spdk_nvme_transport_id *discovery_trid,
@@ -1246,14 +1024,8 @@ nvme_rdma_ctrlr_scan(const struct spdk_nvme_transport_id *discovery_trid,
 {
 	struct spdk_nvme_ctrlr_opts discovery_opts;
 	struct spdk_nvme_ctrlr *discovery_ctrlr;
-	struct spdk_nvmf_discovery_log_page *log_page;
-	struct spdk_nvmf_discovery_log_page_entry *log_page_entry;
 	union spdk_nvme_cc_register cc;
-	char buffer[4096];
 	int rc;
-	uint64_t i, numrec, buffer_max_entries_first, buffer_max_entries, log_page_offset = 0;
-	uint64_t remaining_num_rec = 0;
-	uint16_t recfmt;
 	struct nvme_completion_poll_status status;
 
 	if (strcmp(discovery_trid->subnqn, SPDK_NVMF_DISCOVERY_NQN) != 0) {
@@ -1266,7 +1038,6 @@ nvme_rdma_ctrlr_scan(const struct spdk_nvme_transport_id *discovery_trid,
 	/* For discovery_ctrlr set the timeout to 0 */
 	discovery_opts.keep_alive_timeout_ms = 0;
 
-	memset(buffer, 0x0, 4096);
 	discovery_ctrlr = nvme_rdma_ctrlr_construct(discovery_trid, &discovery_opts, NULL);
 	if (discovery_ctrlr == NULL) {
 		return -1;
@@ -1308,45 +1079,9 @@ nvme_rdma_ctrlr_scan(const struct spdk_nvme_transport_id *discovery_trid,
 		return 0;
 	}
 
-	buffer_max_entries_first = (sizeof(buffer) - offsetof(struct spdk_nvmf_discovery_log_page,
-				    entries[0])) /
-				   sizeof(struct spdk_nvmf_discovery_log_page_entry);
-	buffer_max_entries = sizeof(buffer) / sizeof(struct spdk_nvmf_discovery_log_page_entry);
-	do {
-		rc = nvme_fabrics_get_log_discovery_page(discovery_ctrlr, buffer, sizeof(buffer), log_page_offset);
-		if (rc < 0) {
-			SPDK_DEBUGLOG(SPDK_LOG_NVME, "nvme_fabrics_get_log_discovery_page error\n");
-			nvme_ctrlr_destruct(discovery_ctrlr);
-			return rc;
-		}
-
-		if (!remaining_num_rec) {
-			log_page = (struct spdk_nvmf_discovery_log_page *)buffer;
-			recfmt = from_le16(&log_page->recfmt);
-			if (recfmt != 0) {
-				SPDK_ERRLOG("Unrecognized discovery log record format %" PRIu16 "\n", recfmt);
-				nvme_ctrlr_destruct(discovery_ctrlr);
-				return -EPROTO;
-			}
-			remaining_num_rec = log_page->numrec;
-			log_page_offset = offsetof(struct spdk_nvmf_discovery_log_page, entries[0]);
-			log_page_entry = &log_page->entries[0];
-			numrec = spdk_min(remaining_num_rec, buffer_max_entries_first);
-		} else {
-			numrec = spdk_min(remaining_num_rec, buffer_max_entries);
-			log_page_entry = (struct spdk_nvmf_discovery_log_page_entry *)buffer;
-		}
-
-
-		for (i = 0; i < numrec; i++) {
-			nvme_rdma_discovery_probe(log_page_entry++, cb_ctx, probe_cb);
-		}
-		remaining_num_rec -= numrec;
-		log_page_offset += numrec * sizeof(struct spdk_nvmf_discovery_log_page_entry);
-	} while (remaining_num_rec != 0);
-
+	rc = nvme_fabric_ctrlr_discover(discovery_ctrlr, cb_ctx, probe_cb);
 	nvme_ctrlr_destruct(discovery_ctrlr);
-	return 0;
+	return rc;
 }
 
 struct spdk_nvme_ctrlr *nvme_rdma_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
@@ -1424,32 +1159,25 @@ nvme_rdma_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 int
 nvme_rdma_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value)
 {
-	return nvme_rdma_fabric_prop_set_cmd(ctrlr, offset, SPDK_NVMF_PROP_SIZE_4, value);
+	return nvme_fabric_ctrlr_set_reg_4(ctrlr, offset, value);
 }
 
 int
 nvme_rdma_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value)
 {
-	return nvme_rdma_fabric_prop_set_cmd(ctrlr, offset, SPDK_NVMF_PROP_SIZE_8, value);
+	return nvme_fabric_ctrlr_set_reg_8(ctrlr, offset, value);
 }
 
 int
 nvme_rdma_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value)
 {
-	uint64_t tmp_value;
-	int rc;
-	rc = nvme_rdma_fabric_prop_get_cmd(ctrlr, offset, SPDK_NVMF_PROP_SIZE_4, &tmp_value);
-
-	if (!rc) {
-		*value = (uint32_t)tmp_value;
-	}
-	return rc;
+	return nvme_fabric_ctrlr_get_reg_4(ctrlr, offset, value);
 }
 
 int
 nvme_rdma_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value)
 {
-	return nvme_rdma_fabric_prop_get_cmd(ctrlr, offset, SPDK_NVMF_PROP_SIZE_8, value);
+	return nvme_fabric_ctrlr_get_reg_8(ctrlr, offset, value);
 }
 
 int
@@ -1478,6 +1206,13 @@ nvme_rdma_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 		SPDK_ERRLOG("nvme_rdma_req_init() failed\n");
 		nvme_rdma_req_put(rqpair, rdma_req);
 		return -1;
+	}
+
+	req->timed_out = false;
+	if (spdk_unlikely(rqpair->qpair.ctrlr->timeout_enabled)) {
+		req->submit_tick = spdk_get_ticks();
+	} else {
+		req->submit_tick = 0;
 	}
 
 	wr = &rdma_req->send_wr;
