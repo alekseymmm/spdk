@@ -187,7 +187,7 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 	blk_req->ch = ch;
 	atomic_init(&blk_req->ref_cnt, 0);
 
-	bdev_io->u.bdev.stored_user_cb = bdev_io->cb;
+	bdev_io->u.bdev.stored_user_cb = bdev_io->internal.cb;
 
 	SPDK_DEBUG("For bdev_io=%p, created blk_req=%p dir=[%s], addr=%lu, len=%u\n",
 		 bdev_io, blk_req,

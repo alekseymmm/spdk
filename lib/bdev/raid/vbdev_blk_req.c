@@ -38,7 +38,7 @@ void rdx_blk_req_put_ref(struct rdx_blk_req *blk_req)
 		SPDK_DEBUG("For blk_req=%p achieved ref_cnt=0, complete it, code=%d\n",
 			 blk_req, blk_req->err);
 
-		blk_req->bdev_io->cb = blk_req->bdev_io->u.bdev.stored_user_cb;
+		blk_req->bdev_io->internal.cb = blk_req->bdev_io->u.bdev.stored_user_cb;
 		SPDK_DEBUG("complete bdev_io=%p \n", blk_req->bdev_io);
 		spdk_bdev_io_complete(blk_req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		free(blk_req);

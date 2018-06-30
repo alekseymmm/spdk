@@ -35,7 +35,7 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 void rdx_req_set_dsc(struct rdx_req *req, struct rdx_raid_dsc *raid_dsc)
 {
 	//req->raid_dsc = raid_dsc;
-	req->stripe_num = req->addr / (6 * 8);//raid_dsc->stripe_data_len;
+	req->stripe_num = req->addr / (2 * 8);//raid_dsc->stripe_data_len;
 	//req->stt = &raid_dsc->stt[req->type];
 	//pr_debug("dsc=%p assigned for req=%p\n", raid_dsc, req);
 }
@@ -92,7 +92,7 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 		rdx_req_get_ref(priv);
 	}
 
-	bdev_io->cb = rdx_bdev_io_end_io;
+	bdev_io->internal.cb = rdx_bdev_io_end_io;
 
 	SPDK_DEBUG("For bdev_io=%p created req=%p addr=%lu, len=%d,"
 		" buf_offset=%lu\n", bdev_io, req, req->addr, req->len,
@@ -108,8 +108,8 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	struct rdx_dev *dev;
 	struct rdx_io_ctx *io_ctx;
 	struct spdk_io_channel *io_channel;
-	unsigned int stripe_len = 8 * 6;
-	unsigned int stripe_data_len = 8 * 6;
+	unsigned int stripe_len = 2 * 6;
+	unsigned int stripe_data_len = 2 * 6;
 	unsigned int stripe_size = 8;
 	unsigned int offset_in_strip;
 	unsigned int slen, len;
@@ -230,7 +230,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //			return;
 //		}
 
-		stripe_data_len = 8 * 6;//raid_dsc->stripe_data_len;
+		stripe_data_len = 2 * 6;//raid_dsc->stripe_data_len;
 		offset_in_stripe = addr % stripe_data_len;
 		slen = stripe_data_len - offset_in_stripe;
 		//test
