@@ -280,7 +280,7 @@ main(int argc, char **argv)
 	 * If none of the parameters are provide the application will use the
 	 * default parameters(-c bdev.conf -b Malloc0).
 	 */
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b:a:l:", hello_bdev_parse_arg,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "a:b:l:", hello_bdev_parse_arg,
 				      hello_bdev_usage)) != SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
 	}

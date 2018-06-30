@@ -86,25 +86,17 @@ struct rdx_dev {
 	struct rdx_raid *raid;
 	char *bdev_name;
 	struct spdk_bdev_desc *base_desc;
-};
-
-struct rdx_stripe_dsc {
-	uint16_t strips_per_group;
-	uint16_t groups_cnt;
-	uint16_t synd_cnt; // syndromes per group
-	uint16_t data_cnt;
+	int dsc_use_cnt;
 };
 
 struct rdx_raid {
 	int stripe_size_kb;
 	char *name;
-	struct rdx_dev **devices;
+	struct rdx_raid_dsc *dsc;
 	uint64_t size;
-	uint64_t dev_size;
 	int level;
 	int stripe_size;
 	int dev_cnt;
-	struct rdx_stripe_dsc stripe_dsc;
 	struct spdk_bdev_module *module;
 	struct spdk_bdev raid_bdev;
 
@@ -112,7 +104,18 @@ struct rdx_raid {
 };
 
 struct rdx_raid_dsc {
-
+	struct rdx_raid *raid;
+	struct rdx_dev **devices;
+	uint64_t dev_size;//TODO raid shrinking
+	uint16_t strips_per_substripe;
+	uint16_t substripes_cnt;
+	uint16_t synd_cnt; // syndromes per substripe
+	uint16_t data_cnt;
+	unsigned int stripe_len; //number of drives * stripe_size
+	unsigned int stripe_data_len; // number of data_drives * stripe_size
+	int dev_cnt;
+	uint64_t stripe_cnt;
+	int level;
 };
 
 struct rdx_req {
@@ -129,6 +132,7 @@ struct rdx_req {
 	struct rdx_blk_req *blk_req;
 	int ref_cnt;
 	uint64_t stripe_num;
+	struct rdx_raid_dsc *raid_dsc;
 };
 
 struct rdx_blk_req {
@@ -160,6 +164,7 @@ static inline bool rdx_dev_is_null(char *name)
 	return false;
 }
 
+int rdx_raid0_dsc_configure(struct rdx_raid_dsc *raid_dsc);
 //static inline int rdx_raid_get_dev_num(struct rdx_raid_dsc *raid_dsc,
 //					u64 stripe_num, int strip_num)
 //{
@@ -182,5 +187,8 @@ static inline bool rdx_dev_is_null(char *name)
 //
 //	return dev_num;
 //}
+#define atomic_inc(PTR) atomic_fetch_add(PTR, 1)
+
+#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
 
 #endif /* LIB_BDEV_RAID_VBDEV_COMMON_H_ */

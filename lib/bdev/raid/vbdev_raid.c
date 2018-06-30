@@ -14,13 +14,11 @@
 #include "vbdev_common.h"
 #include "vbdev_dev.h"
 #include "vbdev_raid.h"
+#include "vbdev_raid_dsc.h"
 
 #include "vbdev_req.h"
 #include "vbdev_blk_req.h"
 #include "llist.h"
-
-static int rdx_raid_create_devices(struct rdx_raid *raid,
-				struct rdx_devices *devices);
 
 static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io);
@@ -77,86 +75,30 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 //	if (!raid_size)
 //		set_bit(RDX_RAID_STATE_CREATE, &raid->state);
 
-	if (rdx_raid_create_devices(g_raid, devices)) {
-		SPDK_ERRLOG("Cannot allocate devices\n");
+	g_raid->dsc = rdx_raid_create_dsc(g_raid, level, devices->cnt, devices);
+	if (!g_raid->dsc) {
+		SPDK_ERRLOG("Cannot create descriptor for raid %s\n", g_raid->name);
 		goto error;
 	}
+	return 0;
 error:
 	//rdx_raid_destroy(raid);
 	return -ENOMEM;
 }
 
-static int rdx_raid_create_devices(struct rdx_raid *raid,
-				struct rdx_devices *devices)
-{
-	int i;
-
-	raid->devices = calloc(raid->dev_cnt, sizeof(struct rdx_dev *));
-	if (!raid->devices) {
-		SPDK_ERRLOG("Cannot allocate memory\n");
-		return -1;
-	}
-
-	/* Open drives */
-	for (i = 0; i < raid->dev_cnt; i++) {
-		rdx_dev_create(raid, devices, i);
-	}
-
-//	/* Configure raid and dev sizes or validate after restoring */
-//	if (!raid->size) {
-//		raid->dev_size = raid->devices[0]->size;
-//
-//		for (i = 1; i < raid->dev_cnt; i++) {
-//			if (raid->devices[i]->size < raid->dev_size)
-//				raid->dev_size = raid->devices[i]->size;
-//		}
-//
-//		raid->size = raid->stripe_dsc.data_cnt * raid->dev_size;
-//	} else {
-//		raid->dev_size = raid->size / raid->stripe_dsc.data_cnt;
-//
-//		for (i = 0; i < raid->dev_cnt; i++) {
-//			if (raid->devices[i]->size &&
-//			    raid->devices[i]->size < raid->dev_size) {
-//				SPDK_ERRLOG("Device %d is too small for RAID\n", i);
-//				return -1;
-//			}
-//		}
-//	}
-
-	/* Update raid->size in metadata on all devices */
-//	rdx_md_flush(raid);
-
-	/* Update devices states after restoring to check resulting bitmap */
-//	if (!test_bit(RDX_RAID_STATE_CREATE, &raid->state)) {
-//		for (i = 0; i < raid->dev_cnt; i++)
-//			rdx_dev_update_state(raid->devices[i]);
-//	}
-
-	/* Creation of degraded RAID is not allowed */
-//	if (test_bit(RDX_RAID_STATE_CREATE, &raid->state) &&
-//	    test_bit(RDX_RAID_STATE_DEGRADED, &raid->state)) {
-//		SPDK_ERRLOG("Cannot create degraded raid\n");
-//		return -1;
-//	}
-
-	//clear_bit(RDX_RAID_STATE_CREATE, &raid->state);
-
-	return 0;
-}
-
-int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev)
+int rdx_raid_replace(struct rdx_raid_dsc *raid_dsc, int dev_num,
+		struct spdk_bdev *bdev)
 {
 	int ret = 0;
 
-	ret = rdx_dev_register(raid->devices[dev_num], bdev);
+	ret = rdx_dev_register(raid_dsc->devices[dev_num], bdev);
 	if (ret) {
 		SPDK_ERRLOG("Failed to replace device %s on position %d\n",
 				bdev->name, dev_num);
 		return -1;
 	}
 	SPDK_NOTICELOG("raid %s device=%s replaced on pos %d\n",
-			raid->name, bdev->name, dev_num);
+			raid_dsc->raid->name, bdev->name, dev_num);
 
 	return 0;
 }
@@ -271,6 +213,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 
 	struct rdx_raid_io_channel *raid_ch = ctx_buf;
 	struct rdx_raid *raid = io_device;
+	struct rdx_raid_dsc *raid_dsc = raid->dsc;
 	int i;
 
 	raid_ch->raid = raid;
@@ -285,10 +228,10 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	for (i = 0; i < raid->dev_cnt; i++) {
-		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(raid->devices[i]->base_desc);
+		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(raid_dsc->devices[i]->base_desc);
 		if (!raid_ch->dev_io_channels[i]){
 			SPDK_ERRLOG("could not open io_channel for bdev%s\n",
-				spdk_bdev_get_name(raid->devices[i]->bdev));
+				spdk_bdev_get_name(raid_dsc->devices[i]->bdev));
 
 //				spdk_bdev_close(dev->base_desc);
 //				spdk_bdev_module_release_bdev(dev->bdev);
@@ -329,6 +272,7 @@ static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx)
 int rdx_raid_register(struct rdx_raid *raid)
 {
 	struct spdk_bdev **base_bdevs;
+	struct rdx_raid_dsc *raid_dsc = raid->dsc;
 	int rc = 0;
 	int i;
 
@@ -340,7 +284,7 @@ int rdx_raid_register(struct rdx_raid *raid)
 	}
 
 	if (raid->size == 0) {
-		raid->size = raid->dev_size * raid->dev_cnt;
+		raid->size = raid_dsc->dev_size * raid_dsc->dev_cnt;
 		raid->raid_bdev.blockcnt = raid->size / RDX_BLOCK_SIZE_SECTORS;
 	}
 	spdk_io_device_register(raid, raid_bdev_ch_create_cb,
@@ -350,7 +294,7 @@ int rdx_raid_register(struct rdx_raid *raid)
 	SPDK_NOTICELOG("io_device  for raid registered \n");
 
 	for (i = 0; i < raid->dev_cnt; i++) {
-		base_bdevs[i] = raid->devices[i]->bdev;
+		base_bdevs[i] = raid_dsc->devices[i]->bdev;
 	}
 
 	//This is not working doe to some bug in SPDK. (see github)
@@ -380,8 +324,8 @@ void rdx_raid_destroy_devices(struct rdx_raid *raid)
 
 	SPDK_NOTICELOG("Destroying base devices for raid %s\n", raid->name);
 	for (i = 0; i < raid->dev_cnt; i++) {
-		if (raid->devices[i])
-			rdx_dev_destroy(raid->devices[i]);
+		if (raid->dsc->devices[i])
+			rdx_dev_destroy(raid->dsc->devices[i]);
 	}
 }
 
@@ -390,11 +334,10 @@ void rdx_raid_destroy_devices(struct rdx_raid *raid)
  */
 static int vbdev_raid_destruct(void *ctx)
 {
-	int i;
+
 	struct rdx_raid *raid = (struct rdx_raid *)ctx;
 
 	rdx_raid_destroy_devices(raid);
-	free(raid->devices);
 	free(raid->name);
 	free(raid);
 

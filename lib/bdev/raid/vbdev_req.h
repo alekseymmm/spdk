@@ -17,7 +17,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req);
 
 static inline void rdx_req_get_ref(struct rdx_req *req)
 {
-	atomic_fetch_add(&req->ref_cnt, 1);
+	atomic_inc(&req->ref_cnt);
 }
 
 void rdx_req_put_ref(struct rdx_req *req);

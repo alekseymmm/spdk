@@ -106,15 +106,17 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 static void vbdev_raid_examine(struct spdk_bdev *bdev)
 {
 	int i, ret;
+	struct rdx_raid_dsc *raid_dsc;
 
 	if (g_raid)
 	{
+		raid_dsc = g_raid->dsc;
 		for (i = 0; i < g_raid->dev_cnt; i++) {
-			if (strcmp(g_raid->devices[i]->bdev_name, bdev->name) != 0) {
+			if (strcmp(raid_dsc->devices[i]->bdev_name, bdev->name) != 0) {
 				continue;
 			}
 
-			ret = rdx_raid_replace(g_raid, i, bdev);
+			ret = rdx_raid_replace(raid_dsc, i, bdev);
 			if (ret) {
 				SPDK_ERRLOG("Failed to replace device %s on"
 					    " position %d\n", bdev->name, i);

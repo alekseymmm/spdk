@@ -16,7 +16,8 @@
 int spdk_raid_create(char *name, int level, int stripe_size_kb,
 		struct rdx_devices *devices, uint64_t raid_size);
 int rdx_raid_register(struct rdx_raid *raid);
-int rdx_raid_replace(struct rdx_raid *raid, int dev_num, struct spdk_bdev *bdev);
+int rdx_raid_replace(struct rdx_raid_dsc *raid_dsc, int dev_num,
+		struct spdk_bdev *bdev);
 
 int create_raid_disk(const char *bdev_name, const char *vbdev_name);
 void rdx_raid_destroy_devices(struct rdx_raid *raid);

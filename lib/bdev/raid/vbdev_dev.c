@@ -17,7 +17,7 @@ static void
 vbdev_raid_base_bdev_hotremove_cb(void *ctx)
 {
 	struct rdx_dev *dev = (struct rdx_dev *)ctx;
-	struct rdx_raid *raid = dev->raid;
+	//struct rdx_raid *raid = dev->raid;
 	/*
 	 *unregister dev in raid and do  spdk_bdev_unregister
 	 */
@@ -38,6 +38,7 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	int rc;
 	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
+	struct rdx_raid_dsc *raid_dsc = raid->dsc;
 
 	rc = spdk_bdev_open(bdev, true, vbdev_raid_base_bdev_hotremove_cb,
 			dev, &dev->base_desc);
@@ -61,13 +62,10 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
 	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
 			block_size_sectors - RDX_MD_OFFSET;
-	//TODO: do it the same way as in raidix_nvme, not like this!
-	if (!raid->size) { //create raid
-		if (dev->size < raid->dev_size || raid->dev_size == 0) {
-			raid->dev_size = dev->size;
-		}
-	} else { // restore raid
-		//to be done
+
+	//this is only for raid create. Do something for restore and restripe
+	if (!raid_dsc->dev_size || dev->size < raid_dsc->dev_size) {
+		raid_dsc->dev_size = dev->size;
 	}
 
 	return 0;
@@ -75,10 +73,11 @@ error:
 	return -1;
 }
 
-int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
-		int dev_num)
+int rdx_dev_create(struct rdx_raid_dsc *raid_dsc, int dev_num,
+		   struct rdx_devices *devices)
 {
 	struct rdx_dev *dev;
+	struct rdx_raid *raid = raid_dsc->raid;
 	struct spdk_bdev *bdev;
 //	uint64_t strips_in_dev;
 	int rc = 0;
@@ -93,7 +92,8 @@ int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 //	init_waitqueue_head(&dev->wait);
 	dev->num = dev_num;
 	dev->raid = raid;
-	raid->devices[dev_num] = dev;
+	atomic_init(&dev->dsc_use_cnt, 0);
+	raid_dsc->devices[dev_num] = dev;
 
 //	dev->md = (struct rdx_md *)get_zeroed_page(GFP_KERNEL);
 //	if (!dev->md) {
@@ -136,10 +136,11 @@ int rdx_dev_create(struct rdx_raid *raid, struct rdx_devices *devices,
 		goto error;
 	}
 
+//	strips_in_dev = (get_capacity(dev->bdev->bd_disk) - RDX_MD_OFFSET -
+//				RDX_BACKUP_OFFSET) / raid->stripe_size;
+//		dev->size = strips_in_dev * raid->stripe_size;
 	SPDK_NOTICELOG("Device %s number %d of size %lu sectors added to raid %s\n",
 		 dev->bdev_name, dev->num, dev->size, raid->name);
-
-	//rdx_dev_update(dev);
 
 	return 0;
 
@@ -177,7 +178,7 @@ void rdx_dev_close(struct rdx_dev *dev)
 void rdx_dev_destroy(struct rdx_dev *dev)
 {
 	struct rdx_raid *raid = dev->raid;
-	raid->devices[dev->num] = NULL;
+//	raid->devices[dev->num] = NULL;
 	rdx_dev_close(dev);
 //	if (dev->recon_md)
 //		free_page((unsigned long)dev->recon_md);

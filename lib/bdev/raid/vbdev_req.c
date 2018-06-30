@@ -31,10 +31,15 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 	//rdx_dev_put_ref(dev);
 	free(io_ctx);
 }
+static struct rdx_raid_dsc *rdx_req_get_raid_dsc(struct rdx_req *req)
+{
+	//TODO: this is STUB
+	return req->raid->dsc;
+}
 
 void rdx_req_set_dsc(struct rdx_req *req, struct rdx_raid_dsc *raid_dsc)
 {
-	//req->raid_dsc = raid_dsc;
+	req->raid_dsc = raid_dsc;
 	req->stripe_num = req->addr / (2 * 8);//raid_dsc->stripe_data_len;
 	//req->stt = &raid_dsc->stt[req->type];
 	//pr_debug("dsc=%p assigned for req=%p\n", raid_dsc, req);
@@ -103,14 +108,13 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 					int split_type)
 {
-	struct rdx_raid *raid = req->raid;
+	struct rdx_raid_dsc *raid_dsc = req->raid_dsc;
+	struct rdx_raid *raid = raid_dsc->raid;
 	struct spdk_bdev_io *bdev_io = req->bdev_io;
 	struct rdx_dev *dev;
 	struct rdx_io_ctx *io_ctx;
 	struct spdk_io_channel *io_channel;
-	unsigned int stripe_len = 2 * 6;
-	unsigned int stripe_data_len = 2 * 6;
-	unsigned int stripe_size = 8;
+	unsigned int stripe_size = raid->stripe_size;
 	unsigned int offset_in_strip;
 	unsigned int slen, len;
 	unsigned int split_offset, buf_len;
@@ -122,7 +126,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	char *io_buf;
 
 	addr = req->addr + req->split_offset;
-	offset_in_stripe = addr % stripe_len;
+	offset_in_stripe = addr % raid_dsc->stripe_len;
 	strip_num = offset_in_stripe / stripe_size;
 
 	offset_in_strip = addr % stripe_size;
@@ -131,7 +135,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	//dev_num = rdx_raid_get_dev_num(raid_dsc, stripe_num, strip_num);
 	//raid 0 case only
 	dev_num = strip_num;
-	dev = raid->devices[dev_num];
+	dev = raid_dsc->devices[dev_num];
 	io_channel = req->ch->dev_io_channels[dev_num];
 
 	if (slen > len)
@@ -205,6 +209,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 	uint64_t addr;
 	unsigned int slen, len;
 	unsigned int stripe_data_len, offset_in_stripe;
+	struct rdx_raid_dsc *raid_dsc;
 	unsigned int sectors_to_split;
 	struct rdx_req *split_req;
 
@@ -213,7 +218,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 		addr = req->addr;
 		len = req->len;
 
-//		raid_dsc = rdx_req_get_raid_dsc(req);
+		raid_dsc = rdx_req_get_raid_dsc(req);
 //
 //		if (!raid_dsc) {
 //			req->restripe_lnode.next = NULL;
@@ -262,7 +267,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 
 		}
 
-		rdx_req_set_dsc(split_req, NULL);
+		rdx_req_set_dsc(split_req, raid_dsc);
 //
 //		rdx_req_submit(split_req);
 		llist_add(&split_req->thread_lnode, &split_req->ch->req_llist);
