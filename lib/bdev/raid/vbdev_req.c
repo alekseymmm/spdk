@@ -12,20 +12,20 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 	struct rdx_io_ctx *io_ctx = cb_arg;
 	struct rdx_req *req = io_ctx->req;
 	struct rdx_dev *dev = io_ctx->dev;
-
-	SPDK_DEBUG("Called for bdev_io=%p, req=%p dir=[%s], addr=%lu, len=%u\n",
-		 req->bdev_io, req,
-		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
-		 req->addr, req->len);
-
-
-	if (!success) {
-		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
-		       req->bdev_io, success, req, dev->bdev_name);
-		//rdx_req_err_io(req, dev, bio_data_dir(bio));
-	}
-
-	spdk_bdev_free_io(bdev_io);
+//TEST
+//	SPDK_DEBUG("Called for bdev_io=%p, req=%p dir=[%s], addr=%lu, len=%u\n",
+//		 req->bdev_io, req,
+//		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
+//		 req->addr, req->len);
+//
+//
+//	if (!success) {
+//		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
+//		       req->bdev_io, success, req, dev->bdev_name);
+//		//rdx_req_err_io(req, dev, bio_data_dir(bio));
+//	}
+//
+//	spdk_bdev_free_io(bdev_io);
 
 	rdx_req_put_ref(req);
 	//rdx_dev_put_ref(dev);
@@ -159,19 +159,26 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 
 	rdx_req_get_ref(req);
 
+	SPDK_DEBUG("submit req=%p addr=%lu split_offset=%u len=%u,"
+			" to dev=%s sect=%lu len=%u\n",
+			req, req->addr, req->split_offset, req->len,
+			dev->bdev_name, bdev_offset / KERNEL_SECTOR_SIZE,
+			buf_len / KERNEL_SECTOR_SIZE);
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
-		spdk_bdev_read(dev->base_desc,
-				io_channel,
-				io_buf,
-				bdev_offset, buf_len,
-				rdx_bdev_io_end_io, io_ctx);
+//		spdk_bdev_read(dev->base_desc,
+//				io_channel,
+//				io_buf,
+//				bdev_offset, buf_len,
+//				rdx_bdev_io_end_io, io_ctx);
+		rdx_bdev_io_end_io(NULL, true, io_ctx);
 	}
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
-		spdk_bdev_write(dev->base_desc,
-				io_channel,
-				io_buf,
-				bdev_offset, buf_len,
-				rdx_bdev_io_end_io, io_ctx);
+//		spdk_bdev_write(dev->base_desc,
+//				io_channel,
+//				io_buf,
+//				bdev_offset, buf_len,
+//				rdx_bdev_io_end_io, io_ctx);
+		rdx_bdev_io_end_io(NULL, true, io_ctx);
 	}
 
 	req->split_offset += slen;

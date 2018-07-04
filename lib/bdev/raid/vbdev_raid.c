@@ -286,7 +286,7 @@ int rdx_raid_register(struct rdx_raid *raid)
 		raid->size = raid_dsc->dev_size * raid_dsc->dev_cnt;
 		raid->raid_bdev.blockcnt = raid->size / RDX_BLOCK_SIZE_SECTORS;
 	}
-	SPDK_NOTICELOG("Registering raid %s of size %llu\n",
+	SPDK_NOTICELOG("Registering raid %s of size %lu\n",
 			raid->name , raid->size);
 	spdk_io_device_register(raid, raid_bdev_ch_create_cb,
 				raid_bdev_ch_destroy_cb,

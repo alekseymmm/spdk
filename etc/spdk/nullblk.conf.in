@@ -1,11 +1,19 @@
 [Null]
   Dev Null_0 10240 4096
   Dev Null_1 10240 4096
+  Dev Null_2 10240 4096
+  Dev Null_3 10240 4096
+  Dev Null_4 10240 4096
+  Dev Null_5 10240 4096
 
 [RAID]
   RAIDName dimec
   Level 0
-  StripeSizeKB 64
-  NumberOfDrives  2
+  StripeSizeKB 4
+  NumberOfDrives  6
   Drive Null_0
   Drive Null_1
+  Drive Null_2
+  Drive Null_3
+  Drive Null_4
+  Drive Null_5
