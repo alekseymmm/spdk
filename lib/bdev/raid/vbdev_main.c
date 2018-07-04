@@ -111,7 +111,7 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev)
 	if (g_raid)
 	{
 		raid_dsc = g_raid->dsc;
-		for (i = 0; i < g_raid->dev_cnt; i++) {
+		for (i = 0; i < raid_dsc->dev_cnt; i++) {
 			if (strcmp(raid_dsc->devices[i]->bdev_name, bdev->name) != 0) {
 				continue;
 			}

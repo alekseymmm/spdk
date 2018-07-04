@@ -96,7 +96,6 @@ struct rdx_raid {
 	uint64_t size;
 	int level;
 	int stripe_size;
-	int dev_cnt;
 	struct spdk_bdev_module *module;
 	struct spdk_bdev raid_bdev;
 

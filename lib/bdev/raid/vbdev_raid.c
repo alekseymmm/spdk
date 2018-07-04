@@ -54,7 +54,6 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 	g_raid->stripe_size_kb = stripe_size_kb;
 	g_raid->stripe_size = stripe_size_kb * 1024 / KERNEL_SECTOR_SIZE;
 	g_raid->size = raid_size;
-	g_raid->dev_cnt = devices->cnt;
 	g_raid->module = &raid_if;
 
 	g_raid->raid_bdev.name = strdup(name);
@@ -220,14 +219,14 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
 	init_llist_head(&raid_ch->req_llist);
 
-	raid_ch->dev_io_channels = calloc(raid->dev_cnt,
+	raid_ch->dev_io_channels = calloc(raid->dsc->dev_cnt,
 				sizeof(struct spdk_io_channel *));
 	if (!raid_ch->dev_io_channels) {
 		SPDK_ERRLOG("Cannot allocate base bdevs io_channels array\n");
 		return -1;
 	}
 
-	for (i = 0; i < raid->dev_cnt; i++) {
+	for (i = 0; i < raid->dsc->dev_cnt; i++) {
 		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(raid_dsc->devices[i]->base_desc);
 		if (!raid_ch->dev_io_channels[i]){
 			SPDK_ERRLOG("could not open io_channel for bdev%s\n",
@@ -253,7 +252,7 @@ raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 	struct rdx_raid_io_channel *raid_ch = ctx_buf;
 	struct rdx_raid *raid = raid_ch->raid;
 
-	for (i = 0; i < raid->dev_cnt; i++) {
+	for (i = 0; i < raid->dsc->dev_cnt; i++) {
 		spdk_put_io_channel(raid_ch->dev_io_channels[i]);
 	}
 	free(raid_ch->dev_io_channels);
@@ -277,7 +276,7 @@ int rdx_raid_register(struct rdx_raid *raid)
 	int i;
 
 	SPDK_NOTICELOG("init complete called for raid module\n");
-	base_bdevs = calloc(raid->dev_cnt, sizeof(struct spdk_bdev *));
+	base_bdevs = calloc(raid_dsc->dev_cnt, sizeof(struct spdk_bdev *));
 	if (!base_bdevs) {
 		SPDK_ERRLOG("Cannot allcoate memory for bdevs list\n");
 		return -1;
@@ -287,13 +286,15 @@ int rdx_raid_register(struct rdx_raid *raid)
 		raid->size = raid_dsc->dev_size * raid_dsc->dev_cnt;
 		raid->raid_bdev.blockcnt = raid->size / RDX_BLOCK_SIZE_SECTORS;
 	}
+	SPDK_NOTICELOG("Registering raid %s of size %llu\n",
+			raid->name , raid->size);
 	spdk_io_device_register(raid, raid_bdev_ch_create_cb,
 				raid_bdev_ch_destroy_cb,
 				sizeof(struct rdx_raid_io_channel));
 
 	SPDK_NOTICELOG("io_device  for raid registered \n");
 
-	for (i = 0; i < raid->dev_cnt; i++) {
+	for (i = 0; i < raid_dsc->dev_cnt; i++) {
 		base_bdevs[i] = raid_dsc->devices[i]->bdev;
 	}
 
@@ -323,7 +324,7 @@ void rdx_raid_destroy_devices(struct rdx_raid *raid)
 	int i;
 
 	SPDK_NOTICELOG("Destroying base devices for raid %s\n", raid->name);
-	for (i = 0; i < raid->dev_cnt; i++) {
+	for (i = 0; i < raid->dsc->dev_cnt; i++) {
 		if (raid->dsc->devices[i])
 			rdx_dev_destroy(raid->dsc->devices[i]);
 	}

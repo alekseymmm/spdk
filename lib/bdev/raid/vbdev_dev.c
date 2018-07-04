@@ -21,8 +21,8 @@ vbdev_raid_base_bdev_hotremove_cb(void *ctx)
 	/*
 	 *unregister dev in raid and do  spdk_bdev_unregister
 	 */
-
-	rdx_dev_destroy(dev);
+	if (dev)
+		rdx_dev_destroy(dev);
 //	spdk_io_device_unregister(raid, NULL);
 //	spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
 
@@ -178,7 +178,7 @@ void rdx_dev_close(struct rdx_dev *dev)
 void rdx_dev_destroy(struct rdx_dev *dev)
 {
 	struct rdx_raid *raid = dev->raid;
-//	raid->devices[dev->num] = NULL;
+	raid->dsc->devices[dev->num] = NULL;
 	rdx_dev_close(dev);
 //	if (dev->recon_md)
 //		free_page((unsigned long)dev->recon_md);
