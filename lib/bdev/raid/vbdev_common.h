@@ -14,6 +14,7 @@
 
 #include "spdk/bdev.h"
 #include "spdk/log.h"
+#include "spdk/env.h"
 
 #include "spdk/bdev_module.h"
 #include "stddef.h"
@@ -35,6 +36,15 @@ extern struct spdk_bdev_module raid_if;
 #define RDX_SECTOR_SIZE 512
 #define RDX_BLOCK_SIZE 4096
 #define RDX_BLOCK_SIZE_SECTORS (RDX_BLOCK_SIZE / KERNEL_SECTOR_SIZE)
+
+#define RDX_REQ_POOL_SIZE			(64 * 1024)
+#define RDX_REQ_CACHE_SIZE			256
+
+#define RDX_BLK_REQ_POOL_SIZE			(64 * 1024)
+#define RDX_BLK_REQ_CACHE_SIZE			256
+
+#define RDX_IO_CTX_POOL_SIZE			(64 * 1024)
+#define RDX_IO_CTX_CACHE_SIZE			256
 
 enum rdx_raid_state_shift {
 	RDX_RAID_STATE_ONLINE_SHIFT = 0,
@@ -71,6 +81,12 @@ struct rdx_raid_io_channel {
 	struct rdx_raid *raid;
 	struct llist_head req_llist;
 	struct spdk_io_channel **dev_io_channels;
+
+	struct spdk_mempool *blk_req_mempool;
+	struct spdk_mempool *req_mempool;
+	struct rdx_blk_req *blk_req_pool;
+	int blk_req_pool_size;
+	struct llist_head blk_req_llist;
 	//something else
 };
 
@@ -98,7 +114,9 @@ struct rdx_raid {
 	int stripe_size;
 	struct spdk_bdev_module *module;
 	struct spdk_bdev raid_bdev;
-
+	struct spdk_mempool *req_mempool;
+	struct spdk_mempool *blk_req_mempool;
+	struct spdk_mempool *io_ctx_mempool;
 	TAILQ_ENTRY(vbdev_passthru)	link;
 };
 
@@ -144,6 +162,8 @@ struct rdx_blk_req {
 	struct spdk_bdev_io *bdev_io;
 	int err;
 	struct rdx_raid_io_channel *ch;
+	struct spdk_mempool *mempool;
+	struct llist_node pool_lnode;
 };
 
 struct rdx_io_ctx {

@@ -120,10 +120,28 @@ error:
 	return dsc;
 }
 
+static void rdx_dsc_destroy_devices(struct rdx_raid_dsc *raid_dsc)
+{
+	int i;
+
+	if (!raid_dsc->devices)
+		return;
+
+	for (i = 0; i < raid_dsc->dev_cnt; i++){
+		struct rdx_dev *dev = raid_dsc->devices[i];
+		if (dev) {
+			raid_dsc->devices[dev->num] = NULL;
+			if (__atomic_sub_fetch(&dev->dsc_use_cnt, 1, memory_order_seq_cst) == 0)
+				rdx_dev_destroy(dev);
+		}
+	}
+
+	free(raid_dsc->devices);
+}
 
 void rdx_raid_destroy_dsc(struct rdx_raid_dsc *raid_dsc)
 {
-	//rdx_dsc_destroy_devices(raid_dsc);
+	rdx_dsc_destroy_devices(raid_dsc);
 	//rdx_dsc_destroy_stripe_maps(raid_dsc);
 
 	free(raid_dsc);

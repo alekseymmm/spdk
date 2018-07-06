@@ -14,16 +14,21 @@ void rdx_blk_submit(struct rdx_blk_req *blk_req)
 	struct rdx_req *req;
 
 	rdx_blk_req_get_ref(blk_req);
-
+	rdx_blk_req_put_ref(blk_req);
+/*
 	req = rdx_req_create(blk_req->raid, blk_req->bdev_io, blk_req, true);
 	if (!req) {
 		//bio_put(clone);
 		blk_req->err = -EIO;
 		SPDK_ERRLOG("Cannot create rdx_req\n");
 	}
-
-	rdx_req_split_per_stripe(req);
+//TEST
+	//rdx_req_split_per_stripe(req);
+	rdx_req_get_ref(req);
+	rdx_req_put_ref(req);
 	rdx_blk_req_put_ref(blk_req);
+	*/
+
 }
 
 
@@ -41,6 +46,9 @@ void rdx_blk_req_put_ref(struct rdx_blk_req *blk_req)
 		blk_req->bdev_io->internal.cb = blk_req->bdev_io->u.bdev.stored_user_cb;
 		SPDK_DEBUG("complete bdev_io=%p \n", blk_req->bdev_io);
 		spdk_bdev_io_complete(blk_req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-		free(blk_req);
+		//free(blk_req);
+		//spdk_mempool_put(blk_req->raid->blk_req_mempool, blk_req);
+		//spdk_mempool_put(blk_req->mempool, blk_req);
+		llist_add(&blk_req->pool_lnode, &blk_req->ch->blk_req_llist);
 	}
 }

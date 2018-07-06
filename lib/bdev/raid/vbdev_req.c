@@ -382,7 +382,7 @@ int rdx_req_destroy(struct rdx_req *req)
 //		rdx_req_put_raid_dsc(req);
 //
 //	kmem_cache_free(rdx_req_cachep, req);
-	free(req);
+	spdk_mempool_put(req->ch->req_mempool, req);
 
 	return 0;
 }

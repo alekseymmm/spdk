@@ -20,6 +20,9 @@
 #include "vbdev_blk_req.h"
 #include "llist.h"
 
+int blk_req_pool_iter = 0;
+int req_pool_iter = 0;
+
 static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io);
 static struct spdk_io_channel *vbdev_raid_get_io_channel(void *ctx);
@@ -42,7 +45,6 @@ static const struct spdk_bdev_fn_table vbdev_raid_fn_table = {
 int spdk_raid_create(char *name, int level, int stripe_size_kb,
 		struct rdx_devices *devices, uint64_t raid_size)
 {
-
 	g_raid = calloc(1, sizeof(struct rdx_raid));
 	if (!g_raid) {
 		SPDK_ERRLOG("Cannot allocate memory\n");
@@ -79,9 +81,10 @@ int spdk_raid_create(char *name, int level, int stripe_size_kb,
 		SPDK_ERRLOG("Cannot create descriptor for raid %s\n", g_raid->name);
 		goto error;
 	}
+
 	return 0;
 error:
-	//rdx_raid_destroy(raid);
+	vbdev_raid_destruct(g_raid);
 	return -ENOMEM;
 }
 
@@ -107,6 +110,8 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 {
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct rdx_blk_req *blk_req;
+	struct rdx_raid *raid =ch->raid;
+	struct llist_node *lnode;
 
 	if (bdev_io->u.bdev.num_blocks == 0) {
 		SPDK_NOTICELOG("0 size bdev_io, complete it.\n");
@@ -114,12 +119,16 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 		return;
 	}
 	/* TODO: BUG with mkfs.ext4 and page cache */
-	blk_req = calloc(1, sizeof(struct rdx_blk_req));
+	//blk_req = calloc(1, sizeof(struct rdx_blk_req));
+	//blk_req = spdk_mempool_get(raid->blk_req_mempool);
+	//blk_req = spdk_mempool_get(ch->blk_req_mempool);
+	lnode = llist_del_first(&ch->blk_req_pool);
+	blk_req = llist_entry(lnode, struct rdx_blk_req, pool_lnode);
 	if (!blk_req) {
 		SPDK_ERRLOG("Cannot allocate blk_req for bdev_io\n");
 		return;
 	}
-
+	blk_req->mempool = ch->blk_req_mempool;
 	blk_req->addr = bdev_io->u.bdev.offset_blocks * RDX_BLOCK_SIZE_SECTORS;
 	blk_req->len = bdev_io->u.bdev.num_blocks * RDX_BLOCK_SIZE_SECTORS;
 	blk_req->rw = bdev_io->type;
@@ -214,6 +223,8 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	struct rdx_raid *raid = io_device;
 	struct rdx_raid_dsc *raid_dsc = raid->dsc;
 	int i;
+	char name[32];
+	uint32_t core, socket;
 
 	raid_ch->raid = raid;
 	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
@@ -238,6 +249,50 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
+	snprintf(name, 32, "blk_req%d", atomic_fetch_add(&blk_req_pool_iter, 1));
+
+	// We can probably pass spdk_env_get_socket_id(spdk_env_get_current_core())
+	// instead of SPDK_ENV_SOCKET_ID_ANY, but it only works for EAL threads
+	// not fio threads (pthreads)
+	raid_ch->blk_req_mempool = spdk_mempool_create(name,
+			1024, sizeof(struct rdx_blk_req),
+			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+			SPDK_ENV_SOCKET_ID_ANY);
+
+	if (!raid_ch->blk_req_mempool) {
+		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name, raid_ch);
+		return -1;
+	}
+	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch, name);
+
+	snprintf(name, 32, "req%d", atomic_fetch_add(&req_pool_iter, 1));
+	raid_ch->req_mempool = spdk_mempool_create(name,
+			1024, sizeof(struct rdx_req),
+			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+			SPDK_ENV_SOCKET_ID_ANY);
+	if (!raid_ch->req_mempool) {
+		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name, raid_ch);
+		return -1;
+	}
+	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch, name);
+
+	raid_ch->blk_req_pool_size = 1024;
+	raid_ch->blk_req_pool = calloc(raid_ch->blk_req_pool_size,
+					sizeof(struct rdx_blk_req));
+	if (!raid_ch->blk_req_pool) {
+		SPDK_ERRLOG("Cannot allocate blk_req pool\n");
+		return -1;
+	}
+
+	init_llist_head(&raid_ch->blk_req_llist);
+	for (i = 0; i < raid_ch->blk_req_pool_size; i++) {
+		llist_add(&raid_ch->blk_req_pool[i].pool_lnode,
+			&raid_ch->blk_req_llist);
+	}
+
+	SPDK_NOTICELOG("blk_req pool with %d elements allocated\n",
+			raid_ch->blk_req_pool_size);
+
 	return 0;
 }
 
@@ -257,6 +312,9 @@ raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 	}
 	free(raid_ch->dev_io_channels);
 	spdk_poller_unregister(&raid_ch->poller);
+
+	spdk_mempool_free(raid_ch->blk_req_mempool);
+	spdk_mempool_free(raid_ch->req_mempool);
 }
 
 
@@ -338,7 +396,11 @@ static int vbdev_raid_destruct(void *ctx)
 
 	struct rdx_raid *raid = (struct rdx_raid *)ctx;
 
-	rdx_raid_destroy_devices(raid);
+	SPDK_NOTICELOG("Destruct raid %s\n", raid->name);
+
+	if (raid->dsc)
+		rdx_raid_destroy_dsc(raid->dsc);
+
 	free(raid->name);
 	free(raid);
 
@@ -348,7 +410,7 @@ static int vbdev_raid_destruct(void *ctx)
 		//spdk_bdev_unregister(&g_raid->raid_bdev, NULL, NULL);
 	// we have to chek if it is already unregistered or scheduled remove:wq
 	//spdk_bdev_unregister(&raid->raid_bdev, NULL, NULL);
-	printf("destruct\n");
+
 	return 0;
 }
 
