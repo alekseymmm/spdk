@@ -122,7 +122,7 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 	//blk_req = calloc(1, sizeof(struct rdx_blk_req));
 	//blk_req = spdk_mempool_get(raid->blk_req_mempool);
 	//blk_req = spdk_mempool_get(ch->blk_req_mempool);
-	lnode = llist_del_first(&ch->blk_req_pool);
+	lnode = llist_del_first(&ch->blk_req_llist);
 	blk_req = llist_entry(lnode, struct rdx_blk_req, pool_lnode);
 	if (!blk_req) {
 		SPDK_ERRLOG("Cannot allocate blk_req for bdev_io\n");
