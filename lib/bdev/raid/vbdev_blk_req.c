@@ -24,16 +24,16 @@ void rdx_blk_submit(struct rdx_blk_req *blk_req)
 
 	rdx_req_split_per_stripe(req);
 	rdx_blk_req_put_ref(blk_req);
-
-
 }
 
 
 void rdx_blk_req_put_ref(struct rdx_blk_req *blk_req)
 {
-	if (__atomic_sub_fetch(&blk_req->ref_cnt, 1, memory_order_seq_cst) == 0) {
-		blk_req->bdev_io->internal.cb = blk_req->bdev_io->u.bdev.stored_user_cb;
-		spdk_bdev_io_complete(blk_req->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	if (atomic_dec_and_test(&blk_req->ref_cnt) == 0) {
+		blk_req->bdev_io->internal.cb =
+				blk_req->bdev_io->u.bdev.stored_user_cb;
+		spdk_bdev_io_complete(blk_req->bdev_io,
+				      SPDK_BDEV_IO_STATUS_SUCCESS);
 		//free(blk_req);
 		//spdk_mempool_put(blk_req->raid->blk_req_mempool, blk_req);
 		spdk_mempool_put(blk_req->mempool, blk_req);

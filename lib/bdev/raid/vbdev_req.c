@@ -43,14 +43,10 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 				struct spdk_bdev_io *bdev_io, void *priv,
 				bool user)
 {
-	struct llist_node *lnode;
 	struct rdx_req *req;
 	struct rdx_blk_req *blk_req = priv;
 
 	req = spdk_mempool_get(blk_req->ch->req_mempool);
-	//lnode = llist_del_first(&blk_req->ch->req_llist);
-	//req = llist_entry(lnode, struct rdx_req, pool_lnode);
-	//req = calloc(1, sizeof(struct rdx_req));
 	if (!req) {
 		SPDK_ERRLOG("Cannot allocate request\n");
 		return NULL;
@@ -151,7 +147,7 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 			KERNEL_SECTOR_SIZE;
 	split_offset = req->split_offset * KERNEL_SECTOR_SIZE;
 	buf_len = slen * KERNEL_SECTOR_SIZE;
-	io_buf = bdev_io->u.bdev.iov.iov_base + req->buf_offset + split_offset;
+	io_buf = bdev_io->iov.iov_base + req->buf_offset + split_offset;
 
 	rdx_req_get_ref(req);
 
@@ -206,7 +202,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 {
 	uint64_t addr;
 	unsigned int slen, len;
-	unsigned int stripe_data_len, offset_in_stripe;
+	unsigned int offset_in_stripe;
 	struct rdx_raid_dsc *raid_dsc;
 	unsigned int sectors_to_split, sect_to_split;
 	struct rdx_req *split_req;

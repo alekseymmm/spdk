@@ -38,7 +38,7 @@ struct spdk_bdev_module raid_if = {
 	.init_complete = vbdev_raid_init_complete,
 	.config_text = NULL,//vbdev_raid_get_spdk_running_config,
 	.get_ctx_size = NULL,//vbdev_raid_get_ctx_size,
-	.examine = vbdev_raid_examine,
+	.examine_config = vbdev_raid_examine,
 	.module_fini = vbdev_raid_finish,
 };
 

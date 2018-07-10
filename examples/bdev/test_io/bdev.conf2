@@ -1,5 +1,5 @@
-[AIO]
-	AIO /dev/ram0 AIO_0
+[Null]
+  Dev Null_0 10240 4096
 
 [Passthru]
-  PT AIO_0 PT_0 
+  PT Null_0 PT_0 

@@ -110,8 +110,6 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 {
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct rdx_blk_req *blk_req;
-	struct rdx_raid *raid =ch->raid;
-	struct llist_node *lnode;
 
 	if (bdev_io->u.bdev.num_blocks == 0) {
 		SPDK_NOTICELOG("0 size bdev_io, complete it.\n");
@@ -220,7 +218,6 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	struct rdx_raid_dsc *raid_dsc = raid->dsc;
 	int i;
 	char name[32];
-	uint32_t core, socket;
 
 	raid_ch->raid = raid;
 	//raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
