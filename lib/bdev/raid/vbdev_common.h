@@ -85,8 +85,11 @@ struct rdx_raid_io_channel {
 	struct spdk_mempool *blk_req_mempool;
 	struct spdk_mempool *req_mempool;
 	struct rdx_blk_req *blk_req_pool;
+	struct rdx_req *req_pool;
 	int blk_req_pool_size;
+	int req_pool_size;
 	struct llist_head blk_req_llist;
+	//struct llist_head req_llist;
 	//something else
 };
 
@@ -150,6 +153,7 @@ struct rdx_req {
 	int ref_cnt;
 	uint64_t stripe_num;
 	struct rdx_raid_dsc *raid_dsc;
+	struct llist_node pool_lnode;
 };
 
 struct rdx_blk_req {

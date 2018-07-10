@@ -19,13 +19,13 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 //		 req->addr, req->len);
 //
 //
-//	if (!success) {
-//		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
-//		       req->bdev_io, success, req, dev->bdev_name);
-//		//rdx_req_err_io(req, dev, bio_data_dir(bio));
-//	}
-//
-//	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
+		       req->bdev_io, success, req, dev->bdev_name);
+		//rdx_req_err_io(req, dev, bio_data_dir(bio));
+	}
+
+	spdk_bdev_free_io(bdev_io);
 
 	rdx_req_put_ref(req);
 	//rdx_dev_put_ref(dev);
@@ -49,9 +49,14 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 				struct spdk_bdev_io *bdev_io, void *priv,
 				bool user)
 {
+	struct llist_node *lnode;
 	struct rdx_req *req;
+	struct rdx_blk_req *blk_req = priv;
 
-	req = calloc(1, sizeof(struct rdx_req));
+	req = spdk_mempool_get(blk_req->ch->req_mempool);
+	//lnode = llist_del_first(&blk_req->ch->req_llist);
+	//req = llist_entry(lnode, struct rdx_req, pool_lnode);
+	//req = calloc(1, sizeof(struct rdx_req));
 	if (!req) {
 		SPDK_ERRLOG("Cannot allocate request\n");
 		return NULL;
@@ -99,9 +104,9 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 
 	bdev_io->internal.cb = rdx_bdev_io_end_io;
 
-	SPDK_DEBUG("For bdev_io=%p created req=%p addr=%lu, len=%d,"
-		" buf_offset=%lu\n", bdev_io, req, req->addr, req->len,
-		req->buf_offset);
+//	SPDK_DEBUG("For bdev_io=%p created req=%p addr=%lu, len=%d,"
+//		" buf_offset=%lu\n", bdev_io, req, req->addr, req->len,
+//		req->buf_offset);
 	return req;
 }
 
@@ -159,26 +164,26 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 
 	rdx_req_get_ref(req);
 
-	SPDK_DEBUG("submit req=%p addr=%lu split_offset=%u len=%u,"
-			" to dev=%s sect=%lu len=%u\n",
-			req, req->addr, req->split_offset, req->len,
-			dev->bdev_name, bdev_offset / KERNEL_SECTOR_SIZE,
-			buf_len / KERNEL_SECTOR_SIZE);
+//	SPDK_DEBUG("submit req=%p addr=%lu split_offset=%u len=%u,"
+//			" to dev=%s sect=%lu len=%u\n",
+//			req, req->addr, req->split_offset, req->len,
+//			dev->bdev_name, bdev_offset / KERNEL_SECTOR_SIZE,
+//			buf_len / KERNEL_SECTOR_SIZE);
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
-//		spdk_bdev_read(dev->base_desc,
-//				io_channel,
-//				io_buf,
-//				bdev_offset, buf_len,
-//				rdx_bdev_io_end_io, io_ctx);
-		rdx_bdev_io_end_io(NULL, true, io_ctx);
+		spdk_bdev_read(dev->base_desc,
+				io_channel,
+				io_buf,
+				bdev_offset, buf_len,
+				rdx_bdev_io_end_io, io_ctx);
+		//rdx_bdev_io_end_io(req->bdev_io, true, io_ctx);
 	}
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
-//		spdk_bdev_write(dev->base_desc,
-//				io_channel,
-//				io_buf,
-//				bdev_offset, buf_len,
-//				rdx_bdev_io_end_io, io_ctx);
-		rdx_bdev_io_end_io(NULL, true, io_ctx);
+		spdk_bdev_write(dev->base_desc,
+				io_channel,
+				io_buf,
+				bdev_offset, buf_len,
+				rdx_bdev_io_end_io, io_ctx);
+		//rdx_bdev_io_end_io(req->bdev_io, true, io_ctx);
 	}
 
 	req->split_offset += slen;
@@ -264,12 +269,12 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //				kmem_cache_free(rdx_req_cachep, req);
 				return;
 			}
-			SPDK_DEBUG("req=%p splitted. splitteq=%p addr=%lu,"
-				   " len=%d buf_offset=%lu. Initial req=%p,"
-				   " addr=%lu, len=%d, buf_offset=%lu\n",
-				   req, split_req, split_req->addr,
-				   split_req->len, split_req->buf_offset, req,
-				   req->addr, req->len, req->buf_offset);
+//			SPDK_DEBUG("req=%p splitted. splitteq=%p addr=%lu,"
+//				   " len=%d buf_offset=%lu. Initial req=%p,"
+//				   " addr=%lu, len=%d, buf_offset=%lu\n",
+//				   req, split_req, split_req->addr,
+//				   split_req->len, split_req->buf_offset, req,
+//				   req->addr, req->len, req->buf_offset);
 
 		}
 
@@ -277,14 +282,14 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //
 //		rdx_req_submit(split_req);
 
-		llist_add(&split_req->thread_lnode, &split_req->ch->req_llist);
-//		sect_to_split = split_req->len;
-//		split_req->split_offset = 0;
-//		while (sect_to_split) {
-//			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
-//			len = rdx_req_split_per_dev(split_req, 0);
-//			sect_to_split -= len;
-//		}
+		//llist_add(&split_req->thread_lnode, &split_req->ch->req_llist);
+		sect_to_split = split_req->len;
+		split_req->split_offset = 0;
+		while (sect_to_split) {
+			//len = rdx_bdev_io_split_per_dev(req->bdev_io, 0);
+			len = rdx_req_split_per_dev(split_req, 0);
+			sect_to_split -= len;
+		}
 
 		sectors_to_split -= slen;
 	}
@@ -328,12 +333,12 @@ static void rdx_req_end_io(struct rdx_req *req)
 
 void rdx_req_put_ref(struct rdx_req *req)
 {
-	SPDK_DEBUG("for req=%p before dec_and_test ref_cnt=%d\n",
-			req, atomic_load(&req->ref_cnt));
+//	SPDK_DEBUG("for req=%p before dec_and_test ref_cnt=%d\n",
+//			req, atomic_load(&req->ref_cnt));
 
 	if (__atomic_sub_fetch(&req->ref_cnt, 1, memory_order_seq_cst) == 0) {
-		SPDK_DEBUG("For req=%p achieved ref_cnt=0, complete it\n",
-			 req);
+//		SPDK_DEBUG("For req=%p achieved ref_cnt=0, complete it\n",
+//			 req);
 
 		rdx_req_end_io(req);
 	}
@@ -383,6 +388,8 @@ int rdx_req_destroy(struct rdx_req *req)
 //
 //	kmem_cache_free(rdx_req_cachep, req);
 	spdk_mempool_put(req->ch->req_mempool, req);
+	
+	//llist_add(&req->pool_lnode, &req->ch->req_llist);
 
 	return 0;
 }

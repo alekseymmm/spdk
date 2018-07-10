@@ -121,13 +121,14 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 	/* TODO: BUG with mkfs.ext4 and page cache */
 	//blk_req = calloc(1, sizeof(struct rdx_blk_req));
 	//blk_req = spdk_mempool_get(raid->blk_req_mempool);
-	//blk_req = spdk_mempool_get(ch->blk_req_mempool);
-	lnode = llist_del_first(&ch->blk_req_llist);
-	blk_req = llist_entry(lnode, struct rdx_blk_req, pool_lnode);
+	blk_req = spdk_mempool_get(ch->blk_req_mempool);
+	//lnode = llist_del_first(&ch->blk_req_llist);
+	//blk_req = llist_entry(lnode, struct rdx_blk_req, pool_lnode);
 	if (!blk_req) {
 		SPDK_ERRLOG("Cannot allocate blk_req for bdev_io\n");
 		return;
 	}
+
 	blk_req->mempool = ch->blk_req_mempool;
 	blk_req->addr = bdev_io->u.bdev.offset_blocks * RDX_BLOCK_SIZE_SECTORS;
 	blk_req->len = bdev_io->u.bdev.num_blocks * RDX_BLOCK_SIZE_SECTORS;
@@ -139,10 +140,10 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 
 	bdev_io->u.bdev.stored_user_cb = bdev_io->internal.cb;
 
-	SPDK_DEBUG("For bdev_io=%p, created blk_req=%p dir=[%s], addr=%lu, len=%u\n",
-		 bdev_io, blk_req,
-		 blk_req->rw == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
-		 blk_req->addr, blk_req->len);
+//	SPDK_DEBUG("For bdev_io=%p, created blk_req=%p dir=[%s], addr=%lu, len=%u\n",
+//		 bdev_io, blk_req,
+//		 blk_req->rw == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
+//		 blk_req->addr, blk_req->len);
 
 	rdx_blk_submit(blk_req);
 }
@@ -227,7 +228,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	uint32_t core, socket;
 
 	raid_ch->raid = raid;
-	raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
+	//raid_ch->poller = spdk_poller_register(vbdev_raid_poll, raid_ch, 0);
 	init_llist_head(&raid_ch->req_llist);
 
 	raid_ch->dev_io_channels = calloc(raid->dsc->dev_cnt,
@@ -255,7 +256,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	// instead of SPDK_ENV_SOCKET_ID_ANY, but it only works for EAL threads
 	// not fio threads (pthreads)
 	raid_ch->blk_req_mempool = spdk_mempool_create(name,
-			1024, sizeof(struct rdx_blk_req),
+			512, sizeof(struct rdx_blk_req),
 			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 			SPDK_ENV_SOCKET_ID_ANY);
 
@@ -267,7 +268,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 
 	snprintf(name, 32, "req%d", atomic_fetch_add(&req_pool_iter, 1));
 	raid_ch->req_mempool = spdk_mempool_create(name,
-			1024, sizeof(struct rdx_req),
+			512, sizeof(struct rdx_req),
 			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 			SPDK_ENV_SOCKET_ID_ANY);
 	if (!raid_ch->req_mempool) {
@@ -276,7 +277,7 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	}
 	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch, name);
 
-	raid_ch->blk_req_pool_size = 1024;
+	raid_ch->blk_req_pool_size = 512;
 	raid_ch->blk_req_pool = calloc(raid_ch->blk_req_pool_size,
 					sizeof(struct rdx_blk_req));
 	if (!raid_ch->blk_req_pool) {
@@ -292,6 +293,23 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 
 	SPDK_NOTICELOG("blk_req pool with %d elements allocated\n",
 			raid_ch->blk_req_pool_size);
+
+	raid_ch->req_pool_size = 512;
+	raid_ch->req_pool = calloc(raid_ch->req_pool_size,
+					sizeof(struct rdx_req));
+	if (!raid_ch->req_pool) {
+		SPDK_ERRLOG("Cannot allocate rdx_req pool\n");
+		return -1;
+	}
+
+	init_llist_head(&raid_ch->req_llist);
+	for (i = 0; i < raid_ch->req_pool_size; i++) {
+		llist_add(&raid_ch->req_pool[i].pool_lnode,
+			&raid_ch->req_llist);
+	}
+
+	SPDK_NOTICELOG("rdx_req pool with %d elements allocated\n",
+			raid_ch->req_pool_size);
 
 	return 0;
 }
