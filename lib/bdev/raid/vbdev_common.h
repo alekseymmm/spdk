@@ -211,6 +211,7 @@ int rdx_raid0_dsc_configure(struct rdx_raid_dsc *raid_dsc);
 //	return dev_num;
 //}
 #define atomic_inc(PTR) atomic_fetch_add(PTR, 1)
+#define atomic_dec_and_test(PTR) __atomic_sub_fetch(PTR, 1, memory_order_seq_cst)
 
 #define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
 

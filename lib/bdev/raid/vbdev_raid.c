@@ -140,11 +140,6 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 
 	bdev_io->u.bdev.stored_user_cb = bdev_io->internal.cb;
 
-//	SPDK_DEBUG("For bdev_io=%p, created blk_req=%p dir=[%s], addr=%lu, len=%u\n",
-//		 bdev_io, blk_req,
-//		 blk_req->rw == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
-//		 blk_req->addr, blk_req->len);
-
 	rdx_blk_submit(blk_req);
 }
 
@@ -239,7 +234,8 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	for (i = 0; i < raid->dsc->dev_cnt; i++) {
-		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(raid_dsc->devices[i]->base_desc);
+		raid_ch->dev_io_channels[i] = spdk_bdev_get_io_channel(
+						raid_dsc->devices[i]->base_desc);
 		if (!raid_ch->dev_io_channels[i]){
 			SPDK_ERRLOG("could not open io_channel for bdev%s\n",
 				spdk_bdev_get_name(raid_dsc->devices[i]->bdev));
@@ -261,10 +257,12 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 			SPDK_ENV_SOCKET_ID_ANY);
 
 	if (!raid_ch->blk_req_mempool) {
-		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name, raid_ch);
+		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name,
+				raid_ch);
 		return -1;
 	}
-	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch, name);
+	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
+			name);
 
 	snprintf(name, 32, "req%d", atomic_fetch_add(&req_pool_iter, 1));
 	raid_ch->req_mempool = spdk_mempool_create(name,
@@ -272,44 +270,13 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 			SPDK_ENV_SOCKET_ID_ANY);
 	if (!raid_ch->req_mempool) {
-		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name, raid_ch);
-		return -1;
-	}
-	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch, name);
-
-	raid_ch->blk_req_pool_size = 512;
-	raid_ch->blk_req_pool = calloc(raid_ch->blk_req_pool_size,
-					sizeof(struct rdx_blk_req));
-	if (!raid_ch->blk_req_pool) {
-		SPDK_ERRLOG("Cannot allocate blk_req pool\n");
+		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name,
+				raid_ch);
 		return -1;
 	}
 
-	init_llist_head(&raid_ch->blk_req_llist);
-	for (i = 0; i < raid_ch->blk_req_pool_size; i++) {
-		llist_add(&raid_ch->blk_req_pool[i].pool_lnode,
-			&raid_ch->blk_req_llist);
-	}
-
-	SPDK_NOTICELOG("blk_req pool with %d elements allocated\n",
-			raid_ch->blk_req_pool_size);
-
-	raid_ch->req_pool_size = 512;
-	raid_ch->req_pool = calloc(raid_ch->req_pool_size,
-					sizeof(struct rdx_req));
-	if (!raid_ch->req_pool) {
-		SPDK_ERRLOG("Cannot allocate rdx_req pool\n");
-		return -1;
-	}
-
-	init_llist_head(&raid_ch->req_llist);
-	for (i = 0; i < raid_ch->req_pool_size; i++) {
-		llist_add(&raid_ch->req_pool[i].pool_lnode,
-			&raid_ch->req_llist);
-	}
-
-	SPDK_NOTICELOG("rdx_req pool with %d elements allocated\n",
-			raid_ch->req_pool_size);
+	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
+			name);
 
 	return 0;
 }

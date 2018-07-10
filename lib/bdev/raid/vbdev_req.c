@@ -12,13 +12,7 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 	struct rdx_io_ctx *io_ctx = cb_arg;
 	struct rdx_req *req = io_ctx->req;
 	struct rdx_dev *dev = io_ctx->dev;
-//TEST
-//	SPDK_DEBUG("Called for bdev_io=%p, req=%p dir=[%s], addr=%lu, len=%u\n",
-//		 req->bdev_io, req,
-//		 bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "W" : "R",
-//		 req->addr, req->len);
-//
-//
+
 	if (!success) {
 		SPDK_ERRLOG("bdev_io error %p code=%d req=%p bdev_name=%s\n",
 		       req->bdev_io, success, req, dev->bdev_name);
@@ -104,9 +98,6 @@ struct rdx_req *rdx_req_create(struct rdx_raid *raid,
 
 	bdev_io->internal.cb = rdx_bdev_io_end_io;
 
-//	SPDK_DEBUG("For bdev_io=%p created req=%p addr=%lu, len=%d,"
-//		" buf_offset=%lu\n", bdev_io, req, req->addr, req->len,
-//		req->buf_offset);
 	return req;
 }
 
@@ -164,11 +155,6 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 
 	rdx_req_get_ref(req);
 
-//	SPDK_DEBUG("submit req=%p addr=%lu split_offset=%u len=%u,"
-//			" to dev=%s sect=%lu len=%u\n",
-//			req, req->addr, req->split_offset, req->len,
-//			dev->bdev_name, bdev_offset / KERNEL_SECTOR_SIZE,
-//			buf_len / KERNEL_SECTOR_SIZE);
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
 		spdk_bdev_read(dev->base_desc,
 				io_channel,
@@ -269,13 +255,6 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 //				kmem_cache_free(rdx_req_cachep, req);
 				return;
 			}
-//			SPDK_DEBUG("req=%p splitted. splitteq=%p addr=%lu,"
-//				   " len=%d buf_offset=%lu. Initial req=%p,"
-//				   " addr=%lu, len=%d, buf_offset=%lu\n",
-//				   req, split_req, split_req->addr,
-//				   split_req->len, split_req->buf_offset, req,
-//				   req->addr, req->len, req->buf_offset);
-
 		}
 
 		rdx_req_set_dsc(split_req, raid_dsc);
@@ -333,13 +312,7 @@ static void rdx_req_end_io(struct rdx_req *req)
 
 void rdx_req_put_ref(struct rdx_req *req)
 {
-//	SPDK_DEBUG("for req=%p before dec_and_test ref_cnt=%d\n",
-//			req, atomic_load(&req->ref_cnt));
-
-	if (__atomic_sub_fetch(&req->ref_cnt, 1, memory_order_seq_cst) == 0) {
-//		SPDK_DEBUG("For req=%p achieved ref_cnt=0, complete it\n",
-//			 req);
-
+	if (atomic_dec_and_test(&req->ref_cnt) == 0) {
 		rdx_req_end_io(req);
 	}
 }
