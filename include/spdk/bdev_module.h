@@ -47,6 +47,7 @@
 #include "spdk/queue.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/thread.h"
+#include "spdk/util.h"
 #include "spdk/uuid.h"
 
 /** Block device module */
@@ -99,11 +100,19 @@ struct spdk_bdev_module {
 	int (*get_ctx_size)(void);
 
 	/**
-	 * Notification that a bdev should be examined by a virtual bdev module.
+	 * First notification that a bdev should be examined by a virtual bdev module.
 	 * Virtual bdev modules may use this to examine newly-added bdevs and automatically
-	 * create their own vbdevs.
+	 * create their own vbdevs, but no I/O to device can be send to bdev at this point.
+	 * Only vbdevs based on config files can be created here.
 	 */
-	void (*examine)(struct spdk_bdev *bdev);
+	void (*examine_config)(struct spdk_bdev *bdev);
+
+	/**
+	 * Second notification that a bdev should be examined by a virtual bdev module.
+	 * Virtual bdev modules may use this to examine newly-added bdevs and automatically
+	 * create their own vbdevs. This callback may use I/O operations end finish asynchronously.
+	 */
+	void (*examine_disk)(struct spdk_bdev *bdev);
 
 	/**
 	 * Denotes if the module_init function may complete asynchronously. If set to true,
@@ -219,14 +228,14 @@ struct spdk_bdev {
 	/** Unique product name for this kind of block device. */
 	char *product_name;
 
+	/** write cache enabled, not used at the moment */
+	int write_cache;
+
 	/** Size in bytes of a logical block for the backend */
 	uint32_t blocklen;
 
 	/** Number of blocks */
 	uint64_t blockcnt;
-
-	/** write cache enabled, not used at the moment */
-	int write_cache;
 
 	/**
 	 * This is used to make sure buffers are sector aligned.
@@ -309,11 +318,11 @@ struct spdk_bdev_io {
 	/** Enumerated value representing the I/O type. */
 	uint8_t type;
 
+	/** A single iovec element for use by this bdev_io. */
+	struct iovec iov;
+
 	union {
 		struct {
-			/** For basic IO case, use our own iovec element. */
-			struct iovec iov;
-
 			/** For SG buffer cases, array of iovecs to transfer. */
 			struct iovec *iovs;
 
@@ -365,6 +374,21 @@ struct spdk_bdev_io {
 	 *  must not read or write to these fields.
 	 */
 	struct __bdev_io_internal_fields {
+		/** The bdev I/O channel that this was handled on. */
+		struct spdk_bdev_channel *ch;
+
+		/** The bdev I/O channel that this was submitted on. */
+		struct spdk_bdev_channel *io_submit_ch;
+
+		/** User function that will be called when this completes */
+		spdk_bdev_io_completion_cb cb;
+
+		/** Context that will be passed to the completion callback */
+		void *caller_ctx;
+
+		/** Current tsc at submit time. Used to calculate latency at completion. */
+		uint64_t submit_tsc;
+
 		/** Error information from a device */
 		union {
 			/** Only valid when status is SPDK_BDEV_IO_STATUS_NVME_ERROR */
@@ -386,21 +410,6 @@ struct spdk_bdev_io {
 				uint8_t ascq;
 			} scsi;
 		} error;
-
-		/** The bdev I/O channel that this was handled on. */
-		struct spdk_bdev_channel *ch;
-
-		/** The bdev I/O channel that this was submitted on. */
-		struct spdk_bdev_channel *io_submit_ch;
-
-		/** User function that will be called when this completes */
-		spdk_bdev_io_completion_cb cb;
-
-		/** Context that will be passed to the completion callback */
-		void *caller_ctx;
-
-		/** Current tsc at submit time. Used to calculate latency at completion. */
-		uint64_t submit_tsc;
 
 		/**
 		 * Set to true while the bdev module submit_request function is in progress.
@@ -585,6 +594,20 @@ const struct spdk_bdev_aliases_list *spdk_bdev_get_aliases(const struct spdk_bde
 void spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, uint64_t len);
 
 /**
+ * Set the given buffer as the data buffer described by this bdev_io.
+ *
+ * The portion of the buffer used may be adjusted for memory alignement
+ * purposes.
+ *
+ * \param bdev_io I/O to set the buffer on.
+ * \param buf The buffer to set as the active data buffer.
+ * \param len The length of the buffer.
+ *
+ * \return The usable size of the buffer, after adjustments of alignment.
+ */
+size_t spdk_bdev_io_set_buf(struct spdk_bdev_io *bdev_io, void *buf, size_t len);
+
+/**
  * Complete a bdev_io
  *
  * \param bdev_io I/O to complete.
@@ -668,33 +691,68 @@ struct spdk_bdev_module *spdk_bdev_module_list_find(const char *name);
 static inline struct spdk_bdev_io *
 spdk_bdev_io_from_ctx(void *ctx)
 {
-	return (struct spdk_bdev_io *)
-	       ((uintptr_t)ctx - offsetof(struct spdk_bdev_io, driver_ctx));
+	return SPDK_CONTAINEROF(ctx, struct spdk_bdev_io, driver_ctx);
 }
 
 struct spdk_bdev_part_base;
 
-typedef void (*spdk_bdev_part_base_free_fn)(struct spdk_bdev_part_base *base);
+/**
+ * Returns a pointer to the spdk_bdev associated with an spdk_bdev_part_base
+ *
+ * \param part_base A pointer to an spdk_bdev_part_base object.
+ *
+ * \return A pointer to the base's spdk_bdev struct.
+ */
+struct spdk_bdev *spdk_bdev_part_base_get_bdev(struct spdk_bdev_part_base *part_base);
 
-struct spdk_bdev_part_base {
-	struct spdk_bdev		*bdev;
-	struct spdk_bdev_desc		*desc;
-	uint32_t			ref;
-	uint32_t			channel_size;
-	spdk_bdev_part_base_free_fn	base_free_fn;
-	bool				claimed;
-	struct spdk_bdev_module		*module;
-	struct spdk_bdev_fn_table	*fn_table;
-	struct bdev_part_tailq		*tailq;
-	spdk_io_channel_create_cb	ch_create_cb;
-	spdk_io_channel_destroy_cb	ch_destroy_cb;
-};
+/**
+ * Returns a pointer to the spdk_bdev_descriptor associated with an spdk_bdev_part_base
+ *
+ * \param part_base A pointer to an spdk_bdev_part_base object.
+ *
+ * \return A pointer to the base's spdk_bdev_desc struct.
+ */
+struct spdk_bdev_desc *spdk_bdev_part_base_get_desc(struct spdk_bdev_part_base *part_base);
+
+/**
+ * Returns a pointer to the tailq associated with an spdk_bdev_part_base
+ *
+ * \param part_base A pointer to an spdk_bdev_part_base object.
+ *
+ * \return The head of a tailq of spdk_bdev_part structs registered to the base's module.
+ */
+struct bdev_part_tailq *spdk_bdev_part_base_get_tailq(struct spdk_bdev_part_base *part_base);
+
+/**
+ * Returns a pointer to the module level context associated with an spdk_bdev_part_base
+ *
+ * \param part_base A pointer to an spdk_bdev_part_base object.
+ *
+ * \return A pointer to the module level context registered with the base in spdk_bdev_part_base_construct.
+ */
+void *spdk_bdev_part_base_get_ctx(struct spdk_bdev_part_base *part_base);
+
+typedef void (*spdk_bdev_part_base_free_fn)(void *ctx);
 
 struct spdk_bdev_part {
-	struct spdk_bdev		bdev;
-	struct spdk_bdev_part_base	*base;
-	uint64_t			offset_blocks;
+	/* Entry into the module's global list of bdev parts */
 	TAILQ_ENTRY(spdk_bdev_part)	tailq;
+
+	/**
+	 * Fields that are used internally by part.c These fields should only
+	 * be accessed from a module using any pertinent get and set methods.
+	 */
+	struct bdev_part_internal_fields {
+
+		/* This part's corresponding bdev object. Not to be confused with the base bdev */
+		struct spdk_bdev		bdev;
+
+		/* The base to which this part belongs */
+		struct spdk_bdev_part_base	*base;
+
+		/* number of blocks from the start of the base bdev to the start of this part */
+		uint64_t			offset_blocks;
+	} internal;
 };
 
 struct spdk_bdev_part_channel {
@@ -731,13 +789,13 @@ void spdk_bdev_part_base_hotremove(struct spdk_bdev *base_bdev, struct bdev_part
 /**
  * Construct a new spdk_bdev_part_base on top of the provided bdev.
  *
- * \param base User allocated spdk_bdev_part_base to be filled by this function.
  * \param bdev The spdk_bdev upon which this base will be built.
  * \param remove_cb Function to be called upon hotremove of the bdev.
  * \param module The module to which this bdev base belongs.
  * \param fn_table Function table for communicating with the bdev backend.
  * \param tailq The head of the list of all spdk_bdev_part structures registered to this base's module.
  * \param free_fn User provided function to free base related context upon bdev removal or shutdown.
+ * \param ctx Module specific context for this bdev part base.
  * \param channel_size Channel size in bytes.
  * \param ch_create_cb Called after a new channel is allocated.
  * \param ch_destroy_cb Called upon channel deletion.
@@ -745,15 +803,16 @@ void spdk_bdev_part_base_hotremove(struct spdk_bdev *base_bdev, struct bdev_part
  * \return 0 on success
  * \return -1 if the underlying bdev cannot be opened.
  */
-int spdk_bdev_part_base_construct(struct spdk_bdev_part_base *base, struct spdk_bdev *bdev,
-				  spdk_bdev_remove_cb_t remove_cb,
-				  struct spdk_bdev_module *module,
-				  struct spdk_bdev_fn_table *fn_table,
-				  struct bdev_part_tailq *tailq,
-				  spdk_bdev_part_base_free_fn free_fn,
-				  uint32_t channel_size,
-				  spdk_io_channel_create_cb ch_create_cb,
-				  spdk_io_channel_destroy_cb ch_destroy_cb);
+struct spdk_bdev_part_base *spdk_bdev_part_base_construct(struct spdk_bdev *bdev,
+		spdk_bdev_remove_cb_t remove_cb,
+		struct spdk_bdev_module *module,
+		struct spdk_bdev_fn_table *fn_table,
+		struct bdev_part_tailq *tailq,
+		spdk_bdev_part_base_free_fn free_fn,
+		void *ctx,
+		uint32_t channel_size,
+		spdk_io_channel_create_cb ch_create_cb,
+		spdk_io_channel_destroy_cb ch_destroy_cb);
 
 /**
  * Create a logical spdk_bdev_part on top of a base.
@@ -784,6 +843,47 @@ int spdk_bdev_part_construct(struct spdk_bdev_part *part, struct spdk_bdev_part_
  */
 void spdk_bdev_part_submit_request(struct spdk_bdev_part_channel *ch, struct spdk_bdev_io *bdev_io);
 
+/**
+ * Return a pointer to this part's spdk_bdev.
+ *
+ * \param part An spdk_bdev_part object.
+ *
+ * \return A pointer to this part's spdk_bdev object.
+ */
+struct spdk_bdev *spdk_bdev_part_get_bdev(struct spdk_bdev_part *part);
+
+/**
+ * Return a pointer to this part's base.
+ *
+ * \param part An spdk_bdev_part object.
+ *
+ * \return A pointer to this part's spdk_bdev_part_base object.
+ */
+struct spdk_bdev_part_base *spdk_bdev_part_get_base(struct spdk_bdev_part *part);
+
+/**
+ * Return a pointer to this part's base bdev.
+ *
+ * The return value of this function is equivalent to calling
+ * spdk_bdev_part_base_get_bdev on this part's base.
+ *
+ * \param part An spdk_bdev_part object.
+ *
+ * \return A pointer to the bdev belonging to this part's base.
+ */
+struct spdk_bdev *spdk_bdev_part_get_base_bdev(struct spdk_bdev_part *part);
+
+/**
+ * Return this part's offset from the beginning of the base bdev.
+ *
+ * This function should not be called in the I/O path. Any block
+ * translations to I/O will be handled in spdk_bdev_part_submit_request.
+ *
+ * \param part An spdk_bdev_part object.
+ *
+ * \return the block offset of this part from it's underlying bdev.
+ */
+uint64_t spdk_bdev_part_get_offset_blocks(struct spdk_bdev_part *part);
 
 /*
  * Macro used to register module for later initialization.

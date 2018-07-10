@@ -64,6 +64,16 @@ def construct_null_bdev(client, num_blocks, block_size, name, uuid=None):
     return client.call('construct_null_bdev', params)
 
 
+def delete_null_bdev(client, name):
+    """Remove null bdev from the system.
+
+    Args:
+        name: name of null bdev to delete
+    """
+    params = {'name': name}
+    return client.call('delete_null_bdev', params)
+
+
 def construct_aio_bdev(client, filename, name, block_size=None):
     """Construct a Linux AIO block device.
 
@@ -148,6 +158,16 @@ def construct_rbd_bdev(client, pool_name, rbd_name, block_size, name=None):
     return client.call('construct_rbd_bdev', params)
 
 
+def delete_rbd_bdev(client, name):
+    """Remove rbd bdev from the system.
+
+    Args:
+        name: name of rbd bdev to delete
+    """
+    params = {'name': name}
+    return client.call('delete_rbd_bdev', params)
+
+
 def construct_error_bdev(client, base_name):
     """Construct an error injection block device.
 
@@ -214,6 +234,16 @@ def construct_pmem_bdev(client, pmem_file, name):
     return client.call('construct_pmem_bdev', params)
 
 
+def delete_pmem_bdev(client, name):
+    """Remove pmem bdev from the system.
+
+    Args:
+        name: name of pmem bdev to delete
+    """
+    params = {'name': name}
+    return client.call('delete_pmem_bdev', params)
+
+
 def construct_passthru_bdev(client, base_bdev_name, passthru_bdev_name):
     """Construct a pass-through block device.
 
@@ -236,6 +266,16 @@ def construct_raid_bdev(client, args):
         'raid_bdev_name': args.raid_bdev_name,
     }
     return client.call('construct_raid_bdev', params)
+
+def delete_passthru_bdev(client, name):
+    """Remove pass through bdev from the system.
+
+    Args:
+        name: name of pass through bdev to delete
+    """
+    params = {'name': name}
+    return client.call('delete_passthru_bdev', params)
+
 
 def construct_split_vbdev(client, base_bdev, split_count, split_size_mb=None):
     """Construct split block devices from a base bdev.

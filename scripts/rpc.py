@@ -179,6 +179,15 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_null_bdev) 
 
     @call_cmd
+    def delete_null_bdev(args):
+        rpc.bdev.delete_null_bdev(args.client,
+                                  name=args.name)
+
+    p = subparsers.add_parser('delete_null_bdev', help='Delete a null bdev')
+    p.add_argument('name', help='null bdev name')
+    p.set_defaults(func=delete_null_bdev)
+
+    @call_cmd
     def construct_aio_bdev(args):
         print(rpc.bdev.construct_aio_bdev(args.client,
                                           filename=args.filename,
@@ -242,6 +251,15 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_rbd_bdev)
 
     @call_cmd
+    def delete_rbd_bdev(args):
+        rpc.bdev.delete_rbd_bdev(args.client,
+                                 name=args.name)
+
+    p = subparsers.add_parser('delete_rbd_bdev', help='Delete a rbd bdev')
+    p.add_argument('name', help='rbd bdev name')
+    p.set_defaults(func=delete_rbd_bdev)
+
+    @call_cmd
     def construct_error_bdev(args):
         print(rpc.bdev.construct_error_bdev(args.client,
                                             base_name=args.base_name))
@@ -295,6 +313,15 @@ if __name__ == "__main__":
     p.set_defaults(func=construct_pmem_bdev)
 
     @call_cmd
+    def delete_pmem_bdev(args):
+        rpc.bdev.delete_pmem_bdev(args.client,
+                                  name=args.name)
+
+    p = subparsers.add_parser('delete_pmem_bdev', help='Delete a pmem bdev')
+    p.add_argument('name', help='pmem bdev name')
+    p.set_defaults(func=delete_pmem_bdev)
+
+    @call_cmd
     def construct_passthru_bdev(args):
         print(rpc.bdev.construct_passthru_bdev(args.client,
                                                base_bdev_name=args.base_bdev_name,
@@ -303,7 +330,7 @@ if __name__ == "__main__":
     p = subparsers.add_parser('construct_passthru_bdev',
                               help='Add a pass through bdev on existing bdev')
     p.add_argument('-b', '--base-bdev-name', help="Name of the existing bdev", required=True)
-    p.add_argument('-p', '--passthru-bdev-name', help="Name of the passthru bdev", required=True)
+    p.add_argument('-p', '--passthru-bdev-name', help="Name of the pass through bdev", required=True)
     p.set_defaults(func=construct_passthru_bdev)
     
     @call_cmd
@@ -318,6 +345,15 @@ if __name__ == "__main__":
         'total_size', help='Size of null bdev in MB (int > 0)', type=int)
     p.add_argument('block_size', help='Block size for this bdev', type=int)
     p.set_defaults(func=construct_raid_bdev)  
+
+    @call_cmd
+    def delete_passthru_bdev(args):
+        rpc.bdev.delete_passthru_bdev(args.client,
+                                      name=args.name)
+
+    p = subparsers.add_parser('delete_passthru_bdev', help='Delete a pass through bdev')
+    p.add_argument('name', help='pass through bdev name')
+    p.set_defaults(func=delete_passthru_bdev)
 
     @call_cmd
     def get_bdevs(args):
@@ -880,7 +916,7 @@ if __name__ == "__main__":
 
     p = subparsers.add_parser('decouple_parent_lvol_bdev', help='Decouple parent of lvol')
     p.add_argument('name', help='lvol bdev name')
-    p.set_defaults(func=inflate_lvol_bdev)
+    p.set_defaults(func=decouple_parent_lvol_bdev)
 
     @call_cmd
     def resize_lvol_bdev(args):
@@ -1022,9 +1058,9 @@ if __name__ == "__main__":
     p.add_argument('-q', '--max-queue-depth', help='Max number of outstanding I/O per queue', type=int)
     p.add_argument('-p', '--max-qpairs-per-ctrlr', help='Max number of SQ and CQ per controller', type=int)
     p.add_argument('-c', '--in-capsule-data-size', help='Max number of in-capsule data size', type=int)
-    p.add_argument('-i', '--max-io-size', help='Max I/O size', type=int)
+    p.add_argument('-i', '--max-io-size', help='Max I/O size (bytes)', type=int)
     p.add_argument('-x', '--max-subsystems', help='Max number of NVMf subsystems', type=int)
-    p.add_argument('-u', '--io-unit-size', help='I/O unit size', type=int)
+    p.add_argument('-u', '--io-unit-size', help='I/O unit size (bytes)', type=int)
     p.set_defaults(func=set_nvmf_target_options)
 
     @call_cmd
@@ -1033,7 +1069,7 @@ if __name__ == "__main__":
                                         acceptor_poll_rate=args.acceptor_poll_rate)
 
     p = subparsers.add_parser('set_nvmf_target_config', help='Set NVMf target config')
-    p.add_argument('-r', '--acceptor-poll-rate', help='How often the acceptor polls for incoming connections', type=int)
+    p.add_argument('-r', '--acceptor-poll-rate', help='Polling interval of the acceptor for incoming connections (usec)', type=int)
     p.set_defaults(func=set_nvmf_target_config)
 
     @call_cmd
@@ -1373,12 +1409,13 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_dev(args):
-        print_dict(rpc.vhost.construct_virtio_dev(args.client,
-                                                  trtype=args.trtype,
-                                                  traddr=args.traddr,
-                                                  dev_type=args.dev_type,
-                                                  vq_count=args.vq_count,
-                                                  vq_size=args.vq_size))
+        print_array(rpc.vhost.construct_virtio_dev(args.client,
+                                                   name=args.name,
+                                                   trtype=args.trtype,
+                                                   traddr=args.traddr,
+                                                   dev_type=args.dev_type,
+                                                   vq_count=args.vq_count,
+                                                   vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_dev', help="""Construct new virtio device using provided
     transport type and device type. In case of SCSI device type this implies scan and add bdevs offered by
@@ -1396,11 +1433,11 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_user_scsi_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_user_scsi_bdev(args.client,
-                                                             path=args.path,
-                                                             name=args.name,
-                                                             vq_count=args.vq_count,
-                                                             vq_size=args.vq_size))
+        print_array(rpc.vhost.construct_virtio_user_scsi_bdev(args.client,
+                                                              path=args.path,
+                                                              name=args.name,
+                                                              vq_count=args.vq_count,
+                                                              vq_size=args.vq_size))
 
     p = subparsers.add_parser('construct_virtio_user_scsi_bdev', help="""Connect to virtio user scsi device.
     This imply scan and add bdevs offered by remote side.
@@ -1414,9 +1451,9 @@ if __name__ == "__main__":
 
     @call_cmd
     def construct_virtio_pci_scsi_bdev(args):
-        print_dict(rpc.vhost.construct_virtio_pci_scsi_bdev(args.client,
-                                                            pci_address=args.pci_address,
-                                                            name=args.name))
+        print_array(rpc.vhost.construct_virtio_pci_scsi_bdev(args.client,
+                                                             pci_address=args.pci_address,
+                                                             name=args.name))
 
     p = subparsers.add_parser('construct_virtio_pci_scsi_bdev', help="""Create a Virtio
     SCSI device from a virtio-pci device.""")

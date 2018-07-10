@@ -305,94 +305,6 @@ basic(void)
 	teardown_test();
 }
 
-static int
-poller_run_done(void *ctx)
-{
-	bool	*poller_run = ctx;
-
-	*poller_run = true;
-
-	return -1;
-}
-
-static int
-poller_run_times_done(void *ctx)
-{
-	int	*poller_run_times = ctx;
-
-	(*poller_run_times)++;
-
-	return -1;
-}
-
-static void
-basic_poller(void)
-{
-	struct spdk_poller	*poller = NULL;
-	bool			poller_run = false;
-	int			poller_run_times = 0;
-
-	setup_test();
-
-	set_thread(0);
-	reset_time();
-	/* Register a poller with no-wait time and test execution */
-	poller = spdk_poller_register(poller_run_done, &poller_run, 0);
-	CU_ASSERT(poller != NULL);
-
-	poll_threads();
-	CU_ASSERT(poller_run == true);
-
-	spdk_poller_unregister(&poller);
-	CU_ASSERT(poller == NULL);
-
-	/* Register a poller with 1000us wait time and test single execution */
-	poller_run = false;
-	poller = spdk_poller_register(poller_run_done, &poller_run, 1000);
-	CU_ASSERT(poller != NULL);
-
-	poll_threads();
-	CU_ASSERT(poller_run == false);
-
-	increment_time(1000);
-	poll_threads();
-	CU_ASSERT(poller_run == true);
-
-	reset_time();
-	poller_run = false;
-	poll_threads();
-	CU_ASSERT(poller_run == false);
-
-	increment_time(1000);
-	poll_threads();
-	CU_ASSERT(poller_run == true);
-
-	spdk_poller_unregister(&poller);
-	CU_ASSERT(poller == NULL);
-
-	reset_time();
-	/* Register a poller with 1000us wait time and test multiple execution */
-	poller = spdk_poller_register(poller_run_times_done, &poller_run_times, 1000);
-	CU_ASSERT(poller != NULL);
-
-	poll_threads();
-	CU_ASSERT(poller_run_times == 0);
-
-	increment_time(1000);
-	poll_threads();
-	CU_ASSERT(poller_run_times == 1);
-
-	poller_run_times = 0;
-	increment_time(2000);
-	poll_threads();
-	CU_ASSERT(poller_run_times == 2);
-
-	spdk_poller_unregister(&poller);
-	CU_ASSERT(poller == NULL);
-
-	teardown_test();
-}
-
 static void
 reset_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -441,7 +353,8 @@ static void
 aborted_reset(void)
 {
 	struct spdk_io_channel *io_ch[2];
-	enum spdk_bdev_io_status status1, status2;
+	enum spdk_bdev_io_status status1 = SPDK_BDEV_IO_STATUS_PENDING,
+				 status2 = SPDK_BDEV_IO_STATUS_PENDING;
 
 	setup_test();
 
@@ -1149,7 +1062,8 @@ qos_dynamic_enable(void)
 	struct spdk_io_channel *io_ch[2];
 	struct spdk_bdev_channel *bdev_ch[2];
 	struct spdk_bdev *bdev;
-	int status, second_status;
+	enum spdk_bdev_io_status bdev_io_status[2];
+	int status, second_status, rc, i;
 
 	setup_test();
 	reset_time();
@@ -1179,6 +1093,38 @@ qos_dynamic_enable(void)
 	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) != 0);
 	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) != 0);
 
+	/*
+	 * Submit and complete 10 I/O to fill the QoS allotment for this timeslice.
+	 * Additional I/O will then be queued.
+	 */
+	set_thread(0);
+	for (i = 0; i < 10; i++) {
+		bdev_io_status[0] = SPDK_BDEV_IO_STATUS_PENDING;
+		rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &bdev_io_status[0]);
+		CU_ASSERT(rc == 0);
+		CU_ASSERT(bdev_io_status[0] == SPDK_BDEV_IO_STATUS_PENDING);
+		poll_thread(0);
+		stub_complete_io(g_bdev.io_target, 0);
+		CU_ASSERT(bdev_io_status[0] == SPDK_BDEV_IO_STATUS_SUCCESS);
+	}
+
+	/*
+	 * Send two more I/O.  These I/O will be queued since the current timeslice allotment has been
+	 * filled already.  We want to test that when QoS is disabled that these two I/O:
+	 *  1) are not aborted
+	 *  2) are sent back to their original thread for resubmission
+	 */
+	bdev_io_status[0] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[0], NULL, 0, 1, io_during_io_done, &bdev_io_status[0]);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(bdev_io_status[0] == SPDK_BDEV_IO_STATUS_PENDING);
+	set_thread(1);
+	bdev_io_status[1] = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_read_blocks(g_desc, io_ch[1], NULL, 0, 1, io_during_io_done, &bdev_io_status[1]);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(bdev_io_status[1] == SPDK_BDEV_IO_STATUS_PENDING);
+	poll_threads();
+
 	/* Disable QoS */
 	status = -1;
 	spdk_bdev_set_qos_limit_iops(bdev, 0, qos_dynamic_enable_done, &status);
@@ -1186,6 +1132,22 @@ qos_dynamic_enable(void)
 	CU_ASSERT(status == 0);
 	CU_ASSERT((bdev_ch[0]->flags & BDEV_CH_QOS_ENABLED) == 0);
 	CU_ASSERT((bdev_ch[1]->flags & BDEV_CH_QOS_ENABLED) == 0);
+
+	/*
+	 * All I/O should have been resubmitted back on their original thread.  Complete
+	 *  all I/O on thread 0, and ensure that only the thread 0 I/O was completed.
+	 */
+	set_thread(0);
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(bdev_io_status[0] == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(bdev_io_status[1] == SPDK_BDEV_IO_STATUS_PENDING);
+
+	/* Now complete all I/O on thread 1 and ensure the thread 1 I/O was completed. */
+	set_thread(1);
+	stub_complete_io(g_bdev.io_target, 0);
+	poll_threads();
+	CU_ASSERT(bdev_io_status[1] == SPDK_BDEV_IO_STATUS_SUCCESS);
 
 	/* Disable QoS again */
 	status = -1;
@@ -1258,7 +1220,6 @@ main(int argc, char **argv)
 
 	if (
 		CU_add_test(suite, "basic", basic) == NULL ||
-		CU_add_test(suite, "basic_poller", basic_poller) == NULL ||
 		CU_add_test(suite, "basic_qos", basic_qos) == NULL ||
 		CU_add_test(suite, "put_channel_during_reset", put_channel_during_reset) == NULL ||
 		CU_add_test(suite, "aborted_reset", aborted_reset) == NULL ||

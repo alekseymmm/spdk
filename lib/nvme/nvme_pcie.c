@@ -316,14 +316,14 @@ static inline struct nvme_pcie_ctrlr *
 nvme_pcie_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 {
 	assert(ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE);
-	return (struct nvme_pcie_ctrlr *)((uintptr_t)ctrlr - offsetof(struct nvme_pcie_ctrlr, ctrlr));
+	return SPDK_CONTAINEROF(ctrlr, struct nvme_pcie_ctrlr, ctrlr);
 }
 
 static inline struct nvme_pcie_qpair *
 nvme_pcie_qpair(struct spdk_nvme_qpair *qpair)
 {
 	assert(qpair->trtype == SPDK_NVME_TRANSPORT_PCIE);
-	return (struct nvme_pcie_qpair *)((uintptr_t)qpair - offsetof(struct nvme_pcie_qpair, qpair));
+	return SPDK_CONTAINEROF(qpair, struct nvme_pcie_qpair, qpair);
 }
 
 static volatile void *
@@ -969,7 +969,6 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair)
 	struct nvme_tracker	*tr;
 	uint16_t		i;
 	volatile uint32_t	*doorbell_base;
-	uint64_t		phys_addr = 0;
 	uint64_t		offset;
 	uint16_t		num_trackers;
 	size_t			page_size = sysconf(_SC_PAGESIZE);
@@ -1028,7 +1027,7 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair)
 	 *   This ensures the PRP list embedded in the nvme_tracker object will not span a
 	 *   4KB boundary, while allowing access to trackers in tr[] via normal array indexing.
 	 */
-	pqpair->tr = spdk_dma_zmalloc(num_trackers * sizeof(*tr), sizeof(*tr), &phys_addr);
+	pqpair->tr = spdk_dma_zmalloc(num_trackers * sizeof(*tr), sizeof(*tr), NULL);
 	if (pqpair->tr == NULL) {
 		SPDK_ERRLOG("nvme_tr failed\n");
 		return -ENOMEM;
@@ -1039,9 +1038,8 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair)
 
 	for (i = 0; i < num_trackers; i++) {
 		tr = &pqpair->tr[i];
-		nvme_qpair_construct_tracker(tr, i, phys_addr);
+		nvme_qpair_construct_tracker(tr, i, spdk_vtophys(tr));
 		TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
-		phys_addr += sizeof(struct nvme_tracker);
 	}
 
 	nvme_pcie_qpair_reset(qpair);
@@ -1761,6 +1759,8 @@ nvme_pcie_qpair_build_contig_request(struct spdk_nvme_qpair *qpair, struct nvme_
 	return 0;
 }
 
+#define _2MB_OFFSET(ptr)	(((uintptr_t)(ptr)) &  (0x200000 - 1))
+
 /**
  * Build SGL list describing scattered payload buffer.
  */
@@ -1771,7 +1771,7 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 	int rc;
 	void *virt_addr;
 	uint64_t phys_addr;
-	uint32_t remaining_transfer_len, length;
+	uint32_t remaining_transfer_len, remaining_user_sge_len, length;
 	struct spdk_nvme_sgl_descriptor *sgl;
 	uint32_t nseg = 0;
 
@@ -1791,33 +1791,46 @@ nvme_pcie_qpair_build_hw_sgl_request(struct spdk_nvme_qpair *qpair, struct nvme_
 	remaining_transfer_len = req->payload_size;
 
 	while (remaining_transfer_len > 0) {
-		if (nseg >= NVME_MAX_SGL_DESCRIPTORS) {
-			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
-			return -1;
-		}
-
-		rc = req->payload.next_sge_fn(req->payload.contig_or_cb_arg, &virt_addr, &length);
+		rc = req->payload.next_sge_fn(req->payload.contig_or_cb_arg,
+					      &virt_addr, &remaining_user_sge_len);
 		if (rc) {
 			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
 			return -1;
 		}
 
-		phys_addr = spdk_vtophys(virt_addr);
-		if (phys_addr == SPDK_VTOPHYS_ERROR) {
-			nvme_pcie_fail_request_bad_vtophys(qpair, tr);
-			return -1;
+		remaining_user_sge_len = spdk_min(remaining_user_sge_len, remaining_transfer_len);
+		remaining_transfer_len -= remaining_user_sge_len;
+		while (remaining_user_sge_len > 0) {
+			if (nseg >= NVME_MAX_SGL_DESCRIPTORS) {
+				nvme_pcie_fail_request_bad_vtophys(qpair, tr);
+				return -1;
+			}
+
+			phys_addr = spdk_vtophys(virt_addr);
+			if (phys_addr == SPDK_VTOPHYS_ERROR) {
+				nvme_pcie_fail_request_bad_vtophys(qpair, tr);
+				return -1;
+			}
+
+			length = spdk_min(remaining_user_sge_len, 0x200000 - _2MB_OFFSET(virt_addr));
+			remaining_user_sge_len -= length;
+			virt_addr += length;
+
+			if (nseg > 0 && phys_addr ==
+			    (*(sgl - 1)).address + (*(sgl - 1)).unkeyed.length) {
+				/* extend previous entry */
+				(*(sgl - 1)).unkeyed.length += length;
+				continue;
+			}
+
+			sgl->unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+			sgl->unkeyed.length = length;
+			sgl->address = phys_addr;
+			sgl->unkeyed.subtype = 0;
+
+			sgl++;
+			nseg++;
 		}
-
-		length = spdk_min(remaining_transfer_len, length);
-		remaining_transfer_len -= length;
-
-		sgl->unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
-		sgl->unkeyed.length = length;
-		sgl->address = phys_addr;
-		sgl->unkeyed.subtype = 0;
-
-		sgl++;
-		nseg++;
 	}
 
 	if (nseg == 1) {

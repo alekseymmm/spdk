@@ -62,7 +62,7 @@ static struct spdk_bdev_module passthru_if = {
 	.module_init = vbdev_passthru_init,
 	.config_text = vbdev_passthru_get_spdk_running_config,
 	.get_ctx_size = vbdev_passthru_get_ctx_size,
-	.examine = vbdev_passthru_examine,
+	.examine_config = vbdev_passthru_examine,
 	.module_fini = vbdev_passthru_finish
 };
 
@@ -567,6 +567,17 @@ create_passthru_disk(const char *bdev_name, const char *vbdev_name)
 	vbdev_passthru_register(bdev);
 
 	return 0;
+}
+
+void
+delete_passthru_disk(struct spdk_bdev *bdev, spdk_delete_passthru_complete cb_fn, void *cb_arg)
+{
+	if (!bdev || bdev->module != &passthru_if) {
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
 }
 
 /* Because we specified this function in our pt bdev function table when we

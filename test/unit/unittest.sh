@@ -9,6 +9,8 @@ set -xe
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $(dirname $0)/../..)
 
+cd "$rootdir"
+
 # if ASAN is enabled, use it.  If not use valgrind if installed but allow
 # the env variable to override the default shown below.
 if [ -z ${valgrind+x} ]; then
@@ -119,9 +121,6 @@ $valgrind $testdir/lib/util/string.c/string_ut
 
 if [ $(uname -s) = Linux ]; then
 $valgrind $testdir/lib/vhost/vhost.c/vhost_ut
-$valgrind $testdir/lib/vhost/vhost_scsi.c/vhost_scsi_ut
-$valgrind $testdir/lib/vhost/vhost_blk.c/vhost_blk_ut
-$valgrind $testdir/lib/vhost/vhost_nvme.c/vhost_nvme_ut
 fi
 
 # local unit test coverage
@@ -151,7 +150,7 @@ echo "====================="
 echo "All unit tests passed"
 echo "====================="
 if [ "$cov_avail" = "yes" ]; then
-	echo "Note: coverage report is here: ./$UT_COVERAGE"
+	echo "Note: coverage report is here: $rootdir/$UT_COVERAGE"
 else
 	echo "WARN: lcov not installed or SPDK built without coverage!"
 fi

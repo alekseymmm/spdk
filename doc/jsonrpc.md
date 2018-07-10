@@ -52,7 +52,9 @@ enabled                 | Optional | boolean     | Enable (`true`) or disable (`
 
 ### Response
 
-The current state of context switch monitoring is returned as a boolean.
+Name                    | Type        | Description
+----------------------- | ----------- | -----------
+enabled                 | boolean     | The current state of context switch monitoring
 
 ### Example
 
@@ -73,17 +75,327 @@ Example response:
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": false
+  "result": {
+    "enabled": false
+  }
 }
 ~~~
 
+## start_subsystem_init {#rpc_start_subsystem_init}
+
+Start initialization of SPDK subsystems when it is deferred by starting SPDK application with option -w.
+During its deferral some RPCs can be used to set global parameters for SPDK subsystems.
+This RPC can be called only once.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+Completion status of SPDK subsystem initialization is returned as a boolean.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "start_subsystem_init"
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## get_rpc_methods {#rpc_get_rpc_methods}
+
+Get an array of supported RPC methods.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+current                 | Optional | boolean     | Get an array of RPC methods only callable in the current state.
+
+### Response
+
+The response is an array of supported RPC methods.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_rpc_methods"
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    "start_subsystem_init",
+    "get_rpc_methods",
+    "get_scsi_devices",
+    "get_interfaces",
+    "delete_ip_address",
+    "add_ip_address",
+    "get_nbd_disks",
+    "stop_nbd_disk",
+    "start_nbd_disk",
+    "get_trace_flags",
+    "clear_trace_flag",
+    "set_trace_flag",
+    "get_log_level",
+    "set_log_level",
+    "get_log_print_level",
+    "set_log_print_level",
+    "get_iscsi_global_params",
+    "target_node_add_lun",
+    "get_iscsi_connections",
+    "delete_portal_group",
+    "add_portal_group",
+    "get_portal_groups",
+    "delete_target_node",
+    "delete_pg_ig_maps",
+    "add_pg_ig_maps",
+    "construct_target_node",
+    "get_target_nodes",
+    "delete_initiator_group",
+    "delete_initiators_from_initiator_group",
+    "add_initiators_to_initiator_group",
+    "add_initiator_group",
+    "get_initiator_groups",
+    "set_iscsi_options",
+    "set_bdev_options",
+    "set_bdev_qos_limit_iops",
+    "delete_bdev",
+    "get_bdevs_config",
+    "get_bdevs",
+    "get_bdevs_iostat",
+    "get_subsystem_config",
+    "get_subsystems",
+    "context_switch_monitor",
+    "kill_instance",
+    "scan_ioat_copy_engine",
+    "construct_virtio_dev",
+    "construct_virtio_pci_blk_bdev",
+    "construct_virtio_user_blk_bdev",
+    "get_virtio_scsi_devs",
+    "remove_virtio_scsi_bdev",
+    "construct_virtio_pci_scsi_bdev",
+    "construct_virtio_user_scsi_bdev",
+    "delete_aio_bdev",
+    "construct_aio_bdev",
+    "destruct_split_vbdev",
+    "construct_split_vbdev",
+    "bdev_inject_error",
+    "delete_error_bdev",
+    "construct_error_bdev",
+    "construct_passthru_bdev",
+    "apply_nvme_firmware",
+    "construct_nvme_bdev",
+    "construct_null_bdev",
+    "delete_malloc_bdev",
+    "construct_malloc_bdev",
+    "get_lvol_stores",
+    "destroy_lvol_bdev",
+    "resize_lvol_bdev",
+    "decouple_parent_lvol_bdev",
+    "inflate_lvol_bdev",
+    "rename_lvol_bdev",
+    "clone_lvol_bdev",
+    "snapshot_lvol_bdev",
+    "construct_lvol_bdev",
+    "destroy_lvol_store",
+    "rename_lvol_store",
+    "construct_lvol_store"
+  ]
+}
+~~~
+
+## get_subsystems {#rpc_get_subsystems}
+
+Get an array of name and dependency relationship of SPDK subsystems in initialization order.
+
+### Parameters
+
+None
+
+### Response
+
+The response is an array of name and dependency relationship of SPDK subsystems in initialization order.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_subsystems"
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "subsystem": "copy",
+      "depends_on": []
+    },
+    {
+      "subsystem": "interface",
+      "depends_on": []
+    },
+    {
+      "subsystem": "net_framework",
+      "depends_on": [
+        "interface"
+      ]
+    },
+    {
+      "subsystem": "bdev",
+      "depends_on": [
+        "copy"
+      ]
+    },
+    {
+      "subsystem": "nbd",
+      "depends_on": [
+        "bdev"
+      ]
+    },
+    {
+      "subsystem": "nvmf",
+      "depends_on": [
+        "bdev"
+      ]
+    },
+    {
+      "subsystem": "scsi",
+      "depends_on": [
+        "bdev"
+      ]
+    },
+    {
+      "subsystem": "vhost",
+      "depends_on": [
+        "scsi"
+      ]
+    },
+    {
+      "subsystem": "iscsi",
+      "depends_on": [
+        "scsi"
+      ]
+    }
+  ]
+}
+~~~
+
+## get_subsystem_config {#rpc_get_subsystem_config}
+
+Get current configuration of the specified SPDK subsystem
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | SPDK subsystem name
+
+### Response
+
+The response is current configuration of the specfied SPDK subsystem.
+Null is returned if it is not retrievable by the get_subsystem_config method and empty array is returned if it is empty.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "get_subsystem_config",
+  "params": {
+    "name": "bdev"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "params": {
+        "base_bdev": "Malloc2",
+        "split_size_mb": 0,
+        "split_count": 2
+      },
+      "method": "construct_split_vbdev"
+    },
+    {
+      "params": {
+        "trtype": "PCIe",
+        "name": "Nvme1",
+        "traddr": "0000:01:00.0"
+      },
+      "method": "construct_nvme_bdev"
+    },
+    {
+      "params": {
+        "trtype": "PCIe",
+        "name": "Nvme2",
+        "traddr": "0000:03:00.0"
+      },
+      "method": "construct_nvme_bdev"
+    },
+    {
+      "params": {
+        "block_size": 512,
+        "num_blocks": 131072,
+        "name": "Malloc0",
+        "uuid": "913fc008-79a7-447f-b2c4-c73543638c31"
+      },
+      "method": "construct_malloc_bdev"
+    },
+    {
+      "params": {
+        "block_size": 512,
+        "num_blocks": 131072,
+        "name": "Malloc1",
+        "uuid": "dd5b8f6e-b67a-4506-b606-7fff5a859920"
+      },
+      "method": "construct_malloc_bdev"
+    }
+  ]
+}
+~~~
 
 # Block Device Abstraction Layer {#jsonrpc_components_bdev}
 
 ## set_bdev_options {#rpc_set_bdev_options}
 
 Set global parameters for the block device (bdev) subsystem.  This RPC may only be called
-before subsystems have been initialized.
+before SPDK subsystems have been initialized.
 
 ### Parameters
 
@@ -683,6 +995,551 @@ Example request:
 
 Example response:
 
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## set_nvmf_target_options {#rpc_set_nvmf_target_options}
+
+Set global parameters for the NVMe-oF target.  This RPC may only be called before SPDK subsystems
+have been initialized.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+max_queue_depth         | Optional | number      | Maximum number of outstanding I/Os per queue
+max_qpairs_per_ctrlr    | Optional | number      | Maximum number of SQ and CQ per controller
+in_capsule_data_size    | Optional | number      | Maximum number of in-capsule data size
+max_io_size             | Optional | number      | Maximum I/O size (bytes)
+max_subsystems          | Optional | number      | Maximum number of NVMe-oF subsystems
+io_unit_size            | Optional | number      | I/O unit size (bytes)
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "set_nvmf_target_options",
+  "params": {
+    "in_capsule_data_size": 4096,
+    "io_unit_size": 131072,
+    "max_qpairs_per_ctrlr": 64,
+    "max_queue_depth": 128,
+    "max_io_size": 131072,
+    "max_subsystems": 1024
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## set_nvmf_target_config {#rpc_set_nvmf_target_config}
+
+Set global configuration of NVMe-oF target.  This RPC may only be called before SPDK subsystems
+have been initialized.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+acceptor_poll_rate      | Optional | number      | Polling interval of the acceptor for incoming connections (microseconds)
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "set_nvmf_target_config",
+  "params": {
+    "acceptor_poll_rate": 10000
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+# Logical Volume {#jsonrpc_components_lvol}
+
+Identification of logical volume store and logical volume is explained first.
+
+A logical volume store has a UUID and a name for its identification.
+The UUID is generated on creation and it can be used as a unique identifier.
+The name is specified on creation and can be renamed.
+Either UUID or name is used to access logical volume store in RPCs.
+
+A logical volume has a UUID and a name for its identification.
+The UUID of the logical volume is generated on creation and it can be unique identifier.
+The alias of the logical volume takes the format _lvs_name/lvol_name_ where:
+* _lvs_name_ is the name of the logical volume store.
+* _lvol_name_ is specified on creation and can be renamed.
+
+## construct_lvol_store {#rpc_construct_lvol_store}
+
+Construct a logical volume store.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+bdev_name               | Required | string      | Bdev on which to construct logical volume store
+lvs_name                | Required | string      | Name of the logical volume store to create
+cluster_sz              | Optional | number      | Cluster size of the logical volume store in bytes
+
+### Reponse
+
+UUID of the created logical volume store is returned.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "construct_lvol_store",
+  "params": {
+    "lvs_name": "LVS0",
+    "bdev_name": "Malloc0"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "a9959197-b5e2-4f2d-8095-251ffb6985a5"
+}
+~~~
+
+## destroy_lvol_store {#rpc_destroy_lvol_store}
+
+Destroy a logical volume store.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+uuid                    | Optional | string      | UUID of the logical volume store to destroy
+lvs_name                | Optional | string      | Name of the logical volume store to destroy
+
+Either uuid or lvs_name must be specified, but not both.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "destroy_lvol_store",
+  "id": 1
+  "params": {
+    "uuid": "a9959197-b5e2-4f2d-8095-251ffb6985a5"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## get_lvol_stores {#rpc_get_lvol_stores}
+
+Get a list of logical volume stores.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+uuid                    | Optional | string      | UUID of the logical volume store to retrieve information about
+lvs_name                | Optional | string      | Name of the logical volume store to retrieve information about
+
+Either uuid or lvs_name may be specified, but not both.
+If both uuid and lvs_name are omitted, information about all logical volume stores is returned.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "get_lvol_stores",
+  "id": 1,
+  "params": {
+    "lvs_name": "LVS0"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "uuid": "a9959197-b5e2-4f2d-8095-251ffb6985a5",
+      "base_bdev": "Malloc0",
+      "free_clusters": 31,
+      "cluster_size": 4194304,
+      "total_data_clusters": 31,
+      "block_size": 4096,
+      "name": "LVS0"
+    }
+  ]
+}
+~~~
+
+## rename_lvol_store {#rpc_rename_lvol_store}
+
+Rename a logical volume store.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+old_name                | Required | string      | Existing logical volume store name
+new_name                | Required | string      | New logical volume store name
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "rename_lvol_store",
+  "id": 1,
+  "params": {
+    "old_name": "LVS0",
+    "new_name": "LVS2"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## construct_lvol_bdev {#rpc_construct_lvol_bdev}
+
+Create a logical volume on a logical volume store.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+lvol_name               | Required | string      | Name of logical volume to create
+size                    | Required | number      | Desired size of logical volume in bytes
+thin_provision          | Optional | boolean     | True to enable thin provisioning
+uuid                    | Optional | string      | UUID of logical volume store to create logical volume on
+lvs_name                | Optional | string      | Name of logical volume store to create logical volume on
+
+Size will be rounded up to a multiple of cluster size. Either uuid or lvs_name must be specified, but not both.
+lvol_name will be used in the alias of the created logical volume.
+
+### Response
+
+UUID of the created logical volume is returned.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "construct_lvol_bdev",
+  "id": 1,
+  "params": {
+    "lvol_name": "LVOL0",
+    "size": 1048576,
+    "lvs_name": "LVS0",
+    "thin_provision": true
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "1b38702c-7f0c-411e-a962-92c6a5a8a602"
+}
+~~~
+
+## snapshot_lvol_bdev {#rpc_snapshot_lvol_bdev}
+
+Capture a snapshot of the current state of a logical volume.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+lvol_name               | Required | string      | UUID or alias of the logical volume to create a snapshot from
+snapshot_name           | Required | string      | Name for the newly created snapshot
+
+### Response
+
+UUID of the created logical volume snapshot is returned.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "snapshot_lvol_bdev",
+  "id": 1,
+  "params": {
+    "lvol_name": "1b38702c-7f0c-411e-a962-92c6a5a8a602",
+    "snapshot_name": "SNAP1"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "cc8d7fdf-7865-4d1f-9fc6-35da8e368670"
+}
+~~~
+
+## clone_lvol_bdev {#rpc_clone_lvol_bdev}
+
+Create a logical volume based on a snapshot.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+snapshot_name           | Required | string      | UUID or alias of the snapshot to clone
+clone_name              | Required | string      | Name for the logical volume to create
+
+### Response
+
+UUID of the created logical volume clone is returned.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0"
+  "method": "clone_lvol_bdev",
+  "id": 1,
+  "params": {
+    "snapshot_name": "cc8d7fdf-7865-4d1f-9fc6-35da8e368670",
+    "clone_name": "CLONE1"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "8d87fccc-c278-49f0-9d4c-6237951aca09"
+}
+~~~
+
+## rename_lvol_bdev {#rpc_rename_lvol_bdev}
+
+Rename a logical volume. New name will rename only the alias of the logical volume.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+old_name                | Required | string      | UUID or alias of the existing logical volume
+new_name                | Required | string      | New logical volume name
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "rename_lvol_bdev",
+  "id": 1,
+  "params": {
+    "old_name": "067df606-6dbc-4143-a499-0d05855cb3b8",
+    "new_name": "LVOL2"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## resize_lvol_bdev {#rpc_resize_lvol_bdev}
+
+Resize a logical volume.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the logical volume to resize
+size                    | Required | number      | Desired size of the logical volume in bytes
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "resize_lvol_bdev",
+  "id": 1,
+  "params": {
+    "name": "51638754-ca16-43a7-9f8f-294a0805ab0a",
+    "size": 2097152
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## destroy_lvol_bdev {#rpc_destroy_lvol_bdev}
+
+Destroy a logical volume.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the logical volume to destroy
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "destroy_lvol_bdev",
+  "id": 1,
+  "params": {
+    "name": "51638754-ca16-43a7-9f8f-294a0805ab0a"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## inflate_lvol_bdev {#rpc_inflate_lvol_bdev}
+
+Inflate a logical volume. All unallocated clusters are allocated and copied from the parent or zero filled if not allocated in the parent. Then all dependencies on the parent are removed.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the logical volume to inflate
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "inflate_lvol_bdev",
+  "id": 1,
+  "params": {
+    "name": "8d87fccc-c278-49f0-9d4c-6237951aca09"
+  }
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## decouple_parent_lvol_bdev {#rpc_decouple_parent_lvol_bdev}
+
+Decouple the parent of a logical volume. For unallocated clusters which is allocated in the parent, they are allocated and copied from the parent, but for unallocated clusters which is thin provisioned in the parent, they are kept thin provisioned. Then all dependencies on the parent are removed.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | UUID or alias of the logical volume to decouple the parent of it
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "decouple_parent_lvol_bdev",
+  "id": 1.
+  "params": {
+    "name": "8d87fccc-c278-49f0-9d4c-6237951aca09"
+  }
+}
+~~~
+
+Example response:
 ~~~
 {
   "jsonrpc": "2.0",

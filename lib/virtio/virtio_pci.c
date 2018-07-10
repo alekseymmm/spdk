@@ -146,7 +146,7 @@ io_write64_twopart(uint64_t val, uint32_t *lo, uint32_t *hi)
 	spdk_mmio_write_4(hi, val >> 32);
 }
 
-static void
+static int
 modern_read_dev_config(struct virtio_dev *dev, size_t offset,
 		       void *dst, int length)
 {
@@ -165,9 +165,11 @@ modern_read_dev_config(struct virtio_dev *dev, size_t offset,
 
 		new_gen = spdk_mmio_read_1(&hw->common_cfg->config_generation);
 	} while (old_gen != new_gen);
+
+	return 0;
 }
 
-static void
+static int
 modern_write_dev_config(struct virtio_dev *dev, size_t offset,
 			const void *src, int length)
 {
@@ -178,6 +180,8 @@ modern_write_dev_config(struct virtio_dev *dev, size_t offset,
 	for (i = 0;  i < length; i++) {
 		spdk_mmio_write_1(((uint8_t *)hw->dev_cfg) + offset + i, *p++);
 	}
+
+	return 0;
 }
 
 static uint64_t
@@ -257,6 +261,16 @@ modern_setup_queue(struct virtio_dev *dev, struct virtqueue *vq)
 	struct virtio_hw *hw = dev->ctx;
 	uint64_t desc_addr, avail_addr, used_addr;
 	uint16_t notify_off;
+	void *queue_mem;
+	uint64_t queue_mem_phys_addr;
+
+	queue_mem = spdk_dma_zmalloc(vq->vq_ring_size, VIRTIO_PCI_VRING_ALIGN, &queue_mem_phys_addr);
+	if (queue_mem == NULL) {
+		return -ENOMEM;
+	}
+
+	vq->vq_ring_mem = queue_mem_phys_addr;
+	vq->vq_ring_virt_mem = queue_mem;
 
 	if (!check_vq_phys_addr_ok(vq)) {
 		return -1;
@@ -307,6 +321,8 @@ modern_del_queue(struct virtio_dev *dev, struct virtqueue *vq)
 			   &hw->common_cfg->queue_used_hi);
 
 	spdk_mmio_write_2(&hw->common_cfg->queue_enable, 0);
+
+	spdk_dma_free(vq->vq_ring_virt_mem);
 }
 
 static void

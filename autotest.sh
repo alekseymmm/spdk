@@ -141,6 +141,10 @@ if [ $SPDK_TEST_VHOST -eq 1 ]; then
 	run_test ./test/vhost/spdk_vhost.sh --negative
 	timing_exit negative
 
+	timing_enter vhost_json_config
+	run_test ./test/vhost/json_config/json_config.sh
+	timing_exit vhost_json_config
+
 	if [ $RUN_NIGHTLY -eq 1 ]; then
 		timing_enter integrity_blk
 		run_test ./test/vhost/spdk_vhost.sh --integrity-blk
@@ -199,11 +203,17 @@ fi
 
 if [ $SPDK_TEST_VHOST_INIT -eq 1 ]; then
 	run_test ./test/vhost/initiator/blockdev.sh
+	run_test ./test/vhost/initiator/json_config.sh
 	report_test_completion "vhost_initiator"
 fi
 
 if [ $SPDK_TEST_PMDK -eq 1 ]; then
 	run_test ./test/pmem/pmem.sh -x
+	run_test ./test/pmem/json_config/json_config.sh
+fi
+
+if [ $SPDK_TEST_RBD -eq 1 ]; then
+	run_test ./test/bdev/bdevjson/rbd_json_config.sh
 fi
 
 timing_enter cleanup
