@@ -22,6 +22,7 @@
 
 int blk_req_pool_iter = 0;
 int req_pool_iter = 0;
+int io_ctx_pool_iter = 0;
 
 static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 				struct spdk_bdev_io *bdev_io);
@@ -275,6 +276,20 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
 			name);
 
+	snprintf(name, 32, "io_ctx%d", atomic_fetch_add(&io_ctx_pool_iter, 1));
+	raid_ch->io_ctx_mempool = spdk_mempool_create(name,
+			512, sizeof(struct rdx_io_ctx),
+			SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+			SPDK_ENV_SOCKET_ID_ANY);
+	if (!raid_ch->io_ctx_mempool) {
+		SPDK_ERRLOG("Cannot create mempool %s for channel %p\n", name,
+				raid_ch);
+		return -1;
+	}
+
+	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
+			name);
+
 	return 0;
 }
 
@@ -295,8 +310,12 @@ raid_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 	free(raid_ch->dev_io_channels);
 	spdk_poller_unregister(&raid_ch->poller);
 
-	spdk_mempool_free(raid_ch->blk_req_mempool);
-	spdk_mempool_free(raid_ch->req_mempool);
+	if (raid_ch->blk_req_mempool)
+		spdk_mempool_free(raid_ch->blk_req_mempool);
+	if (raid_ch->req_mempool)
+		spdk_mempool_free(raid_ch->req_mempool);
+	if (raid_ch->io_ctx_mempool)
+		spdk_mempool_free(raid_ch->io_ctx_mempool);
 }
 
 

@@ -131,7 +131,7 @@ static void rdx_dsc_destroy_devices(struct rdx_raid_dsc *raid_dsc)
 		struct rdx_dev *dev = raid_dsc->devices[i];
 		if (dev) {
 			raid_dsc->devices[dev->num] = NULL;
-			if (__atomic_sub_fetch(&dev->dsc_use_cnt, 1, memory_order_seq_cst) == 0)
+			if (atomic_dec_and_test(&dev->dsc_use_cnt) == 0)
 				rdx_dev_destroy(dev);
 		}
 	}

@@ -23,8 +23,9 @@ void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
 
 	rdx_req_put_ref(req);
 	//rdx_dev_put_ref(dev);
-	free(io_ctx);
+	spdk_mempool_put(req->ch->io_ctx_mempool, io_ctx);
 }
+
 static struct rdx_raid_dsc *rdx_req_get_raid_dsc(struct rdx_req *req)
 {
 	//TODO: this is STUB
@@ -133,7 +134,8 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	if (slen > len)
 		slen = len;
 
-	io_ctx = calloc(1, sizeof(struct rdx_io_ctx));
+	//io_ctx = calloc(1, sizeof(struct rdx_io_ctx));
+	io_ctx = spdk_mempool_get(req->ch->io_ctx_mempool);
 	if (!io_ctx) {
 		SPDK_ERRLOG("Cannot allocate io_ctx for req=%p\n", req);
 		goto out_err_ctx;
