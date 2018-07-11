@@ -29,13 +29,13 @@ static int vbdev_raid_init(void);
 //static void vbdev_raid_get_spdk_running_config(FILE *fp);
 //static int vbdev_raid_get_ctx_size(void);
 static void vbdev_raid_examine(struct spdk_bdev *bdev);
-static void vbdev_raid_init_complete(void);
+//static void vbdev_raid_init_complete(void);
 static void vbdev_raid_finish(void);
 
 struct spdk_bdev_module raid_if = {
 	.name = "raid",
 	.module_init = vbdev_raid_init,
-	.init_complete = vbdev_raid_init_complete,
+	.init_complete = NULL,//vbdev_raid_init_complete,
 	.config_text = NULL,//vbdev_raid_get_spdk_running_config,
 	.get_ctx_size = NULL,//vbdev_raid_get_ctx_size,
 	.examine_config = vbdev_raid_examine,
@@ -103,6 +103,7 @@ int create_raid_disk(const char *bdev_name, const char *vbdev_name)
 	return 0;
 }
 
+int registered_devs = 0;
 static void vbdev_raid_examine(struct spdk_bdev *bdev)
 {
 	int i, ret;
@@ -121,18 +122,22 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev)
 				SPDK_ERRLOG("Failed to replace device %s on"
 					    " position %d\n", bdev->name, i);
 			}
+			registered_devs++;
+			if(registered_devs == raid_dsc->dev_cnt) {
+				rdx_raid_register(raid_dsc->raid);
+			}
 			break;
 		}
 	}
 	spdk_bdev_module_examine_done(&raid_if);
 }
 
-static void vbdev_raid_init_complete(void)
-{
-	if (g_raid) {
-		rdx_raid_register(g_raid);
-	}
-}
+//static void vbdev_raid_init_complete(void)
+//{
+//	if (g_raid) {
+//		rdx_raid_register(g_raid);
+//	}
+//}
 
 static void vbdev_raid_finish(void)
 {
