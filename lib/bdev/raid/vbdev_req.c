@@ -134,7 +134,6 @@ unsigned int rdx_req_split_per_dev(struct rdx_req *req,
 	if (slen > len)
 		slen = len;
 
-	//io_ctx = calloc(1, sizeof(struct rdx_io_ctx));
 	io_ctx = spdk_mempool_get(req->ch->io_ctx_mempool);
 	if (!io_ctx) {
 		SPDK_ERRLOG("Cannot allocate io_ctx for req=%p\n", req);
@@ -233,8 +232,7 @@ void rdx_req_split_per_stripe(struct rdx_req *req)
 
 		offset_in_stripe = addr % raid_dsc->stripe_data_len;
 		slen = raid_dsc->stripe_data_len - offset_in_stripe;
-		//test
-//		slen=len;
+
 		if (slen >= len) {
 			slen = len;
 			split_req = req;
@@ -359,8 +357,6 @@ int rdx_req_destroy(struct rdx_req *req)
 //
 //	kmem_cache_free(rdx_req_cachep, req);
 	spdk_mempool_put(req->ch->req_mempool, req);
-	
-	//llist_add(&req->pool_lnode, &req->ch->req_llist);
 
 	return 0;
 }

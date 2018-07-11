@@ -142,8 +142,6 @@ static void vbdev_raid_examine(struct spdk_bdev *bdev)
 static void vbdev_raid_finish(void)
 {
 	//spdk_bdev_unregister(&g_raid->raid_bdev, NULL, NULL);
-
-	//rdx_raid_destroy_devices(&g_raid);
 	printf("raid fini called\n");
 	return;
 }

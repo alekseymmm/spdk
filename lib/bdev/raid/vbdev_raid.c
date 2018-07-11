@@ -112,17 +112,7 @@ static void vbdev_raid_submit_request(struct spdk_io_channel *_ch,
 	struct rdx_raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct rdx_blk_req *blk_req;
 
-	if (bdev_io->u.bdev.num_blocks == 0) {
-		SPDK_NOTICELOG("0 size bdev_io, complete it.\n");
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-		return;
-	}
-	/* TODO: BUG with mkfs.ext4 and page cache */
-	//blk_req = calloc(1, sizeof(struct rdx_blk_req));
-	//blk_req = spdk_mempool_get(raid->blk_req_mempool);
 	blk_req = spdk_mempool_get(ch->blk_req_mempool);
-	//lnode = llist_del_first(&ch->blk_req_llist);
-	//blk_req = llist_entry(lnode, struct rdx_blk_req, pool_lnode);
 	if (!blk_req) {
 		SPDK_ERRLOG("Cannot allocate blk_req for bdev_io\n");
 		return;
@@ -147,8 +137,7 @@ static int vbdev_raid_poll(void *arg)
 	struct rdx_raid_io_channel *ch = arg;
 	struct rdx_req *req;
 	struct llist_node *first, *next;
-	unsigned int sectors_to_split, len = 0;
-	int processed = 0;
+	unsigned int sectors_to_split, len = 0;	
 
 	first = llist_del_all(&ch->req_llist);
 	while (first) {
@@ -158,7 +147,6 @@ static int vbdev_raid_poll(void *arg)
 //		req->bdev_io->cb = req->bdev_io->u.bdev.stored_user_cb;
 //
 //		spdk_bdev_io_complete(req->bdev_io, 1);
-		processed++;
 		first = next;
 		sectors_to_split = req->len;
 		req->split_offset = 0;
@@ -259,8 +247,6 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 				raid_ch);
 		return -1;
 	}
-	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
-			name);
 
 	snprintf(name, 32, "req%d", atomic_fetch_add(&req_pool_iter, 1));
 	raid_ch->req_mempool = spdk_mempool_create(name,
@@ -273,9 +259,6 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
-			name);
-
 	snprintf(name, 32, "io_ctx%d", atomic_fetch_add(&io_ctx_pool_iter, 1));
 	raid_ch->io_ctx_mempool = spdk_mempool_create(name,
 			512, sizeof(struct rdx_io_ctx),
@@ -286,9 +269,6 @@ raid_bdev_ch_create_cb(void *io_device, void *ctx_buf)
 				raid_ch);
 		return -1;
 	}
-
-	SPDK_NOTICELOG("for channel %p spdk mempool %s created\n", raid_ch,
-			name);
 
 	return 0;
 }
@@ -377,17 +357,6 @@ error:
 //{
 //	spdk_io_device_unregister(&raid->raid_bdev, NULL);
 //}
-
-void rdx_raid_destroy_devices(struct rdx_raid *raid)
-{
-	int i;
-
-	SPDK_NOTICELOG("Destroying base devices for raid %s\n", raid->name);
-	for (i = 0; i < raid->dsc->dev_cnt; i++) {
-		if (raid->dsc->devices[i])
-			rdx_dev_destroy(raid->dsc->devices[i]);
-	}
-}
 
 /* Called after we've unregistered following a hot remove callback.
  * Our finish entry point will be called next.
