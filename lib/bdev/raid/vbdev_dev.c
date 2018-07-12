@@ -39,6 +39,7 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	uint64_t block_size_sectors;
 	struct rdx_raid *raid = dev->raid;
 	struct rdx_raid_dsc *raid_dsc = raid->dsc;
+	uint64_t strips_in_dev;
 
 	rc = spdk_bdev_open(bdev, true, vbdev_raid_base_bdev_hotremove_cb,
 			dev, &dev->base_desc);
@@ -60,8 +61,10 @@ int rdx_dev_register(struct rdx_dev *dev, struct spdk_bdev *bdev)
 	SPDK_NOTICELOG("bdev %s claimed by raid module\n", bdev->name);
 
 	block_size_sectors = spdk_bdev_get_block_size(dev->bdev) / KERNEL_SECTOR_SIZE;
-	dev->size = spdk_bdev_get_num_blocks(dev->bdev) *
-			block_size_sectors - RDX_MD_OFFSET;
+	//TODO add RDX_BACKUP_OFFSET
+	strips_in_dev = (spdk_bdev_get_num_blocks(dev->bdev) *
+			block_size_sectors - RDX_MD_OFFSET) / raid->stripe_size;
+	dev->size = strips_in_dev * raid->stripe_size;
 
 	//this is only for raid create. Do something for restore and restripe
 	if (!raid_dsc->dev_size || dev->size < raid_dsc->dev_size) {
