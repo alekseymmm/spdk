@@ -1,6 +1,7 @@
 #include "vbdev_common.h"
 #include "vbdev_req.h"
 #include "vbdev_blk_req.h"
+#include "bitops.h"
 
 static struct rdx_req *rdx_req_split(struct rdx_req *req, unsigned int len);
 void rdx_bdev_io_end_io(struct spdk_bdev_io *bdev_io, bool success,
@@ -357,6 +358,111 @@ int rdx_req_destroy(struct rdx_req *req)
 //
 //	kmem_cache_free(rdx_req_cachep, req);
 	spdk_mempool_put(req->ch->req_mempool, req);
+
+	return 0;
+}
+
+int rdx_req_assign(struct rdx_req *req)
+{
+	struct rdx_stripe *stripe;
+	bool need_buffers = false;
+	struct rdx_raid_dsc *raid_dsc = req->raid_dsc;
+	struct rdx_raid *raid = raid_dsc->raid;
+
+
+	/* Start collecting stats about this request */
+	if (req->event == RDX_REQ_EVENT_CREATED &&
+	    !test_bit(RDX_REQ_FLAG_IN_STATS, &req->flags) &&
+	    (test_bit(RDX_RAID_STATE_RECON, &raid->state) ||
+	     test_bit(RDX_RAID_STATE_INIT, &raid->state) ||
+	     test_bit(RDX_RAID_STATE_RESTRIPING, &raid->state) ||
+	     rdx_dynamic_stats)) {
+		atomic_inc(&raid->stats->req_cnt[req->type]);
+		set_bit(RDX_REQ_FLAG_IN_STATS, &req->flags);
+	}
+
+	if (!rdx_raid_is_online(raid)) {
+		/* Destroy request or send to complete with error */
+		return -1;
+	}
+
+	if (!req->stripe) {
+		stripe = rdx_stripe_get(raid_dsc, req->stripe_num);
+		if (!stripe) {
+			pr_debug("busy req %p stripe_num %llu\n",
+				 req, req->stripe_num);
+
+			req->event = RDX_REQ_EVENT_BUSY;
+			req->thread_lnode.next = NULL;
+			llist_add(&req->thread_lnode, &raid->busy_req_list);
+
+			if (rdx_dynamic_stats)
+				atomic_inc(&raid->stats->busy_stripes);
+			return 0;
+		}
+	} else {
+		stripe = req->stripe;
+	}
+
+	pr_debug("assign req %p stripe_num %llu\n", req, req->stripe_num);
+
+	if (raid_dsc->req_check_bitmap(req, stripe)) {
+		pr_debug("busy req %p stripe_num %llu\n", req, req->stripe_num);
+
+		if (!req->stripe) {
+			atomic_inc(&stripe->req_cnt);
+			req->stripe = stripe;
+		}
+		req->event = RDX_REQ_EVENT_BUSY;
+		list_add_tail(&req->work_list, &stripe->req_list);
+
+		if (rdx_dynamic_stats)
+			atomic_inc(&raid->stats->busy_locked);
+		return 0;
+	}
+
+	need_buffers = raid_dsc->synd_cnt  ||
+		  (req->type == RDX_REQ_TYPE_RECON && raid_dsc->level == 1) ||
+		  (req->type == RDX_REQ_TYPE_BACKUP && raid_dsc->level == 1);
+	if (need_buffers && rdx_req_get_buffers(req, stripe)) {
+		pr_debug("busy req %p stripe_num %llu\n", req, req->stripe_num);
+
+		req->event = RDX_REQ_EVENT_BUSY;
+		req->thread_lnode.next = NULL;
+		llist_add(&req->thread_lnode, &raid->busy_req_list);
+
+		if (rdx_dynamic_stats)
+			atomic_inc(&raid->stats->busy_buffers);
+		return 0;
+	}
+
+	raid_dsc->req_set_bitmap(req, stripe, 1);
+
+	if (!req->stripe) {
+		atomic_inc(&stripe->req_cnt);
+		req->stripe = stripe;
+	}
+
+	/*
+	 * If we have nothing to reconstruct - release the resources and
+	 * complete the recon request
+	 */
+	if (req->type == RDX_REQ_TYPE_RECON &&
+	    !BitCount64(req->recon_bitmap)) {
+		pr_err("Nothing to reconstruct. For req=%p recon_bitmap=%llu "
+			"failed bitmap=%llu\n", req, req->recon_bitmap,
+			req->failed_bitmap);
+		return -1;
+	}
+
+	/* The Detector of Recalc */
+	if (raid_dsc->synd_cnt && req->type == RDX_REQ_TYPE_WRITE &&
+	    req->len == raid_dsc->stripe_data_len)
+		req->event = RDX_REQ_EVENT_ASSIGNED_CALC;
+	else
+		req->event = RDX_REQ_EVENT_ASSIGNED;
+
+	rdx_req_process(req);
 
 	return 0;
 }

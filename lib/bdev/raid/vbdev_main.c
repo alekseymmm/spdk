@@ -24,6 +24,7 @@
 #include "vbdev_raid.h"
 
 struct rdx_raid *g_raid;
+rdx_dynamic_stats = 0;
 
 static int vbdev_raid_init(void);
 //static void vbdev_raid_get_spdk_running_config(FILE *fp);

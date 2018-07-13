@@ -23,6 +23,7 @@
 
 extern struct rdx_raid *g_raid;
 extern struct spdk_bdev_module raid_if;
+extern int rdx_dynamic_stats;
 
 #define RDX_MD_OFFSET 0
 
@@ -46,26 +47,6 @@ extern struct spdk_bdev_module raid_if;
 #define RDX_IO_CTX_POOL_SIZE			(64 * 1024)
 #define RDX_IO_CTX_CACHE_SIZE			256
 
-enum rdx_raid_state_shift {
-	RDX_RAID_STATE_ONLINE_SHIFT = 0,
-	RDX_RAID_STATE_DEGRADED_SHIFT,
-	RDX_RAID_STATE_CREATE_SHIFT,
-	RDX_RAID_STATE_DESTROY_SHIFT,
-	RDX_RAID_STATE_RECON_SHIFT,
-	RDX_RAID_STATE_NEED_RECON_SHIFT,
-	RDX_RAID_STATE_STOP_RECON_SHIFT,
-	RDX_RAID_STATE_INIT_SHIFT,
-	RDX_RAID_STATE_NEED_INIT_SHIFT,
-	RDX_RAID_STATE_STOP_INIT_SHIFT,
-	RDX_RAID_STATE_RESTRIPING_SHIFT,
-	RDX_RAID_STATE_NEED_RESTRIPING_SHIFT,
-};
-
-
-#define RDX_RAID_STATE_ONLINE (1 << RDX_RAID_STATE_ONLINE_SHIFT)
-#define RDX_RAID_STATE_DEGRADED (1 << RDX_RAID_STATE_DEGRADED_SHIFT)
-#define RDX_RAID_STATE_CREATE (1 << RDX_RAID_STATE_CREATE_SHIFT)
-
 enum rdx_req_type {
 	RDX_REQ_TYPE_READ = 0,
 	RDX_REQ_TYPE_WRITE,
@@ -74,6 +55,74 @@ enum rdx_req_type {
 	RDX_REQ_TYPE_RESTRIPE,
 	RDX_REQ_TYPE_BACKUP,
 	RDX_REQ_TYPE_COUNT,
+};
+
+enum rdx_req_state {
+	RDX_REQ_STATE_CREATE = 0,
+	RDX_REQ_STATE_ASSIGN,
+	RDX_REQ_STATE_READ,
+	RDX_REQ_STATE_CALC,
+	RDX_REQ_STATE_WRITE,
+	RDX_REQ_STATE_COMPLETE,
+	RDX_REQ_STATE_DESTROY,
+	RDX_REQ_STATE_FAIL,
+	RDX_REQ_STATE_COUNT,
+};
+
+enum rdx_req_event {
+	RDX_REQ_EVENT_CREATED = 0,
+	RDX_REQ_EVENT_ASSIGNED,
+	RDX_REQ_EVENT_ASSIGNED_CALC,
+	RDX_REQ_EVENT_BUSY,
+	RDX_REQ_EVENT_XFER_COMPLETED,
+	RDX_REQ_EVENT_XFER_RETRY,
+	RDX_REQ_EVENT_XFER_FAILED,
+	RDX_REQ_EVENT_XFER_CALC,
+	RDX_REQ_EVENT_CALC_COMPLETED,
+	RDX_REQ_EVENT_CALC_FAILED,
+	RDX_REQ_EVENT_COMPLETED,
+	RDX_REQ_EVENT_FAILED,
+	RDX_REQ_EVENT_COUNT,
+};
+
+enum rdx_req_flags {
+	RDX_REQ_FLAG_ERR = 0,
+	RDX_REQ_FLAG_BIO_ERR,
+	RDX_REQ_FLAG_RETRY,
+	RDX_REQ_FLAG_NEED_INIT,
+	RDX_REQ_FLAG_IN_STATS,
+	RDX_REQ_FLAG_USER,
+	RDX_REQ_FLAG_IN_RESTRIPE,
+	RDX_REQ_FLAG_TO_BACKUP,
+	//RDX_REQ_FLAG_FULL_STRIPE,
+	//RDX_REQ_FLAG_DEGRADED,
+};
+
+enum rdx_raid_state {
+	RDX_RAID_STATE_ONLINE = 0,
+	RDX_RAID_STATE_DEGRADED,
+	RDX_RAID_STATE_DESTROY,
+	RDX_RAID_STATE_RECON,
+	RDX_RAID_STATE_NEED_RECON,
+	RDX_RAID_STATE_STOP_RECON,
+	RDX_RAID_STATE_INIT,
+	RDX_RAID_STATE_NEED_INIT,
+	RDX_RAID_STATE_STOP_INIT,
+	RDX_RAID_STATE_RESTRIPING,
+	RDX_RAID_STATE_NEED_RESTRIPE,
+	RDX_RAID_STATE_STOP_RESTRIPE,
+	RDX_RAID_STATE_RESTRIPED,
+};
+
+enum rdx_dev_state {
+	RDX_DEV_STATE_ONLINE = 0,
+	RDX_DEV_STATE_NEED_RECON,
+	RDX_DEV_STATE_RECON,
+};
+
+enum rdx_split_type {
+	RDX_SPLIT_REQ = 0,
+	RDX_SPLIT_BIO,
 };
 
 struct rdx_raid_io_channel {
@@ -103,11 +152,29 @@ struct rdx_dev {
 	int dsc_use_cnt;
 };
 
+struct rdx_trans {
+	int state;
+	int (*func)(struct rdx_req *req);
+};
+
+typedef struct rdx_trans rdx_stt[RDX_REQ_STATE_COUNT][RDX_REQ_EVENT_COUNT];
+
+struct rdx_raid_stats {
+	uint32_t req_cnt[RDX_REQ_TYPE_COUNT];
+	uint32_t busy_stripes;
+	uint32_t busy_buffers;
+	uint32_t busy_locked;
+	/* TODO: stripes_cnt, buf_cnt. If you want to debug it, you should
+	 * store flag "in_stats" in stripe.
+	 */
+};
+
 struct rdx_raid {
 	int stripe_size_kb;
 	char *name;
 	struct rdx_raid_dsc *dsc;
 	uint64_t size;
+	struct rdx_raid_stats *stats;
 	int level;
 	int stripe_size;
 	struct spdk_bdev_module *module;
@@ -115,6 +182,7 @@ struct rdx_raid {
 	struct spdk_mempool *req_mempool;
 	struct spdk_mempool *blk_req_mempool;
 	struct spdk_mempool *io_ctx_mempool;
+	unsigned long state;
 	TAILQ_ENTRY(vbdev_passthru)	link;
 };
 
@@ -131,6 +199,21 @@ struct rdx_raid_dsc {
 	int dev_cnt;
 	uint64_t stripe_cnt;
 	int level;
+	rdx_stt stt[RDX_REQ_TYPE_COUNT];
+	int (*req_check_bitmap)(struct rdx_req *req,
+				struct rdx_stripe *stripe);
+	void (*req_set_bitmap)(struct rdx_req *req,
+			       struct rdx_stripe *stripe, int val);
+};
+
+struct rdx_stripe {
+	uint64_t num;
+	char **buffers;
+	unsigned long *rw_bitmap;
+	struct list_head req_list;		/* wait list, maybe rbtree */
+	int req_cnt;
+	struct list_head list;
+	struct rdx_raid_dsc *raid_dsc;
 };
 
 struct rdx_req {
@@ -139,14 +222,19 @@ struct rdx_req {
 	unsigned int split_offset; //sectors
 	uint64_t buf_offset; //bytes
 	struct rdx_raid *raid;
+	struct rdx_stripe *stripe;
 	struct spdk_bdev_io *bdev_io;
 	struct llist_node thread_lnode;
 	enum rdx_req_type type;
 	void *priv;
+	enum rdx_req_type type;
+	enum rdx_req_state state;	/* TODO: atomic? */
+	enum rdx_req_event event;	/* TODO: atomic? */
 	struct rdx_raid_io_channel *ch;
 	struct rdx_blk_req *blk_req;
 	int ref_cnt;
 	uint64_t stripe_num;
+	unsigned long flags;
 	struct rdx_raid_dsc *raid_dsc;
 	struct llist_node pool_lnode;
 };
